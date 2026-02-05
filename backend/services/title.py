@@ -2,7 +2,7 @@
 标题生成服务
 """
 
-from .prompts import TITLE_SYSTEM_PROMPT
+from .prompts import get_title_prompt
 
 
 class TitleService:
@@ -14,7 +14,7 @@ class TitleService:
     def generate(self, user_message: str) -> str:
         """根据用户消息生成对话标题"""
         messages = [
-            {"role": "system", "content": TITLE_SYSTEM_PROMPT},
+            {"role": "system", "content": get_title_prompt()},
             {"role": "user", "content": user_message[:100]}
         ]
         

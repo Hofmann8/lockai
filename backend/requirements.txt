@@ -1,10 +1,18 @@
+# Web Framework
 flask>=3.0.0
 flask-cors>=4.0.0
 flask-sqlalchemy>=3.1.0
+
+# HTTP Client
 httpx>=0.27.0
+
+# Environment
 python-dotenv>=1.0.0
+
+# S3 Storage
 boto3>=1.35.0
 
-# Production server
-gunicorn>=21.0.0
-gevent>=24.0.0
+# Production Server (gevent 支持高并发 SSE 长连接)
+gunicorn>=22.0.0
+gevent>=24.2.0
+greenlet>=3.0.0

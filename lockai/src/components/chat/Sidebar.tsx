@@ -1,13 +1,13 @@
 'use client';
 
-import { useState } from 'react';
+import { useState, useEffect } from 'react';
 import Link from 'next/link';
+import Image from 'next/image';
 import { usePathname, useRouter } from 'next/navigation';
 import { Plus, MessageSquare, Trash2, ChevronLeft, LogOut, Settings, FileText, Check, X } from 'lucide-react';
 import { ChatSession, AuthState } from '@/types';
 import { deleteSession } from '@/lib/chat-history';
-import { getAuthState, logout } from '@/lib/auth';
-import { ThemeToggle } from '@/components/ThemeToggle';
+import { getAuthState, logout, fetchUserAvatar, updateAvatarUrl } from '@/lib/auth';
 
 interface SidebarProps {
   sessions: ChatSession[];
@@ -38,7 +38,20 @@ export function Sidebar({
   const router = useRouter();
   const pathname = usePathname();
   const [user] = useState<AuthState['user']>(() => getAuthState().user);
+  const [avatarUrl, setAvatarUrl] = useState<string | null>(() => getAuthState().user?.avatarUrl || null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+
+  // 加载用户头像
+  useEffect(() => {
+    if (!avatarUrl) {
+      fetchUserAvatar('avatarmd').then((url) => {
+        if (url) {
+          setAvatarUrl(url);
+          updateAvatarUrl(url);
+        }
+      });
+    }
+  }, [avatarUrl]);
 
   const handleDeleteClick = (e: React.MouseEvent, sessionId: string) => {
     e.stopPropagation();
@@ -205,16 +218,25 @@ export function Sidebar({
         {/* User Info & Actions */}
         <div className="border-t border-border p-3 space-y-2">
           <div className="flex items-center gap-3 p-2 rounded-xl bg-muted/50">
-            <div className="w-10 h-10 rounded-full bg-primary/20 flex items-center justify-center text-primary font-semibold shrink-0">
-              {user?.name?.charAt(0).toUpperCase() || 'U'}
-            </div>
+            {avatarUrl ? (
+              <Image
+                src={avatarUrl}
+                alt={user?.name || '用户头像'}
+                width={40}
+                height={40}
+                className="w-10 h-10 rounded-full object-cover shrink-0"
+              />
+            ) : (
+              <div className="w-10 h-10 rounded-full bg-primary/20 flex items-center justify-center text-primary font-semibold shrink-0">
+                {user?.name?.charAt(0).toUpperCase() || 'U'}
+              </div>
+            )}
             <div className="flex-1 min-w-0">
               <div className="font-medium text-foreground truncate">{user?.name || '用户'}</div>
               <div className="text-xs text-muted-foreground truncate">{user?.email}</div>
             </div>
           </div>
           <div className="flex gap-2">
-            <ThemeToggle direction="up" />
             <button
               onClick={onOpenSettings}
               className="flex-1 flex items-center justify-center gap-2 p-2 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted transition-colors cursor-pointer"
@@ -297,11 +319,20 @@ export function Sidebar({
         {/* User Info & Actions */}
         <div className="border-t border-border p-3 space-y-2">
           <div className="flex justify-center">
-            <div className="w-10 h-10 rounded-full bg-primary/20 flex items-center justify-center text-primary font-semibold">
-              {user?.name?.charAt(0).toUpperCase() || 'U'}
-            </div>
+            {avatarUrl ? (
+              <Image
+                src={avatarUrl}
+                alt={user?.name || '用户头像'}
+                width={40}
+                height={40}
+                className="w-10 h-10 rounded-full object-cover"
+              />
+            ) : (
+              <div className="w-10 h-10 rounded-full bg-primary/20 flex items-center justify-center text-primary font-semibold">
+                {user?.name?.charAt(0).toUpperCase() || 'U'}
+              </div>
+            )}
           </div>
-          <ThemeToggle direction="up" />
           <button
             onClick={onOpenSettings}
             className="w-full flex items-center justify-center p-2 rounded-lg text-muted-foreground hover:text-foreground hover:bg-muted transition-colors cursor-pointer"

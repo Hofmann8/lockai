@@ -107,8 +107,8 @@ class LLMService:
             print(f"[LLM] 异常: {type(e).__name__}: {e}")
             yield {"type": "error", "content": f"请求失败: {str(e)}"}
     
-    def stream_qwen(self, messages: list, enable_search: bool = True) -> Generator[dict, None, None]:
-        """流式调用 Qwen API（用于 Leo 模式）"""
+    def stream_qwen(self, messages: list, model: str = "qwen-plus", enable_search: bool = True, enable_thinking: bool = False) -> Generator[dict, None, None]:
+        """流式调用 Qwen API（用于 Leo/Scooby 模式）"""
         if not self.qwen_api_key:
             yield {"type": "error", "content": "Qwen API 密钥未配置"}
             return
@@ -119,15 +119,20 @@ class LLMService:
         }
         
         payload = {
-            "model": "qwen-plus",
+            "model": model,
             "messages": messages,
             "temperature": self.temperature,
             "max_tokens": self.max_tokens,
             "stream": True,
-            "enable_search": enable_search
+            "enable_search": enable_search,
+            "stream_options": {"include_usage": True}
         }
         
-        print(f"\n[LLM-Qwen] 流式调用: qwen-plus (search={enable_search})")
+        # Qwen3 系列支持思考模式
+        if enable_thinking:
+            payload["enable_thinking"] = True
+        
+        print(f"\n[LLM-Qwen] 流式调用: {model} (search={enable_search}, thinking={enable_thinking})")
         
         try:
             with httpx.Client(timeout=120.0) as client:
@@ -152,8 +157,14 @@ class LLMService:
                                 break
                             try:
                                 data = json.loads(data_str)
-                                delta = data.get("choices", [{}])[0].get("delta", {})
-                                content = delta.get("content", "")
+                                choices = data.get("choices", [])
+                                if not choices:
+                                    continue
+                                
+                                delta = choices[0].get("delta", {})
+                                
+                                # 回复内容（忽略 reasoning_content）
+                                content = delta.get("content")
                                 if content:
                                     yield {"type": "content", "content": content}
                             except json.JSONDecodeError:

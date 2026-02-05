@@ -1,5 +1,5 @@
 import type { Metadata } from "next";
-import { Geist, Geist_Mono } from "next/font/google";
+import { Geist, Geist_Mono, Quicksand } from "next/font/google";
 import "./globals.css";
 import { ThemeProvider } from "@/lib/theme";
 
@@ -13,11 +13,17 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
+const quicksand = Quicksand({
+  variable: "--font-logo",
+  weight: ["600"],
+  subsets: ["latin"],
+});
+
 export const metadata: Metadata = {
   title: "LockAI - Funk&Love AI Platform",
   description: "浙江大学 DFM 街舞社 Funk&Love 舞队内部 AI 应用平台",
   icons: {
-    icon: "https://funkandlove-main.s3.bitiful.net/public/favicon.ico",
+    icon: "/favicon.ico",
   },
 };
 
@@ -29,6 +35,7 @@ export default function RootLayout({
   return (
     <html lang="zh-CN" suppressHydrationWarning>
       <head>
+        <link rel="icon" href="/favicon.ico" />
         <script
           dangerouslySetInnerHTML={{
             __html: `
@@ -47,7 +54,7 @@ export default function RootLayout({
         />
       </head>
       <body
-        className={`${geistSans.variable} ${geistMono.variable} antialiased`}
+        className={`${geistSans.variable} ${geistMono.variable} ${quicksand.variable} antialiased`}
       >
         <ThemeProvider>
           {children}

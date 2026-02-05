@@ -45,6 +45,7 @@ export default function ChatPage() {
     if (!content.trim() || state.isLoading) return;
 
     let sessionId = currentSessionId;
+    let isNewSession = false;
     if (!sessionId) {
       const session = await createSession();
       if (!session) {
@@ -52,8 +53,7 @@ export default function ChatPage() {
         return;
       }
       sessionId = session.id;
-      setCurrentSessionId(sessionId);
-      await loadSessions();
+      isNewSession = true;
     }
 
     const userMessage: ChatMessage = {
@@ -72,6 +72,9 @@ export default function ChatPage() {
     }));
 
     await addMessage(sessionId, userMessage);
+    if (isNewSession) {
+      setCurrentSessionId(sessionId);
+    }
     await loadSessions();
 
     setStreamingContent('');

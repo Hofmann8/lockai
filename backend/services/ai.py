@@ -60,9 +60,9 @@ class AIService:
         
         messages.append({"role": "user", "content": message})
         
-        # Pro 模式：使用本地模型，简单直接
-        if ai_role == 'xiaosuolaoshi-pro':
-            for chunk in self.llm.stream_pro(messages):
+        # Leo 模式：使用 Qwen，简单直接，不支持搜索和绘图
+        if ai_role == 'leo':
+            for chunk in self.llm.stream_qwen(messages):
                 yield chunk
             yield {"type": "done", "content": ""}
             return

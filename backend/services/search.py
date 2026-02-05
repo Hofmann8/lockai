@@ -8,7 +8,7 @@ import threading
 import httpx
 from typing import Generator
 
-from .prompts import SEARCH_SYSTEM_PROMPT
+from .prompts import get_search_prompt
 
 
 class SearchService:
@@ -30,7 +30,7 @@ class SearchService:
         }
         
         messages = [
-            {"role": "system", "content": SEARCH_SYSTEM_PROMPT},
+            {"role": "system", "content": get_search_prompt()},
             {"role": "user", "content": query}
         ]
         
@@ -50,9 +50,14 @@ class SearchService:
         stop_flag = threading.Event()
         
         def extract_keywords_worker():
-            """并行提取关键词"""
+            """并行提取关键词（使用 Qwen）"""
             sent_keywords = set()
             last_len = 0
+            
+            qwen_headers = {
+                "Authorization": f"Bearer {self.llm.qwen_api_key}",
+                "Content-Type": "application/json"
+            }
             
             while not stop_flag.is_set():
                 stop_flag.wait(0.3)
@@ -67,8 +72,8 @@ class SearchService:
                 
                 try:
                     kw_response = httpx.post(
-                        f"{self.llm.base_url}/v1/chat/completions",
-                        headers=headers,
+                        f"{self.llm.qwen_base_url}/chat/completions",
+                        headers=qwen_headers,
                         json={
                             "model": self.llm.model_keyword,
                             "messages": [

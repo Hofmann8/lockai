@@ -59,9 +59,11 @@ class ImageService:
                 
                 result = self.storage.upload_image(image_bytes, user_id, session_id)
                 if result:
+                    # 添加水印参数：右下角，最大15%，50%透明度
+                    watermark_url = f"{result['url']}?mark=public/watermark.svg&mark-pos=0.95,0.95&mark-pct=0.15&mark-alpha=0.5"
                     return {
                         "success": True, 
-                        "image": result["url"],
+                        "image": watermark_url,
                         "s3_key": result["s3_key"],
                         "image_id": result["id"],
                         "prompt": prompt

@@ -60,9 +60,23 @@ class AIService:
         
         messages.append({"role": "user", "content": message})
         
-        # Leo 模式：使用 Qwen，简单直接，不支持搜索和绘图
+        # Leo 模式：使用 Qwen Plus，简单直接，不支持搜索和绘图
         if ai_role == 'leo':
-            for chunk in self.llm.stream_qwen(messages):
+            for chunk in self.llm.stream_qwen(messages, model="qwen-plus"):
+                yield chunk
+            yield {"type": "done", "content": ""}
+            return
+        
+        # Scooby 模式：使用 Qwen3 Max，可选深度思考
+        if ai_role == 'scooby':
+            for chunk in self.llm.stream_qwen(messages, model="qwen3-max", enable_thinking=True):
+                yield chunk
+            yield {"type": "done", "content": ""}
+            return
+        
+        # Scooby 快速模式：不开启思考
+        if ai_role == 'scooby_fast':
+            for chunk in self.llm.stream_qwen(messages, model="qwen3-max", enable_thinking=False):
                 yield chunk
             yield {"type": "done", "content": ""}
             return

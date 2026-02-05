@@ -1,8 +1,7 @@
 'use client';
 
-import { useState, useEffect } from 'react';
-import { X, Check, Lock } from 'lucide-react';
-import { Settings, AIRole, AI_ROLES, getSettings, saveSettings } from '@/lib/settings';
+import { X } from 'lucide-react';
+import { useTheme } from '@/lib/theme';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -10,20 +9,7 @@ interface SettingsModalProps {
 }
 
 export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
-  const [settings, setSettings] = useState<Settings>({ aiRole: 'xiaosuolaoshi' });
-
-  useEffect(() => {
-    if (isOpen) {
-      setSettings(getSettings());
-    }
-  }, [isOpen]);
-
-  const handleRoleChange = (role: AIRole, available: boolean) => {
-    if (!available) return;
-    const newSettings = { ...settings, aiRole: role };
-    setSettings(newSettings);
-    saveSettings(newSettings);
-  };
+  const { theme, setTheme } = useTheme();
 
   if (!isOpen) return null;
 
@@ -50,44 +36,47 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
 
         {/* Content */}
         <div className="p-6 space-y-6">
-          {/* AI Role Selection */}
+          {/* 显示设置 */}
           <div className="space-y-3">
             <label className="text-sm font-medium text-foreground">
-              AI 助手
+              显示设置
             </label>
-            <p className="text-xs text-muted-foreground">
-              选择你想使用的 AI 助手
-            </p>
             <div className="space-y-2">
-              {AI_ROLES.map((role) => (
-                <button
-                  key={role.id}
-                  onClick={() => handleRoleChange(role.id, role.available)}
-                  disabled={!role.available}
-                  className={`
-                    w-full flex items-center justify-between px-4 py-3 rounded-xl border transition-all
-                    ${!role.available
-                      ? 'border-border bg-muted/50 cursor-not-allowed opacity-60'
-                      : settings.aiRole === role.id
-                        ? 'border-primary bg-primary/10 cursor-pointer'
-                        : 'border-border hover:border-primary/50 hover:bg-muted cursor-pointer'
-                    }
-                  `}
-                >
-                  <div className="text-left">
-                    <div className="font-medium text-foreground flex items-center gap-2">
-                      {role.name}
-                      {!role.available && <Lock className="w-3.5 h-3.5 text-muted-foreground" />}
-                    </div>
-                    <div className="text-xs text-muted-foreground">
-                      {role.available ? role.description : '即将推出'}
-                    </div>
-                  </div>
-                  {role.available && settings.aiRole === role.id && (
-                    <Check className="w-5 h-5 text-primary" />
-                  )}
-                </button>
-              ))}
+              <div className="flex items-center justify-between">
+                <span className="text-sm text-muted-foreground">主题</span>
+                <div className="flex gap-1 p-1 rounded-lg bg-muted">
+                  <button
+                    onClick={() => setTheme('light')}
+                    className={`px-3 py-1.5 rounded-md text-xs transition-colors cursor-pointer ${
+                      theme === 'light' 
+                        ? 'bg-card text-foreground shadow-sm' 
+                        : 'text-muted-foreground hover:text-foreground'
+                    }`}
+                  >
+                    浅色
+                  </button>
+                  <button
+                    onClick={() => setTheme('dark')}
+                    className={`px-3 py-1.5 rounded-md text-xs transition-colors cursor-pointer ${
+                      theme === 'dark' 
+                        ? 'bg-card text-foreground shadow-sm' 
+                        : 'text-muted-foreground hover:text-foreground'
+                    }`}
+                  >
+                    深色
+                  </button>
+                  <button
+                    onClick={() => setTheme('system')}
+                    className={`px-3 py-1.5 rounded-md text-xs transition-colors cursor-pointer ${
+                      theme === 'system' 
+                        ? 'bg-card text-foreground shadow-sm' 
+                        : 'text-muted-foreground hover:text-foreground'
+                    }`}
+                  >
+                    跟随系统
+                  </button>
+                </div>
+              </div>
             </div>
           </div>
 
@@ -109,13 +98,6 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
               </p>
             </div>
           </div>
-        </div>
-
-        {/* Footer */}
-        <div className="px-6 py-4 border-t border-border">
-          <p className="text-xs text-muted-foreground text-center">
-            设置会自动保存，切换后新对话生效
-          </p>
         </div>
       </div>
     </div>

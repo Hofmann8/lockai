@@ -3,10 +3,9 @@
 import { useRef, useEffect, useState } from 'react';
 import { ChatMessage } from '@/types';
 import { Message } from './Message';
+import { StreamingMarkdown } from './StreamingMarkdown';
 import { Loader2, Search, Palette } from 'lucide-react';
-import { getCurrentRoleName, onSettingsChange } from '@/lib/settings';
-import { fixIncompleteMarkdown } from '@/lib/markdown';
-import ReactMarkdown from 'react-markdown';
+import { getCurrentRoleName, onSettingsChange, getSettings, isDeepThinkingMode } from '@/lib/settings';
 import Lottie, { LottieRefCurrentProps } from 'lottie-react';
 import lockAnimation from '../../../public/Unlock.json';
 import Image from 'next/image';
@@ -40,15 +39,45 @@ export function MessageList({
   const bottomRef = useRef<HTMLDivElement>(null);
   const lottieRef = useRef<LottieRefCurrentProps>(null);
   const [roleName, setRoleName] = useState('小锁老师');
+  const [currentRole, setCurrentRole] = useState(getSettings().aiRole);
+  const [isDeepThinking, setIsDeepThinking] = useState(isDeepThinkingMode());
+  const [thinkingSeconds, setThinkingSeconds] = useState(0);
+  const thinkingTimerRef = useRef<NodeJS.Timeout | null>(null);
   const prevInputActive = useRef(isInputActive);
   const { resolvedTheme } = useTheme();
 
   useEffect(() => {
     setRoleName(getCurrentRoleName());
-    return onSettingsChange(() => {
+    setCurrentRole(getSettings().aiRole);
+    setIsDeepThinking(isDeepThinkingMode());
+    return onSettingsChange((settings) => {
       setRoleName(getCurrentRoleName());
+      setCurrentRole(settings.aiRole);
+      setIsDeepThinking(isDeepThinkingMode());
     });
   }, []);
+
+  // 深度思考模式计时器
+  useEffect(() => {
+    if (isLoading && !streamingContent && !isSearching && isDeepThinking) {
+      setThinkingSeconds(0);
+      thinkingTimerRef.current = setInterval(() => {
+        setThinkingSeconds(prev => prev + 1);
+      }, 1000);
+    } else {
+      if (thinkingTimerRef.current) {
+        clearInterval(thinkingTimerRef.current);
+        thinkingTimerRef.current = null;
+      }
+      setThinkingSeconds(0);
+    }
+    
+    return () => {
+      if (thinkingTimerRef.current) {
+        clearInterval(thinkingTimerRef.current);
+      }
+    };
+  }, [isLoading, streamingContent, isSearching, isDeepThinking]);
 
   // 控制 Lottie 动画播放方向
   useEffect(() => {
@@ -115,30 +144,7 @@ export function MessageList({
             </div>
           </div>
           <div className="max-w-[75%] bg-card border border-border rounded-2xl px-4 py-3">
-            <div className="prose prose-sm max-w-none dark:prose-invert">
-              <ReactMarkdown
-                components={{
-                  p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
-                  code: ({ children, className }) => {
-                    const isInline = !className;
-                    if (isInline) {
-                      return <code className="px-1.5 py-0.5 rounded text-sm bg-muted">{children}</code>;
-                    }
-                    return (
-                      <pre className="p-3 rounded-lg overflow-x-auto text-sm bg-muted">
-                        <code>{children}</code>
-                      </pre>
-                    );
-                  },
-                  ul: ({ children }) => <ul className="list-disc pl-4 mb-2">{children}</ul>,
-                  ol: ({ children }) => <ol className="list-decimal pl-4 mb-2">{children}</ol>,
-                  li: ({ children }) => <li className="mb-1">{children}</li>,
-                }}
-              >
-                {fixIncompleteMarkdown(streamingContent)}
-              </ReactMarkdown>
-              <span className="inline-block w-0.5 h-4 bg-primary animate-pulse ml-0.5 align-middle" />
-            </div>
+            <StreamingMarkdown content={streamingContent} />
           </div>
         </div>
       )}
@@ -167,26 +173,7 @@ export function MessageList({
                 </div>
               </div>
               <div className="max-w-[75%] bg-card border border-border rounded-2xl px-4 py-3">
-                <div className="prose prose-sm max-w-none dark:prose-invert">
-                  <ReactMarkdown
-                    components={{
-                      p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
-                      code: ({ children, className }) => {
-                        const isInline = !className;
-                        if (isInline) {
-                          return <code className="px-1.5 py-0.5 rounded text-sm bg-muted">{children}</code>;
-                        }
-                        return (
-                          <pre className="p-3 rounded-lg overflow-x-auto text-sm bg-muted">
-                            <code>{children}</code>
-                          </pre>
-                        );
-                      },
-                    }}
-                  >
-                    {fixIncompleteMarkdown(streamingContent)}
-                  </ReactMarkdown>
-                </div>
+                <StreamingMarkdown content={streamingContent} showCursor={false} />
               </div>
             </div>
           )}
@@ -244,26 +231,7 @@ export function MessageList({
                 </div>
               </div>
               <div className="max-w-[75%] bg-card border border-border rounded-2xl px-4 py-3">
-                <div className="prose prose-sm max-w-none dark:prose-invert">
-                  <ReactMarkdown
-                    components={{
-                      p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
-                      code: ({ children, className }) => {
-                        const isInline = !className;
-                        if (isInline) {
-                          return <code className="px-1.5 py-0.5 rounded text-sm bg-muted">{children}</code>;
-                        }
-                        return (
-                          <pre className="p-3 rounded-lg overflow-x-auto text-sm bg-muted">
-                            <code>{children}</code>
-                          </pre>
-                        );
-                      },
-                    }}
-                  >
-                    {fixIncompleteMarkdown(streamingContent)}
-                  </ReactMarkdown>
-                </div>
+                <StreamingMarkdown content={streamingContent} showCursor={false} />
               </div>
             </div>
           )}
@@ -307,14 +275,8 @@ export function MessageList({
           </div>
           <div className="max-w-[75%] bg-card border border-border rounded-2xl px-4 py-3">
             {streamingContent && (
-              <div className="prose prose-sm max-w-none dark:prose-invert mb-3">
-                <ReactMarkdown
-                  components={{
-                    p: ({ children }) => <p className="mb-2 last:mb-0">{children}</p>,
-                  }}
-                >
-                  {fixIncompleteMarkdown(streamingContent)}
-                </ReactMarkdown>
+              <div className="mb-3">
+                <StreamingMarkdown content={streamingContent} showCursor={false} />
               </div>
             )}
             <div className="grid gap-2">
@@ -337,15 +299,40 @@ export function MessageList({
           <div className="shrink-0 w-10 h-10 rounded-xl bg-muted text-muted-foreground flex items-center justify-center">
             <Loader2 className="w-5 h-5 animate-spin" />
           </div>
-          <div className="bg-card border border-border rounded-2xl px-4 py-3">
+          <div className="bg-card border border-border rounded-2xl px-4 py-3 min-w-48">
             <div className="flex items-center gap-2 text-muted-foreground">
               <span className="text-sm">{roleName}正在思考</span>
+              {isDeepThinking && (
+                <span className="text-xs text-muted-foreground/70 tabular-nums">{thinkingSeconds}s</span>
+              )}
               <span className="flex gap-1">
                 <span className="w-1.5 h-1.5 bg-current rounded-full animate-bounce" style={{ animationDelay: '0ms' }} />
                 <span className="w-1.5 h-1.5 bg-current rounded-full animate-bounce" style={{ animationDelay: '150ms' }} />
                 <span className="w-1.5 h-1.5 bg-current rounded-full animate-bounce" style={{ animationDelay: '300ms' }} />
               </span>
             </div>
+            {/* Campbell/小锁老师 提示 */}
+            {(currentRole === 'campbell' || currentRole === 'xiaosuolaoshi') && thinkingSeconds >= 10 && thinkingSeconds < 30 && (
+              <p className="text-xs text-muted-foreground/70 mt-2 animate-fade-in">
+                {currentRole === 'campbell' ? 'Campbell' : '小锁老师'}正在深度思考，可能需要一些时间
+              </p>
+            )}
+            {(currentRole === 'campbell' || currentRole === 'xiaosuolaoshi') && thinkingSeconds >= 30 && (
+              <p className="text-xs text-muted-foreground/70 mt-2 animate-fade-in">
+                受限于舞队算力资源和网络波动，响应可能较慢。如需更快体验，可尝试 Scooby 或 Leo 模型
+              </p>
+            )}
+            {/* Scooby 深度思考提示 */}
+            {currentRole === 'scooby' && isDeepThinking && thinkingSeconds >= 8 && thinkingSeconds < 20 && (
+              <p className="text-xs text-muted-foreground/70 mt-2 animate-fade-in">
+                Scooby 正在深度思考中
+              </p>
+            )}
+            {currentRole === 'scooby' && isDeepThinking && thinkingSeconds >= 20 && (
+              <p className="text-xs text-muted-foreground/70 mt-2 animate-fade-in">
+                深度思考需要更多时间，可在设置中切换为快速思考模式
+              </p>
+            )}
           </div>
         </div>
       )}

@@ -10,6 +10,7 @@
 .env
 .env.local
 .env.*.local
+.env.production
 *.env
 backend/.env
 !*.env.example
@@ -154,3 +155,7 @@ temp/
 *.key
 *.crt
 .cache/
+
+# Deploy artifacts
+*.zip
+lockai-deploy.zip

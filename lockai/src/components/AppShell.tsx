@@ -40,6 +40,9 @@ export function AppShell({ children }: AppShellProps) {
 
   const isChat = pathname === '/chat';
   const isPaper = pathname === '/paper';
+  const currentSessionTitle = isChat
+    ? sessions.find(s => s.id === currentSessionId)?.title || '新对话'
+    : '';
 
   const loadSessions = useCallback(async () => {
     const data = await getSessions();
@@ -65,9 +68,13 @@ export function AppShell({ children }: AppShellProps) {
     // Paper 页面的新项目逻辑由 Paper 组件处理
   }, [isChat]);
 
-  const handleDeleteSession = useCallback(() => {
+  const handleDeleteSession = useCallback((sessionId: string) => {
+    // 如果删除的是当前会话，清空当前会话
+    if (sessionId === currentSessionId) {
+      setCurrentSessionId(null);
+    }
     loadSessions();
-  }, [loadSessions]);
+  }, [loadSessions, currentSessionId]);
 
   const contextValue: AppShellContextType = {
     sessions,
@@ -97,10 +104,19 @@ export function AppShell({ children }: AppShellProps) {
           ${sidebarCollapsed ? 'ml-16' : 'ml-72'}
         `}
       >
-        <div className="fixed top-4 left-4 text-lg font-semibold text-foreground z-10 transition-[margin] duration-300"
+        <div
+          className="fixed top-4 left-4 right-4 z-10 transition-[margin] duration-300"
           style={{ marginLeft: sidebarCollapsed ? '64px' : '288px' }}
         >
-          LockAI
+          <div className="relative flex items-center justify-between">
+            <div className="text-xl text-foreground logo-text">LockAI</div>
+            {isChat && (
+              <div className="absolute left-1/2 -translate-x-1/2 text-sm text-muted-foreground truncate max-w-[50%]">
+                {currentSessionTitle}
+              </div>
+            )}
+            <div className="w-16" />
+          </div>
         </div>
         {children}
       </div>

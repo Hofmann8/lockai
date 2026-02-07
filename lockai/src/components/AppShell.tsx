@@ -2,16 +2,23 @@
 
 import { useState, useCallback, useEffect, useTransition, createContext, useContext } from 'react';
 import { usePathname } from 'next/navigation';
-import { ChatSession } from '@/types';
+import { ChatSession, PaperRecord } from '@/types';
 import { Sidebar } from '@/components/chat/Sidebar';
 import { SettingsModal } from '@/components/SettingsModal';
 import { getSessions, getSession } from '@/lib/chat-history';
+import { listPapers, deletePaper } from '@/lib/api';
+import { getAuthState } from '@/lib/auth';
 
 interface AppShellContextType {
   sessions: ChatSession[];
   currentSessionId: string | null;
   setCurrentSessionId: (id: string | null) => void;
   loadSessions: () => Promise<ChatSession[]>;
+  paperRecords: PaperRecord[];
+  loadPaperRecords: () => Promise<void>;
+  currentPaperId: string | null;
+  setCurrentPaperId: (id: string | null) => void;
+  paperNewProjectTick: number;
   sidebarCollapsed: boolean;
   setSidebarCollapsed: (collapsed: boolean) => void;
 }
@@ -34,6 +41,9 @@ export function AppShell({ children }: AppShellProps) {
   const pathname = usePathname();
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
+  const [paperRecords, setPaperRecords] = useState<PaperRecord[]>([]);
+  const [currentPaperId, setCurrentPaperId] = useState<string | null>(null);
+  const [paperNewProjectTick, setPaperNewProjectTick] = useState(0);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isPending, startTransition] = useTransition();
@@ -52,35 +62,71 @@ export function AppShell({ children }: AppShellProps) {
     return data;
   }, []);
 
+  const loadPaperRecords = useCallback(async () => {
+    const auth = getAuthState();
+    const userId = auth.user?.id;
+    if (!userId) return;
+    const records = await listPapers(userId);
+    startTransition(() => {
+      setPaperRecords(records);
+    });
+  }, []);
+
   // 初始化加载会话
   useEffect(() => {
     loadSessions();
   }, [loadSessions]);
 
+  // Paper 页面加载论文记录
+  useEffect(() => {
+    if (isPaper) {
+      loadPaperRecords();
+    }
+  }, [isPaper, loadPaperRecords]);
+
   const handleSelectSession = useCallback(async (sessionId: string) => {
-    setCurrentSessionId(sessionId);
-  }, []);
+    if (isPaper) {
+      setCurrentPaperId(sessionId);
+    } else {
+      setCurrentSessionId(sessionId);
+    }
+  }, [isPaper]);
 
   const handleNewChat = useCallback(() => {
     if (isChat) {
       setCurrentSessionId(null);
     }
-    // Paper 页面的新项目逻辑由 Paper 组件处理
-  }, [isChat]);
-
-  const handleDeleteSession = useCallback((sessionId: string) => {
-    // 如果删除的是当前会话，清空当前会话
-    if (sessionId === currentSessionId) {
-      setCurrentSessionId(null);
+    if (isPaper) {
+      setCurrentPaperId(null);
+      setPaperNewProjectTick(tick => tick + 1);
     }
-    loadSessions();
-  }, [loadSessions, currentSessionId]);
+  }, [isChat, isPaper]);
+
+  const handleDeleteSession = useCallback(async (sessionId: string) => {
+    if (isPaper) {
+      await deletePaper(sessionId);
+      if (sessionId === currentPaperId) {
+        setCurrentPaperId(null);
+      }
+      loadPaperRecords();
+    } else {
+      if (sessionId === currentSessionId) {
+        setCurrentSessionId(null);
+      }
+      loadSessions();
+    }
+  }, [isPaper, loadSessions, loadPaperRecords, currentSessionId, currentPaperId, setCurrentPaperId]);
 
   const contextValue: AppShellContextType = {
     sessions,
     currentSessionId,
     setCurrentSessionId,
     loadSessions,
+    paperRecords,
+    loadPaperRecords,
+    currentPaperId,
+    setCurrentPaperId,
+    paperNewProjectTick,
     sidebarCollapsed,
     setSidebarCollapsed,
   };
@@ -89,13 +135,15 @@ export function AppShell({ children }: AppShellProps) {
     <AppShellContext.Provider value={contextValue}>
       <Sidebar
         sessions={isChat ? sessions : []}
-        currentSessionId={isChat ? currentSessionId : null}
+        paperRecords={isPaper ? paperRecords : []}
+        currentSessionId={isPaper ? currentPaperId : (isChat ? currentSessionId : null)}
         onSelectSession={handleSelectSession}
         onNewChat={handleNewChat}
         onDeleteSession={handleDeleteSession}
         onOpenSettings={() => setIsSettingsOpen(true)}
         isCollapsed={sidebarCollapsed}
         onToggleCollapse={() => setSidebarCollapsed(!sidebarCollapsed)}
+        isPaper={isPaper}
       />
 
       <div

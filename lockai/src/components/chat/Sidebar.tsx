@@ -1,16 +1,17 @@
 'use client';
 
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useCallback, useRef } from 'react';
 import Link from 'next/link';
 import Image from 'next/image';
 import { usePathname, useRouter } from 'next/navigation';
 import { Plus, MessageSquare, Trash2, ChevronLeft, LogOut, Settings, FileText, Check, X } from 'lucide-react';
-import { ChatSession, AuthState } from '@/types';
+import { ChatSession, AuthState, PaperRecord } from '@/types';
 import { deleteSession } from '@/lib/chat-history';
-import { getAuthState, logout, fetchUserAvatar, updateAvatarUrl } from '@/lib/auth';
+import { getAuthState, logout, fetchUserAvatar, getSignedUrlExpiry, isSignedUrlExpired, updateAvatarUrl } from '@/lib/auth';
 
 interface SidebarProps {
   sessions: ChatSession[];
+  paperRecords: PaperRecord[];
   currentSessionId: string | null;
   onSelectSession: (sessionId: string) => void;
   onNewChat: () => void;
@@ -18,6 +19,7 @@ interface SidebarProps {
   onOpenSettings: () => void;
   isCollapsed: boolean;
   onToggleCollapse: () => void;
+  isPaper?: boolean;
 }
 
 const navItems = [
@@ -27,6 +29,7 @@ const navItems = [
 
 export function Sidebar({
   sessions,
+  paperRecords,
   currentSessionId,
   onSelectSession,
   onNewChat,
@@ -34,24 +37,70 @@ export function Sidebar({
   onOpenSettings,
   isCollapsed,
   onToggleCollapse,
+  isPaper = false,
 }: SidebarProps) {
   const router = useRouter();
   const pathname = usePathname();
   const [user] = useState<AuthState['user']>(() => getAuthState().user);
   const [avatarUrl, setAvatarUrl] = useState<string | null>(() => getAuthState().user?.avatarUrl || null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const avatarRefreshingRef = useRef(false);
+  const avatarErrorHandledRef = useRef<string | null>(null);
 
-  // 加载用户头像
-  useEffect(() => {
-    if (!avatarUrl) {
-      fetchUserAvatar('avatarmd').then((url) => {
-        if (url) {
-          setAvatarUrl(url);
-          updateAvatarUrl(url);
-        }
-      });
+  const refreshAvatar = useCallback(async (force = false) => {
+    if (avatarRefreshingRef.current) return;
+    if (!force && avatarUrl && !isSignedUrlExpired(avatarUrl)) return;
+
+    avatarRefreshingRef.current = true;
+    try {
+      const url = await fetchUserAvatar('avatarmd');
+      if (url) {
+        avatarErrorHandledRef.current = null;
+        setAvatarUrl(url);
+        updateAvatarUrl(url);
+      } else if (force && avatarUrl) {
+        // 强制刷新失败时回退到默认头像，避免持续 403。
+        setAvatarUrl(null);
+        updateAvatarUrl(null);
+      }
+    } finally {
+      avatarRefreshingRef.current = false;
     }
   }, [avatarUrl]);
+
+  // 初始化和状态变化时，按需刷新头像签名 URL。
+  useEffect(() => {
+    void refreshAvatar(false);
+  }, [refreshAvatar]);
+
+  // 在过期前 5 分钟自动续签，避免用户使用中突然 403。
+  useEffect(() => {
+    if (!avatarUrl) return;
+    const expiresAt = getSignedUrlExpiry(avatarUrl);
+    if (!expiresAt) return;
+
+    const renewAt = expiresAt - 5 * 60 * 1000;
+    const delay = Math.max(0, renewAt - Date.now());
+    const timer = window.setTimeout(() => {
+      void refreshAvatar(true);
+    }, delay);
+
+    return () => window.clearTimeout(timer);
+  }, [avatarUrl, refreshAvatar]);
+
+  const handleAvatarError = useCallback(() => {
+    if (!avatarUrl) return;
+
+    // 同一 URL 只重试一次，防止加载失败循环。
+    if (avatarErrorHandledRef.current === avatarUrl) {
+      setAvatarUrl(null);
+      updateAvatarUrl(null);
+      return;
+    }
+
+    avatarErrorHandledRef.current = avatarUrl;
+    void refreshAvatar(true);
+  }, [avatarUrl, refreshAvatar]);
 
   const handleDeleteClick = (e: React.MouseEvent, sessionId: string) => {
     e.stopPropagation();
@@ -60,7 +109,9 @@ export function Sidebar({
 
   const handleConfirmDelete = async (e: React.MouseEvent, sessionId: string) => {
     e.stopPropagation();
-    await deleteSession(sessionId);
+    if (!isPaper) {
+      await deleteSession(sessionId);
+    }
     onDeleteSession(sessionId);
     setConfirmDeleteId(null);
   };
@@ -145,20 +196,82 @@ export function Sidebar({
           </div>
         </div>
 
-        {/* New Chat Button */}
+        {/* New Chat / New Project Button */}
         <div className="p-3">
           <button
             onClick={onNewChat}
             className="flex items-center gap-3 w-full p-3 rounded-xl bg-primary text-primary-foreground font-medium hover:opacity-90 transition-all cursor-pointer"
           >
             <Plus className="w-5 h-5 shrink-0" />
-            <span>新对话</span>
+            <span>{isPaper ? '新项目' : '新对话'}</span>
           </button>
         </div>
 
-        {/* Sessions List */}
+        {/* Sessions / Paper Records List */}
         <div className="flex-1 overflow-y-auto px-3 pb-3">
-          {Object.entries(groupedSessions).map(([dateKey, dateSessions]) => (
+          {isPaper ? (
+            /* Paper Records */
+            paperRecords.length === 0 ? (
+              <div className="text-sm text-muted-foreground text-center py-8">暂无论文记录</div>
+            ) : (
+              <div className="space-y-1">
+                {paperRecords.map((record) => (
+                  <div
+                    key={record.id}
+                    onClick={() => confirmDeleteId !== record.id && onSelectSession(record.id)}
+                    className={`
+                      group flex items-center gap-3 w-full p-3 rounded-xl text-left
+                      transition-colors cursor-pointer
+                      ${record.id === currentSessionId
+                        ? 'bg-primary/10 text-primary'
+                        : 'hover:bg-muted text-foreground'
+                      }
+                    `}
+                  >
+                    {confirmDeleteId === record.id ? (
+                      <>
+                        <span className="flex-1 text-sm text-destructive">确认删除？</span>
+                        <button
+                          onClick={(e) => handleConfirmDelete(e, record.id)}
+                          className="p-1 rounded hover:bg-destructive/20 text-destructive transition-all cursor-pointer"
+                          aria-label="确认删除"
+                        >
+                          <Check className="w-4 h-4" />
+                        </button>
+                        <button
+                          onClick={handleCancelDelete}
+                          className="p-1 rounded hover:bg-muted text-muted-foreground transition-all cursor-pointer"
+                          aria-label="取消"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <FileText className="w-4 h-4 shrink-0" />
+                        <div className="flex-1 min-w-0">
+                          <span className="block truncate text-sm">{record.topic}</span>
+                          <span className="block text-xs text-muted-foreground">
+                            {record.status === 'completed' ? '已完成' : record.status}
+                            {record.created_at && ` · ${new Date(record.created_at).toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' })}`}
+                          </span>
+                        </div>
+                        <button
+                          onClick={(e) => handleDeleteClick(e, record.id)}
+                          className="opacity-0 group-hover:opacity-100 p-1 rounded hover:bg-destructive/10 hover:text-destructive transition-all cursor-pointer"
+                          aria-label="删除论文"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </>
+                    )}
+                  </div>
+                ))}
+              </div>
+            )
+          ) : (
+            /* Chat Sessions */
+            Object.entries(groupedSessions).map(([dateKey, dateSessions]) => (
             <div key={dateKey} className="mb-4">
               <div className="text-xs text-muted-foreground px-2 py-1 font-medium">
                 {dateKey}
@@ -212,7 +325,8 @@ export function Sidebar({
                 ))}
               </div>
             </div>
-          ))}
+          ))
+          )}
         </div>
 
         {/* User Info & Actions */}
@@ -225,6 +339,7 @@ export function Sidebar({
                 width={40}
                 height={40}
                 className="w-10 h-10 rounded-full object-cover shrink-0"
+                onError={handleAvatarError}
               />
             ) : (
               <div className="w-10 h-10 rounded-full bg-primary/20 flex items-center justify-center text-primary font-semibold shrink-0">
@@ -326,6 +441,7 @@ export function Sidebar({
                 width={40}
                 height={40}
                 className="w-10 h-10 rounded-full object-cover"
+                onError={handleAvatarError}
               />
             ) : (
               <div className="w-10 h-10 rounded-full bg-primary/20 flex items-center justify-center text-primary font-semibold">

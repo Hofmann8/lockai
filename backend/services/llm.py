@@ -175,19 +175,135 @@ class LLMService:
             print(f"[LLM-Qwen] 异常: {type(e).__name__}: {e}")
             yield {"type": "error", "content": f"Qwen 请求失败: {str(e)}"}
     
-    def complete(self, messages: list, model: str = None, temperature: float = None, max_tokens: int = None) -> Optional[str]:
-        """非流式调用 API"""
+    def complete_with_tools(
+        self,
+        messages: list,
+        tools: list[dict],
+        tool_handler: callable,
+        model: str = None,
+        temperature: float = None,
+        max_tokens: int = None,
+        api_key: str = None,
+        max_rounds: int = 10,
+    ) -> str | None:
+        """
+        带 function calling 的多轮对话。
+
+        LLM 可以调用 tools 中定义的函数，由 tool_handler 执行后把结果
+        喂回 LLM，循环直到 LLM 输出纯文本或达到 max_rounds。
+
+        参数:
+            tools: OpenAI 格式的 tool 定义列表
+            tool_handler: callable(name, arguments) -> str，执行工具并返回结果字符串
+            max_rounds: 最大工具调用轮数，防止死循环
+        返回:
+            最终的纯文本回复，或 None
+        """
+        model = model or self.model_primary
+        use_qwen = model.startswith("qwen")
+
+        if use_qwen:
+            api_key = api_key or self.qwen_api_key
+            base_url = self.qwen_base_url
+        else:
+            api_key = api_key or self._get_api_key()
+            base_url = self.base_url
+        endpoint = f"{base_url.rstrip('/')}/chat/completions" if use_qwen else f"{base_url.rstrip('/')}/v1/chat/completions"
+
+        if not api_key:
+            return None
+
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+        msgs = list(messages)  # 不修改原始列表
+
+        for round_idx in range(max_rounds):
+            payload = {
+                "model": model,
+                "messages": msgs,
+                "tools": tools,
+                "temperature": temperature if temperature is not None else self.temperature,
+                "max_tokens": max_tokens or self.max_tokens,
+            }
+
+            print(f"\n[LLM] tool_call round {round_idx + 1}: model={model}")
+
+            try:
+                with httpx.Client(
+                    timeout=httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0)
+                ) as client:
+                    resp = client.post(
+                        endpoint,
+                        headers=headers,
+                        json=payload,
+                    )
+
+                if resp.status_code != 200:
+                    print(f"[LLM] tool_call 错误: HTTP {resp.status_code} - {resp.text[:500]}")
+                    return None
+
+                data = resp.json()
+                choice = data.get("choices", [{}])[0]
+                message = choice.get("message", {})
+                finish_reason = choice.get("finish_reason", "")
+
+                # 如果没有 tool_calls → 返回纯文本
+                tool_calls = message.get("tool_calls")
+                if not tool_calls:
+                    return message.get("content") or None
+
+                # 把 assistant 的 tool_calls 消息加入历史
+                msgs.append(message)
+
+                # 逐个执行 tool_call，把结果加入历史
+                for tc in tool_calls:
+                    fn = tc.get("function", {})
+                    name = fn.get("name", "")
+                    try:
+                        arguments = json.loads(fn.get("arguments", "{}"))
+                    except json.JSONDecodeError:
+                        arguments = {}
+
+                    print(f"[LLM] tool_call: {name}({json.dumps(arguments, ensure_ascii=False)[:200]})")
+                    result_str = tool_handler(name, arguments)
+
+                    msgs.append({
+                        "role": "tool",
+                        "tool_call_id": tc.get("id", ""),
+                        "content": result_str,
+                    })
+
+                # 如果 finish_reason 不是 tool_calls，也退出
+                if finish_reason != "tool_calls" and finish_reason != "stop":
+                    return message.get("content") or None
+
+            except Exception as e:
+                print(f"[LLM] tool_call 异常: {type(e).__name__}: {e}")
+                return None
+
+        print(f"[LLM] tool_call 达到最大轮数 {max_rounds}")
+        return None
+
+    def complete(self, messages: list, model: str = None, temperature: float = None, max_tokens: int = None, api_key: str = None) -> Optional[str]:
+        """
+        非流式语义的 API 调用（内部用 stream 接收，避免长文本超时）。
+        api_key 可覆盖默认 key。
+        """
         model = model or self.model_primary
         
         # 判断是否使用 Qwen
         use_qwen = model.startswith("qwen")
         
         if use_qwen:
-            api_key = self.qwen_api_key
+            api_key = api_key or self.qwen_api_key
             base_url = self.qwen_base_url
         else:
-            api_key = self._get_api_key()
+            api_key = api_key or self._get_api_key()
             base_url = self.base_url
+        endpoint = f"{base_url.rstrip('/')}/chat/completions" if use_qwen else f"{base_url.rstrip('/')}/v1/chat/completions"
         
         if not api_key:
             return None
@@ -201,20 +317,45 @@ class LLMService:
             "model": model,
             "messages": messages,
             "temperature": temperature if temperature is not None else self.temperature,
-            "max_tokens": max_tokens or self.max_tokens
+            "max_tokens": max_tokens or self.max_tokens,
+            "stream": True,
         }
         
+        print(f"\n[LLM] complete(stream): model={model}, key=...{api_key[-6:] if api_key else 'None'}")
+        
         try:
-            with httpx.Client(timeout=30.0) as client:
-                response = client.post(
-                    f"{base_url}/chat/completions",
+            chunks: list[str] = []
+            with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0)) as client:
+                with client.stream(
+                    "POST",
+                    endpoint,
                     headers=headers,
-                    json=payload
-                )
-                
-                if response.status_code == 200:
-                    return response.json()["choices"][0]["message"]["content"]
+                    json=payload,
+                ) as response:
+                    if response.status_code != 200:
+                        error_text = response.read().decode()
+                        print(f"[LLM] 错误: HTTP {response.status_code} - {error_text[:500]}")
+                        return None
+                    
+                    for line in response.iter_lines():
+                        if not line or not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(data_str)
+                            delta = data.get("choices", [{}])[0].get("delta", {})
+                            content = delta.get("content", "")
+                            if content:
+                                chunks.append(content)
+                        except json.JSONDecodeError:
+                            continue
+            
+            result = "".join(chunks)
+            print(f"[LLM] 成功: {len(result)} 字符")
+            return result if result else None
         except Exception as e:
-            print(f"[LLM] 异常: {e}")
+            print(f"[LLM] 异常: {type(e).__name__}: {e}")
         
         return None

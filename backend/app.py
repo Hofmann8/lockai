@@ -10,8 +10,11 @@ from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 from dotenv import load_dotenv
 
-from models import db, ChatSession, ChatMessage, GeneratedImage
+from models import db, ChatSession, ChatMessage, GeneratedImage, PaperRecord
 from services.ai import AIService
+from services.llm import LLMService
+from services.storage import StorageService
+from services.paper import PaperService, SessionManager, PaperStatus
 
 load_dotenv()
 
@@ -34,6 +37,11 @@ with app.app_context():
     db.create_all()
 
 ai_service = AIService()
+
+# Paper generation service
+llm_service = LLMService()
+storage_service = StorageService()
+paper_service = PaperService(llm_service, storage_service)
 
 
 # ============ Session APIs ============
@@ -301,6 +309,200 @@ def paper_assist():
         return jsonify(result), status_code
     
     return jsonify(result)
+
+
+# ============ Paper Generation APIs ============
+
+@app.route("/api/paper/generate", methods=["POST"])
+def paper_generate():
+    """POST /api/paper/generate — 开始生成论文（SSE 流）"""
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "请求体不能为空"}), 400
+
+    topic = data.get("topic")
+    if not topic or not isinstance(topic, str) or not topic.strip():
+        return jsonify({"error": "研究主题不能为空"}), 400
+
+    user_id = data.get("user_id", "anonymous")
+
+    def generate():
+        with app.app_context():
+            for event in paper_service.generate(user_id, topic.strip()):
+                event_type = event.get("type", "progress")
+                yield f"event: {event_type}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.route("/api/paper/<paper_id>/status", methods=["GET"])
+def paper_status(paper_id):
+    """GET /api/paper/<paper_id>/status — 查询论文生成状态"""
+    # 先查内存中的活跃 session
+    session = SessionManager.get(paper_id)
+    if session:
+        return jsonify({
+            "id": session.id,
+            "topic": session.topic,
+            "status": session.status.value,
+            "progress_detail": session.progress_detail,
+            "pdf_url": session.pdf_url,
+            "error": session.error,
+        })
+
+    # 再查数据库
+    record = PaperRecord.query.get(paper_id)
+    if not record:
+        return jsonify({"error": "论文不存在"}), 404
+
+    # 兜底：DB 里是进行中状态，但内存 session 不存在，说明任务已中断。
+    terminal_statuses = {PaperStatus.COMPLETED.value, PaperStatus.FAILED.value}
+    if record.status not in terminal_statuses:
+        record.status = PaperStatus.FAILED.value
+        if not record.error:
+            record.error = "任务已中断（服务重启或连接断开），请重新生成"
+        db.session.commit()
+
+    return jsonify(record.to_dict())
+
+
+@app.route("/api/paper/<paper_id>/download", methods=["GET"])
+def paper_download(paper_id):
+    """GET /api/paper/<paper_id>/download — 获取 PDF 下载链接"""
+    record = PaperRecord.query.get(paper_id)
+    if not record:
+        return jsonify({"error": "论文不存在"}), 404
+    if not record.pdf_url:
+        return jsonify({"error": "PDF 尚未生成"}), 404
+
+    return jsonify({"pdf_url": record.pdf_url})
+
+
+@app.route("/api/paper/<paper_id>/pdf", methods=["GET"])
+def paper_pdf_proxy(paper_id):
+    """GET /api/paper/<paper_id>/pdf — 代理 PDF 内容（解决 S3 不支持 inline 预览）"""
+    record = PaperRecord.query.get(paper_id)
+    if not record:
+        return jsonify({"error": "论文不存在"}), 404
+    if not record.pdf_s3_key:
+        return jsonify({"error": "PDF 尚未生成"}), 404
+
+    pdf_bytes = storage_service.download_bytes(record.pdf_s3_key)
+    if not pdf_bytes:
+        return jsonify({"error": "PDF 下载失败"}), 502
+
+    return Response(
+        pdf_bytes,
+        mimetype="application/pdf",
+        headers={
+            "Content-Disposition": "inline",
+            "Cache-Control": "public, max-age=3600",
+        },
+    )
+
+
+@app.route("/api/paper/<paper_id>", methods=["DELETE"])
+def paper_delete(paper_id):
+    """DELETE /api/paper/<paper_id> — 删除论文（DB 记录 + S3 文件）"""
+    record = PaperRecord.query.get(paper_id)
+    if not record:
+        return jsonify({"error": "论文不存在"}), 404
+
+    # 删除 S3 上的 PDF 和 VFS 快照
+    deleted_keys = []
+    for key in [record.pdf_s3_key, record.vfs_s3_key]:
+        if key:
+            if storage_service.delete_object(key):
+                deleted_keys.append(key)
+
+    # 删除数据库记录
+    db.session.delete(record)
+    db.session.commit()
+
+    print(f"[Paper] 已删除论文 {paper_id}，清理 S3: {deleted_keys}")
+    return jsonify({"success": True, "deleted_s3_keys": deleted_keys})
+
+
+@app.route("/api/paper/<paper_id>/files", methods=["GET"])
+def paper_files(paper_id):
+    """GET /api/paper/<paper_id>/files — 获取论文 VFS 文件列表"""
+    from services.paper import restore_session
+    session = restore_session(paper_id, storage_service, db)
+    if not session:
+        return jsonify({"error": "论文不存在或数据已丢失"}), 404
+
+    return jsonify({
+        "id": session.id,
+        "topic": session.topic,
+        "files": session.vfs.list_files(),
+    })
+
+
+@app.route("/api/paper/<paper_id>/files/<path:file_path>", methods=["GET"])
+def paper_file_content(paper_id, file_path):
+    """GET /api/paper/<paper_id>/files/<path> — 读取论文 VFS 中的单个文件"""
+    from services.paper import restore_session
+    session = restore_session(paper_id, storage_service, db)
+    if not session:
+        return jsonify({"error": "论文不存在或数据已丢失"}), 404
+
+    content = session.vfs.read(file_path)
+    if content is None:
+        return jsonify({"error": f"文件 {file_path} 不存在"}), 404
+
+    return jsonify({"path": file_path, "content": content})
+
+
+@app.route("/api/paper/<paper_id>/revise", methods=["POST"])
+def paper_revise(paper_id):
+    """POST /api/paper/<paper_id>/revise — 修订已有论文（SSE 流）"""
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "请求体不能为空"}), 400
+
+    instruction = data.get("instruction")
+    if not instruction or not isinstance(instruction, str) or not instruction.strip():
+        return jsonify({"error": "修改指令不能为空"}), 400
+
+    def generate():
+        with app.app_context():
+            for event in paper_service.revise(paper_id, instruction.strip()):
+                event_type = event.get("type", "progress")
+                yield f"event: {event_type}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+    return Response(
+        generate(),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.route("/api/papers", methods=["GET"])
+def list_papers():
+    """GET /api/papers — 列出用户的所有论文"""
+    user_id = request.args.get("user_id")
+    if not user_id:
+        return jsonify({"error": "缺少 user_id"}), 400
+
+    papers = (
+        PaperRecord.query.filter_by(user_id=user_id)
+        .order_by(PaperRecord.created_at.desc())
+        .limit(50)
+        .all()
+    )
+    return jsonify([p.to_dict() for p in papers])
 
 
 @app.route("/health", methods=["GET"])

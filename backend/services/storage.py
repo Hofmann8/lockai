@@ -68,6 +68,31 @@ class StorageService:
             print(f"[S3] 上传失败: {e}")
             return None
     
+    def upload_bytes(self, data: bytes, s3_key: str, content_type: str = "application/octet-stream") -> dict | None:
+        """Upload raw bytes to S3"""
+        if not self.available:
+            return None
+        self._client.put_object(
+            Bucket=self.bucket,
+            Key=s3_key,
+            Body=data,
+            ContentType=content_type,
+            ACL='public-read'
+        )
+        url = f"{self.public_url}/{s3_key}"
+        return {"url": url, "s3_key": s3_key}
+
+    def download_bytes(self, s3_key: str) -> bytes | None:
+        """Download raw bytes from S3"""
+        if not self.available:
+            return None
+        response = self._client.get_object(Bucket=self.bucket, Key=s3_key)
+        return response['Body'].read()
+
+    def upload_pdf(self, pdf_data: bytes, s3_key: str) -> dict | None:
+        """Upload PDF to S3"""
+        return self.upload_bytes(pdf_data, s3_key, "application/pdf")
+
     def delete_object(self, s3_key: str) -> bool:
         """删除 S3 对象"""
         if not self.available:

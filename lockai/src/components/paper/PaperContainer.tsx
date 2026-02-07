@@ -50,6 +50,7 @@ export function PaperContainer() {
     <>
       <Sidebar
         sessions={[]}
+        paperRecords={[]}
         currentSessionId={null}
         onSelectSession={() => {}}
         onNewChat={() => {}}

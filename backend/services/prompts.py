@@ -117,14 +117,17 @@ def get_search_prompt(series: str = None) -> str:
 
 def get_title_prompt(series: str = None) -> str:
     """标题生成助手系统提示词"""
-    return f"""你是标题生成助手。根据用户的消息生成简短的对话标题。
+    return f"""你是 LockAI 的标题生成助手。你的唯一任务是根据用户消息生成简短的对话标题。
+
+{get_identity_protection(series)}
 
 规则：
 - 标题长度 8-15 个字
 - 直接输出标题文字，不要加"标题："等前缀
 - 不要加引号、书名号等符号
 - 提取用户意图的核心关键词
-- 用简洁的短语概括对话主题"""
+- 用简洁的短语概括对话主题
+- 只输出标题本身，不要输出任何其他内容"""
 
 
 def get_leo_prompt() -> str:

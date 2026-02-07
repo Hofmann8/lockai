@@ -15,7 +15,7 @@ class TitleService:
         """根据用户消息生成对话标题"""
         messages = [
             {"role": "system", "content": get_title_prompt()},
-            {"role": "user", "content": user_message[:100]}
+            {"role": "user", "content": f"为以下用户消息生成标题：\n\n{user_message[:100]}"}
         ]
         
         print(f"[Title] 生成标题...")

@@ -77,3 +77,48 @@ export interface ErrorResponse {
   code: string;
   details?: string;
 }
+
+// Paper generation types
+export interface PaperGenerateRequest {
+  topic: string;
+  user_id?: string;
+}
+
+export interface PaperReviseRequest {
+  instruction: string;
+}
+
+export interface PaperRecord {
+  id: string;
+  topic: string;
+  status: string;
+  pdf_url: string | null;
+  progress_detail?: string | null;
+  error?: string | null;
+  created_at: string;
+  completed_at: string | null;
+}
+
+export interface PaperFiles {
+  id: string;
+  topic: string;
+  files: string[];
+}
+
+export interface PaperFileContent {
+  path: string;
+  content: string;
+}
+
+export type PaperEventType = 'session_created' | 'progress' | 'completed' | 'error';
+
+export interface PaperEvent {
+  type: PaperEventType;
+  session_id?: string;
+  stage?: string;
+  detail?: string;
+  pdf_url?: string;
+  message?: string;
+}
+
+export type PaperEventCallback = (event: PaperEvent) => void;

@@ -69,3 +69,31 @@ class GeneratedImage(db.Model):
             'prompt': self.prompt,
             'created_at': self.created_at.isoformat(),
         }
+
+
+class PaperRecord(db.Model):
+    """论文记录（持久化）"""
+    __tablename__ = 'paper_records'
+
+    id = db.Column(db.String(36), primary_key=True)
+    user_id = db.Column(db.String(36), nullable=False, index=True)
+    topic = db.Column(db.String(500), nullable=False)
+    status = db.Column(db.String(20), nullable=False)
+    vfs_s3_key = db.Column(db.String(255))
+    pdf_s3_key = db.Column(db.String(255))
+    pdf_url = db.Column(db.String(500))
+    outline_json = db.Column(db.Text)
+    error = db.Column(db.Text)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    completed_at = db.Column(db.DateTime)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'topic': self.topic,
+            'status': self.status,
+            'pdf_url': self.pdf_url,
+            'error': self.error,
+            'created_at': self.created_at.isoformat(),
+            'completed_at': self.completed_at.isoformat() if self.completed_at else None,
+        }

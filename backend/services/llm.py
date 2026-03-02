@@ -72,6 +72,7 @@ class LLMService:
         
         print(f"\n[LLM] 流式调用: {model}")
         
+        chunk_count = 0
         try:
             with httpx.Client(timeout=120.0) as client:
                 with client.stream(
@@ -95,12 +96,19 @@ class LLMService:
                                 break
                             try:
                                 data = json.loads(data_str)
-                                delta = data.get("choices", [{}])[0].get("delta", {})
-                                content = delta.get("content", "")
+                                choices = data.get("choices", [])
+                                if not choices:
+                                    continue
+                                delta = choices[0].get("delta", {})
+                                content = delta.get("content") or ""
                                 if content:
+                                    chunk_count += 1
                                     yield {"type": "content", "content": content}
                             except json.JSONDecodeError:
                                 continue
+            
+            if chunk_count == 0:
+                print(f"[LLM] 警告: {model} 返回了 0 个内容 chunk")
         except httpx.TimeoutException:
             yield {"type": "error", "content": "请求超时"}
         except Exception as e:

@@ -4,7 +4,7 @@ import { useState, useCallback, useEffect } from 'react';
 import { ChatMessage, ChatState } from '@/types';
 import { MessageList } from '@/components/chat/MessageList';
 import { MessageInput } from '@/components/chat/MessageInput';
-import { sendChatMessageStream, StreamEvent, generateSessionTitle } from '@/lib/api';
+import { sendChatMessageStream, StreamEvent, generateSessionTitle, uploadImage } from '@/lib/api';
 import { getSession, createSession, addMessage, truncateMessages } from '@/lib/chat-history';
 import { getAuthState } from '@/lib/auth';
 import { useAppShell } from '@/components/AppShell';
@@ -29,6 +29,7 @@ export default function ChatPage() {
   const [generatedImages, setGeneratedImages] = useState<string[]>([]);
   const [isInputActive, setIsInputActive] = useState(false);
   const [recallText, setRecallText] = useState<string | undefined>(undefined);
+  const [recallImages, setRecallImages] = useState<string[] | undefined>(undefined);
   const [recallTick, setRecallTick] = useState(0);
 
   // 加载当前会话消息
@@ -44,8 +45,8 @@ export default function ChatPage() {
     }
   }, [currentSessionId]);
 
-  const handleSendMessage = useCallback(async (content: string, effectiveRole: EffectiveAIRole) => {
-    if (!content.trim() || state.isLoading) return;
+  const handleSendMessage = useCallback(async (content: string, effectiveRole: EffectiveAIRole, images?: string[]) => {
+    if ((!content.trim() && (!images || images.length === 0)) || state.isLoading) return;
 
     let sessionId = currentSessionId;
     let isNewSession = false;
@@ -59,10 +60,24 @@ export default function ChatPage() {
       isNewSession = true;
     }
 
+    // 先上传图片到 S3，拿到 URL（全程只用 URL）
+    let imageUrls: string[] | undefined;
+    if (images && images.length > 0) {
+      const userId = getAuthState().user?.id;
+      const urls = await Promise.all(
+        images.map(img =>
+          img.startsWith('http') ? Promise.resolve(img) : uploadImage(img, userId, sessionId!)
+        )
+      );
+      imageUrls = urls.filter((u): u is string => u !== null);
+      if (imageUrls.length === 0) imageUrls = undefined;
+    }
+
     const userMessage: ChatMessage = {
       id: crypto.randomUUID(),
       role: 'user',
-      content: content.trim(),
+      content: content.trim() || '(图片)',
+      images: imageUrls,
       timestamp: new Date(),
     };
 
@@ -89,7 +104,7 @@ export default function ChatPage() {
     setGeneratedImages([]);
 
     let fullContent = '';
-    const images: string[] = [];
+    const generatedImgs: string[] = [];
     let savedAssistantContent = '';
 
     const handleEvent = (event: StreamEvent) => {
@@ -129,8 +144,8 @@ export default function ChatPage() {
           break;
         case 'image':
           if (event.image) {
-            images.push(event.image);
-            setGeneratedImages([...images]);
+            generatedImgs.push(event.image);
+            setGeneratedImages([...generatedImgs]);
             setIsDrawing(false);
           }
           break;
@@ -146,8 +161,8 @@ export default function ChatPage() {
           break;
         case 'done':
           let finalContent = fullContent;
-          if (images.length > 0) {
-            finalContent += '\n\n' + images.map(img => `![生成的图片](${img})`).join('\n\n');
+          if (generatedImgs.length > 0) {
+            finalContent += '\n\n' + generatedImgs.map(img => `![生成的图片](${img})`).join('\n\n');
           }
           savedAssistantContent = finalContent;
           const assistantMessage: ChatMessage = {
@@ -175,7 +190,8 @@ export default function ChatPage() {
 
     await sendChatMessageStream(
       {
-        message: content.trim(),
+        message: content.trim() || '(图片)',
+        images: imageUrls,
         history: state.messages,
         ai_role: effectiveRole,
         user_id: getAuthState().user?.id,
@@ -223,7 +239,8 @@ export default function ChatPage() {
       };
     });
     // 把消息内容放回输入框
-    setRecallText(message.content);
+    setRecallText(message.content === '(图片)' ? '' : message.content);
+    setRecallImages(message.images);
     setRecallTick(t => t + 1);
   }, [currentSessionId]);
 
@@ -266,6 +283,7 @@ export default function ChatPage() {
           disabled={state.isLoading}
           onActiveChange={setIsInputActive}
           defaultValue={recallText}
+          defaultImages={recallImages}
           key={recallTick}
         />
         <p className="text-xs text-muted-foreground text-center mt-3">

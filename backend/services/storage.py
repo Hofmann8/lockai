@@ -45,13 +45,22 @@ class StorageService:
         
         image_id = uuid.uuid4().hex
         
+        # 根据 content_type 确定文件扩展名
+        ext_map = {
+            "image/jpeg": ".jpg",
+            "image/png": ".png",
+            "image/gif": ".gif",
+            "image/webp": ".webp",
+        }
+        ext = ext_map.get(content_type, ".png")
+        
         if user_id and session_id:
-            s3_key = f"users/{user_id}/sessions/{session_id}/images/{image_id}.png"
+            s3_key = f"users/{user_id}/sessions/{session_id}/images/{image_id}{ext}"
         elif user_id:
-            s3_key = f"users/{user_id}/images/{image_id}.png"
+            s3_key = f"users/{user_id}/images/{image_id}{ext}"
         else:
             date_prefix = datetime.now().strftime("%Y/%m/%d")
-            s3_key = f"ai-images/{date_prefix}/{image_id}.png"
+            s3_key = f"ai-images/{date_prefix}/{image_id}{ext}"
         
         try:
             self._client.put_object(

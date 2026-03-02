@@ -3,6 +3,7 @@ export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
   content: string;
+  images?: string[];  // S3 公开 URL
   timestamp: Date;
 }
 
@@ -18,6 +19,7 @@ export interface ChatSession {
 // 聊天请求
 export interface ChatRequest {
   message: string;
+  images?: string[];  // S3 公开 URL
   history?: ChatMessage[];
   ai_role?: string;
   user_id?: string;

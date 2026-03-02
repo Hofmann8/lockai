@@ -11,7 +11,6 @@ from .storage import StorageService
 from .search import SearchService
 from .image import ImageService
 from .title import TitleService
-from .mod_dragon import process_dragon_stream, has_user_triggered, get_dragon_birthday_prompt  # [mod-dragon]
 
 
 class AIService:
@@ -33,7 +32,7 @@ class AIService:
         """生成对话标题"""
         return self.title.generate(user_message)
     
-    def chat_stream(self, message: str, history: list = None, ai_role: str = 'xiaosuolaoshi', user_id: str = None, session_id: str = None, user_name: str = None) -> Generator[dict, None, None]:
+    def chat_stream(self, message: str, history: list = None, ai_role: str = 'xiaosuolaoshi', user_id: str = None, session_id: str = None, images: list = None) -> Generator[dict, None, None]:
         """
         流式聊天接口
         
@@ -57,41 +56,44 @@ class AIService:
         if history:
             for item in history:
                 role = "assistant" if item["role"] == "assistant" else "user"
-                messages.append({"role": role, "content": item["content"]})
+                # 历史消息中的图片也需要构建多模态格式
+                item_images = item.get("images")
+                if item_images and role == "user":
+                    content_parts = [{"type": "text", "text": item["content"]}]
+                    for img_url in item_images:
+                        content_parts.append({"type": "image_url", "image_url": {"url": img_url}})
+                    messages.append({"role": role, "content": content_parts})
+                else:
+                    messages.append({"role": role, "content": item["content"]})
         
-        messages.append({"role": "user", "content": message})
+        # 当前消息
+        if images:
+            content_parts = [{"type": "text", "text": message}]
+            for img_url in images:
+                content_parts.append({"type": "image_url", "image_url": {"url": img_url}})
+            messages.append({"role": "user", "content": content_parts})
+            print(f"[Chat] 附带 {len(images)} 张图片")
+        else:
+            messages.append({"role": "user", "content": message})
         
-        # Leo 模式：使用 Qwen Plus，简单直接，不支持搜索和绘图
+        # Leo 模式：使用 Qwen3.5 Flash，轻量快速，原生联网
         if ai_role == 'leo':
-            for chunk in self.llm.stream_qwen(messages, model="qwen-plus"):
+            for chunk in self.llm.stream_qwen(messages, model="qwen3.5-flash"):
                 yield chunk
             yield {"type": "done", "content": ""}
             return
         
-        # Scooby 模式：使用 Qwen3 Max，可选深度思考
+        # Scooby 模式：使用 Qwen3.5 Plus，可选深度思考
         if ai_role == 'scooby':
-            for chunk in self.llm.stream_qwen(messages, model="qwen3-max", enable_thinking=True):
+            for chunk in self.llm.stream_qwen(messages, model="qwen3.5-plus", enable_thinking=True):
                 yield chunk
             yield {"type": "done", "content": ""}
             return
         
         # Scooby 快速模式：不开启思考
         if ai_role == 'scooby_fast':
-            for chunk in self.llm.stream_qwen(messages, model="qwen3-max", enable_thinking=False):
+            for chunk in self.llm.stream_qwen(messages, model="qwen3.5-plus", enable_thinking=False):
                 yield chunk
-            yield {"type": "done", "content": ""}
-            return
-        
-        # [mod-dragon] Dragon 模式：复用 Scooby 通道，深度/快速，包装彩蛋检测
-        if ai_role in ('dragon', 'dragon_fast'):
-            # 该用户未触发过彩蛋时才注入生日隐藏 prompt
-            if not has_user_triggered(user_id):
-                birthday_hint = get_dragon_birthday_prompt()
-                if birthday_hint and messages and messages[0].get("role") == "system":
-                    messages[0]["content"] += "\n\n" + birthday_hint
-            enable_thinking = ai_role == 'dragon'
-            raw = self.llm.stream_qwen(messages, model="qwen3-max", enable_thinking=enable_thinking)
-            yield from process_dragon_stream(raw, user_id, user_name)
             yield {"type": "done", "content": ""}
             return
         

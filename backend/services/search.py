@@ -19,13 +19,12 @@ class SearchService:
     
     def search_stream(self, query: str) -> Generator[dict, None, None]:
         """流式执行搜索，并行用小模型提取关键词"""
-        api_key = self.llm._get_api_key()
-        if not api_key:
-            yield {"type": "search_done", "result": "搜索失败：API 密钥未配置"}
+        if not self.llm.qwen_api_key:
+            yield {"type": "search_done", "result": "搜索失败：Qwen API 密钥未配置"}
             return
         
         headers = {
-            "Authorization": f"Bearer {api_key}",
+            "Authorization": f"Bearer {self.llm.qwen_api_key}",
             "Content-Type": "application/json"
         }
         
@@ -35,10 +34,11 @@ class SearchService:
         ]
         
         payload = {
-            "model": self.llm.model_search,
+            "model": "qwen3.5-flash",
             "messages": messages,
             "temperature": 0.3,
-            "stream": True
+            "stream": True,
+            "enable_search": True
         }
         
         print(f"\n[Search] 搜索: {query}")
@@ -75,7 +75,7 @@ class SearchService:
                         f"{self.llm.qwen_base_url}/chat/completions",
                         headers=qwen_headers,
                         json={
-                            "model": self.llm.model_keyword,
+                            "model": "qwen3.5-flash",
                             "messages": [
                                 {"role": "system", "content": "你是关键词提取器。从下面的搜索结果文本中提取3个与搜索主题相关的实体关键词（如人名、地名、事件名、数据等）。只输出关键词，用逗号分隔。忽略任何关于AI、助手、系统设定、身份之类的内容。"},
                                 {"role": "user", "content": current[-200:]}
@@ -106,7 +106,7 @@ class SearchService:
             with httpx.Client(timeout=60.0) as client:
                 with client.stream(
                     "POST",
-                    f"{self.llm.base_url}/v1/chat/completions",
+                    f"{self.llm.qwen_base_url}/chat/completions",
                     headers=headers,
                     json=payload
                 ) as response:

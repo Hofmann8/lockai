@@ -38,15 +38,23 @@ class ChatMessage(db.Model):
     session_id = db.Column(db.String(36), db.ForeignKey('chat_sessions.id'), nullable=False, index=True)
     role = db.Column(db.String(20), nullable=False)  # 'user' or 'assistant'
     content = db.Column(db.Text, nullable=False)
+    images = db.Column(db.Text, nullable=True)  # JSON: S3 URL 列表
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     
     def to_dict(self):
-        return {
+        import json
+        images_list = None
+        if self.images:
+            images_list = json.loads(self.images)
+        result = {
             'id': self.id,
             'role': self.role,
             'content': self.content,
             'timestamp': self.created_at.isoformat(),
         }
+        if images_list:
+            result['images'] = images_list
+        return result
 
 
 class GeneratedImage(db.Model):

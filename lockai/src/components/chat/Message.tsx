@@ -113,6 +113,21 @@ export function Message({ message, onRecall }: MessageProps) {
           `}
         >
           <div className={`prose prose-sm max-w-none ${isUser ? 'prose-invert' : 'dark:prose-invert'}`}>
+            {/* 用户消息中的图片 */}
+            {isUser && message.images && message.images.length > 0 && (
+              <div className={`flex gap-2 flex-wrap ${message.content && message.content !== '(图片)' ? 'mb-2' : ''}`}>
+                {message.images.map((img, i) => (
+                  <img
+                    key={i}
+                    src={img}
+                    alt={`图片 ${i + 1}`}
+                    className="rounded-lg max-w-[200px] max-h-[200px] object-cover cursor-pointer"
+                    onClick={() => window.open(img, '_blank')}
+                  />
+                ))}
+              </div>
+            )}
+            {(!isUser || !message.images || message.content !== '(图片)') && (
             <ReactMarkdown
               remarkPlugins={[remarkMath, remarkGfm]}
               rehypePlugins={[rehypeKatex]}
@@ -188,6 +203,7 @@ export function Message({ message, onRecall }: MessageProps) {
             >
               {message.content}
             </ReactMarkdown>
+            )}
           </div>
         </div>
 

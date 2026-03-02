@@ -35,6 +35,14 @@ db.init_app(app)
 # Create tables
 with app.app_context():
     db.create_all()
+    # 确保 chat_messages 表有 images 列（SQLite 不会自动加新列）
+    from sqlalchemy import inspect, text
+    inspector = inspect(db.engine)
+    columns = [c['name'] for c in inspector.get_columns('chat_messages')]
+    if 'images' not in columns:
+        db.session.execute(text('ALTER TABLE chat_messages ADD COLUMN images TEXT'))
+        db.session.commit()
+        print("[DB] 已添加 chat_messages.images 列")
 
 ai_service = AIService()
 
@@ -164,6 +172,63 @@ def get_user_images(user_id):
     return jsonify([img.to_dict() for img in images])
 
 
+@app.route("/api/sessions/<session_id>/truncate", methods=["POST"])
+def truncate_messages(session_id):
+    """截断会话消息：删除指定消息及其之后的所有消息"""
+    session = ChatSession.query.get(session_id)
+    if not session:
+        return jsonify({"error": "会话不存在"}), 404
+
+    data = request.get_json()
+    message_id = data.get("message_id")
+    if not message_id:
+        return jsonify({"error": "缺少 message_id"}), 400
+
+    target = ChatMessage.query.get(message_id)
+    if not target or target.session_id != session_id:
+        return jsonify({"error": "消息不存在"}), 404
+
+    # 删除该消息及之后的所有消息
+    ChatMessage.query.filter(
+        ChatMessage.session_id == session_id,
+        ChatMessage.created_at >= target.created_at
+    ).delete()
+    db.session.commit()
+
+    return jsonify({"success": True})
+
+
+@app.route("/api/upload-image", methods=["POST"])
+def upload_image():
+    """上传图片到 S3，返回公开 URL"""
+    import base64
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "请求体不能为空"}), 400
+
+    image_data_url = data.get("image")
+    user_id = data.get("user_id")
+    session_id = data.get("session_id")
+
+    if not image_data_url or not image_data_url.startswith("data:"):
+        return jsonify({"error": "无效的图片数据"}), 400
+
+    header, b64_data = image_data_url.split(",", 1)
+    mime = header.split(":")[1].split(";")[0]
+    image_bytes = base64.b64decode(b64_data)
+
+    result = storage_service.upload_image(
+        image_bytes,
+        user_id=user_id,
+        session_id=session_id,
+        content_type=mime,
+    )
+    if not result:
+        return jsonify({"error": "图片上传失败"}), 500
+
+    return jsonify({"url": result["url"]})
+
+
 @app.route("/api/sessions/<session_id>/messages", methods=["POST"])
 def add_message(session_id):
     """添加消息到会话"""
@@ -178,11 +243,16 @@ def add_message(session_id):
     if not data.get('role') or not data.get('content'):
         return jsonify({"error": "缺少 role 或 content"}), 400
     
+    # images 此时已经是 S3 URL 列表
+    image_urls = data.get('images')
+    images_json = json.dumps(image_urls) if image_urls else None
+    
     message = ChatMessage(
         id=data.get('id', str(uuid.uuid4())),
         session_id=session_id,
         role=data['role'],
-        content=data['content']
+        content=data['content'],
+        images=images_json,
     )
     db.session.add(message)
     db.session.commit()
@@ -232,10 +302,10 @@ def chat_stream():
     ai_role = data.get("ai_role", "xiaosuolaoshi")
     user_id = data.get("user_id")
     session_id = data.get("session_id")
-    user_name = data.get("user_name")  # [mod-dragon]
+    images = data.get("images")  # S3 公开 URL 列表
     
     def generate():
-        for chunk in ai_service.chat_stream(message, history, ai_role, user_id, session_id, user_name=user_name):
+        for chunk in ai_service.chat_stream(message, history, ai_role, user_id, session_id, images=images):
             event_type = chunk["type"]
             
             if event_type == "content":
@@ -248,9 +318,6 @@ def chat_stream():
                 yield f"event: search_complete\ndata: {{}}\n\n"
             elif event_type == "drawing":
                 yield f"event: drawing\ndata: {json.dumps({'prompt': chunk['content']})}\n\n"
-            # [mod-dragon] 生日彩蛋事件
-            elif event_type == "birthday_egg":
-                yield f"event: birthday_egg\ndata: {json.dumps({'seq': chunk.get('seq'), 'user_id': chunk.get('user_id'), 'user_name': chunk.get('user_name'), 'triggered_at': chunk.get('triggered_at')})}\n\n"
             elif event_type == "image":
                 # 保存图片记录到数据库
                 if chunk.get("s3_key") and user_id:

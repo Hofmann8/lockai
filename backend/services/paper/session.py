@@ -9,10 +9,12 @@ from enum import Enum
 from typing import Optional
 
 from .vfs import VirtualFileSystem
+from .embeddings import EmbeddingIndex
 
 
 class PaperStatus(Enum):
     PENDING = "pending"
+    PLANNING_CHAT = "planning_chat"
     RESEARCHING = "researching"
     PLANNING = "planning"
     WRITING = "writing"
@@ -41,6 +43,8 @@ class PaperSession:
     literature_summary: str = ""
     file_plan: dict = field(default_factory=dict)
     content: dict = field(default_factory=dict)
+    design_context: str = ""  # 规划对话上下文
+    embedding_index: EmbeddingIndex = field(default_factory=EmbeddingIndex)
 
 
 class SessionManager:

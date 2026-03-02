@@ -11,6 +11,7 @@ from .storage import StorageService
 from .search import SearchService
 from .image import ImageService
 from .title import TitleService
+from .mod_dragon import process_dragon_stream, has_user_triggered, get_dragon_birthday_prompt  # [mod-dragon]
 
 
 class AIService:
@@ -32,7 +33,7 @@ class AIService:
         """生成对话标题"""
         return self.title.generate(user_message)
     
-    def chat_stream(self, message: str, history: list = None, ai_role: str = 'xiaosuolaoshi', user_id: str = None, session_id: str = None) -> Generator[dict, None, None]:
+    def chat_stream(self, message: str, history: list = None, ai_role: str = 'xiaosuolaoshi', user_id: str = None, session_id: str = None, user_name: str = None) -> Generator[dict, None, None]:
         """
         流式聊天接口
         
@@ -78,6 +79,19 @@ class AIService:
         if ai_role == 'scooby_fast':
             for chunk in self.llm.stream_qwen(messages, model="qwen3-max", enable_thinking=False):
                 yield chunk
+            yield {"type": "done", "content": ""}
+            return
+        
+        # [mod-dragon] Dragon 模式：复用 Scooby 通道，深度/快速，包装彩蛋检测
+        if ai_role in ('dragon', 'dragon_fast'):
+            # 该用户未触发过彩蛋时才注入生日隐藏 prompt
+            if not has_user_triggered(user_id):
+                birthday_hint = get_dragon_birthday_prompt()
+                if birthday_hint and messages and messages[0].get("role") == "system":
+                    messages[0]["content"] += "\n\n" + birthday_hint
+            enable_thinking = ai_role == 'dragon'
+            raw = self.llm.stream_qwen(messages, model="qwen3-max", enable_thinking=enable_thinking)
+            yield from process_dragon_stream(raw, user_id, user_name)
             yield {"type": "done", "content": ""}
             return
         

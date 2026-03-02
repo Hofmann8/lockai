@@ -194,8 +194,18 @@ export function PDFPreview({ pdfUrl, proxyUrl, onDownload }: PDFPreviewProps) {
   }, [zoomIn, zoomOut]);
 
   const handleDownload = () => {
-    if (onDownload) onDownload();
-    else window.open(pdfUrl, '_blank');
+    if (onDownload) { onDownload(); return; }
+    // 跨域 S3 链接无法用 <a download>，走代理或直接打开
+    // 优先用代理（带 ?download=1 触发 attachment disposition）
+    const url = proxyUrl ? `${proxyUrl}?download=1` : pdfUrl;
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'paper.pdf';
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
   };
 
   return (

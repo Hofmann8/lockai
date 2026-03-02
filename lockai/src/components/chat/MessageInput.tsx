@@ -1,17 +1,20 @@
 'use client';
 
 import { useState, useRef, useCallback, useEffect, KeyboardEvent } from 'react';
-import { Send, Loader2, ChevronDown, Brain, Zap } from 'lucide-react';
-import { AIRole, AI_ROLES, getSettings, saveSettings } from '@/lib/settings';
+import { Send, Loader2, ChevronDown, Brain, Zap, PartyPopper, Flame } from 'lucide-react';
+import { AIRole, AI_ROLES, EffectiveAIRole, getEffectiveRoleFromState, getSettings, saveSettings } from '@/lib/settings';
+// [mod-dragon] 生日限定模型，移除时删除此行及下方 dragon 相关调用
+import { patchModelOrder, onDragonRoleChange, applyDragonTheme } from '@/lib/mod-dragon';
 
 interface MessageInputProps {
-  onSend: (message: string) => void;
+  onSend: (message: string, effectiveRole: EffectiveAIRole) => void;
   disabled?: boolean;
   onActiveChange?: (active: boolean) => void;
 }
 
 // 模型显示顺序
-const MODEL_ORDER: AIRole[] = ['campbell', 'scooby', 'leo', 'xiaosuolaoshi'];
+const BASE_MODEL_ORDER: AIRole[] = ['campbell', 'scooby', 'leo', 'xiaosuolaoshi'];
+const MODEL_ORDER = patchModelOrder(BASE_MODEL_ORDER); // [mod-dragon]
 
 export function MessageInput({ onSend, disabled = false, onActiveChange }: MessageInputProps) {
   const [value, setValue] = useState('');
@@ -29,6 +32,7 @@ export function MessageInput({ onSend, disabled = false, onActiveChange }: Messa
     const settings = getSettings();
     setCurrentRole(settings.aiRole);
     setScoobyDeepThinking(settings.scoobyDeepThinking);
+    applyDragonTheme(settings.aiRole === 'dragon'); // [mod-dragon]
   }, []);
 
   // 点击外部关闭菜单
@@ -56,12 +60,13 @@ export function MessageInput({ onSend, disabled = false, onActiveChange }: Messa
 
   const handleSubmit = useCallback(() => {
     if (!value.trim() || disabled) return;
-    onSend(value);
+    const effectiveRole = getEffectiveRoleFromState(currentRole, scoobyDeepThinking);
+    onSend(value, effectiveRole);
     setValue('');
     if (textareaRef.current) {
       textareaRef.current.style.height = 'auto';
     }
-  }, [value, disabled, onSend]);
+  }, [value, disabled, onSend, currentRole, scoobyDeepThinking]);
 
   const handleKeyDown = useCallback((e: KeyboardEvent<HTMLTextAreaElement>) => {
     if (e.key === 'Enter' && !e.shiftKey) {
@@ -74,6 +79,7 @@ export function MessageInput({ onSend, disabled = false, onActiveChange }: Messa
     setCurrentRole(role);
     saveSettings({ aiRole: role });
     setShowModelMenu(false);
+    onDragonRoleChange(role); // [mod-dragon]
   };
 
   const handleThinkingToggle = () => {
@@ -83,7 +89,7 @@ export function MessageInput({ onSend, disabled = false, onActiveChange }: Messa
   };
 
   const currentRoleConfig = AI_ROLES.find(r => r.id === currentRole);
-  const orderedRoles = MODEL_ORDER.map(id => AI_ROLES.find(r => r.id === id)!).filter(Boolean);
+  const orderedRoles = MODEL_ORDER.map(id => AI_ROLES.find(r => r.id === id)!).filter(r => r && r.available);
 
   return (
     <div 
@@ -150,8 +156,9 @@ export function MessageInput({ onSend, disabled = false, onActiveChange }: Messa
 
           {/* 思考模式切换 */}
           {(() => {
-            const canToggle = currentRole === 'scooby';
-            const isDeepThinking = currentRole === 'campbell' || currentRole === 'xiaosuolaoshi' || (currentRole === 'scooby' && scoobyDeepThinking);
+            const canToggle = currentRole === 'scooby' || currentRole === 'dragon'; // [mod-dragon]
+            const isDeepThinking = currentRole === 'campbell' || currentRole === 'xiaosuolaoshi' || (currentRole === 'scooby' && scoobyDeepThinking) || (currentRole === 'dragon' && scoobyDeepThinking); // [mod-dragon]
+            const isDragon = currentRole === 'dragon'; // [mod-dragon]
             
             return (
               <button
@@ -170,7 +177,19 @@ export function MessageInput({ onSend, disabled = false, onActiveChange }: Messa
                   }
                 `}
               >
-                {isDeepThinking ? (
+                {isDragon ? ( // [mod-dragon] Dragon 专属文案
+                  isDeepThinking ? (
+                    <>
+                      <PartyPopper className="w-4 h-4" />
+                      <span>你先别急</span>
+                    </>
+                  ) : (
+                    <>
+                      <Flame className="w-4 h-4" />
+                      <span>我急死了</span>
+                    </>
+                  )
+                ) : isDeepThinking ? (
                   <>
                     <Brain className="w-4 h-4" />
                     <span>深度思考</span>

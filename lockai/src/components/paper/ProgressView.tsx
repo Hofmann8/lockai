@@ -6,7 +6,7 @@ const STAGES = [
   { key: 'researching', label: '文献检索', icon: Search },
   { key: 'planning', label: '结构规划', icon: BookOpen },
   { key: 'writing', label: '内容撰写', icon: PenTool },
-  { key: 'formatting', label: 'LaTeX 排版', icon: FileCode },
+  { key: 'formatting', label: '精美排版', icon: FileCode },
   { key: 'compiling', label: '编译 PDF', icon: FileText },
 ] as const;
 
@@ -54,14 +54,30 @@ export function ProgressView({
         <p className="text-sm text-muted-foreground">{detail}</p>
       </div>
 
-      {/* Progress bar */}
-      <div className="w-full h-1.5 rounded-full bg-muted mb-8 overflow-hidden">
-        <div
-          className={`h-full rounded-full transition-all duration-700 ease-out ${
-            isError ? 'bg-destructive' : isComplete ? 'bg-green-500' : 'bg-primary'
-          }`}
-          style={{ width: `${progressPercent}%` }}
-        />
+      {/* Progress bar — error 时绿色到失败前一阶段，红色到失败阶段 */}
+      <div className="w-full h-1.5 rounded-full bg-muted mb-8 overflow-hidden relative">
+        {isError && currentIndex > 0 ? (
+          <>
+            <div
+              className="absolute h-full rounded-full bg-green-500 transition-all duration-700 ease-out"
+              style={{ width: `${(currentIndex / STAGES.length) * 100}%` }}
+            />
+            <div
+              className="absolute h-full rounded-r-full bg-destructive transition-all duration-700 ease-out"
+              style={{
+                left: `${(currentIndex / STAGES.length) * 100}%`,
+                width: `${(0.5 / STAGES.length) * 100}%`,
+              }}
+            />
+          </>
+        ) : (
+          <div
+            className={`h-full rounded-full transition-all duration-700 ease-out ${
+              isError ? 'bg-destructive' : isComplete ? 'bg-green-500' : 'bg-primary'
+            }`}
+            style={{ width: `${progressPercent}%` }}
+          />
+        )}
       </div>
 
       {/* Stage indicators */}

@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useCallback, useEffect, useTransition, createContext, useContext } from 'react';
+import { useState, useCallback, useEffect, useTransition, createContext, useContext, ReactNode } from 'react';
 import { usePathname } from 'next/navigation';
 import { ChatSession, PaperRecord } from '@/types';
 import { Sidebar } from '@/components/chat/Sidebar';
@@ -21,6 +21,8 @@ interface AppShellContextType {
   paperNewProjectTick: number;
   sidebarCollapsed: boolean;
   setSidebarCollapsed: (collapsed: boolean) => void;
+  setPaperHeaderTitle: (title: string) => void;
+  setPaperHeaderAction: (action: ReactNode | null) => void;
 }
 
 const AppShellContext = createContext<AppShellContextType | null>(null);
@@ -44,6 +46,8 @@ export function AppShell({ children }: AppShellProps) {
   const [paperRecords, setPaperRecords] = useState<PaperRecord[]>([]);
   const [currentPaperId, setCurrentPaperId] = useState<string | null>(null);
   const [paperNewProjectTick, setPaperNewProjectTick] = useState(0);
+  const [paperHeaderTitle, setPaperHeaderTitle] = useState('');
+  const [paperHeaderAction, setPaperHeaderAction] = useState<ReactNode | null>(null);
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isPending, startTransition] = useTransition();
@@ -129,6 +133,8 @@ export function AppShell({ children }: AppShellProps) {
     paperNewProjectTick,
     sidebarCollapsed,
     setSidebarCollapsed,
+    setPaperHeaderTitle,
+    setPaperHeaderAction,
   };
 
   return (
@@ -163,7 +169,16 @@ export function AppShell({ children }: AppShellProps) {
                 {currentSessionTitle}
               </div>
             )}
-            <div className="w-16" />
+            {isPaper && paperHeaderTitle && (
+              <div className="absolute left-1/2 -translate-x-1/2 text-sm text-muted-foreground truncate max-w-[50%]">
+                {paperHeaderTitle}
+              </div>
+            )}
+            {isPaper && paperHeaderAction ? (
+              <div className="flex items-center">{paperHeaderAction}</div>
+            ) : (
+              <div className="w-16" />
+            )}
           </div>
         </div>
         {children}

@@ -21,8 +21,22 @@ def persist_session(session: PaperSession, storage, db, upsert: bool = False):
     session.pdf_s3_key = pdf_key
     session.pdf_url = result["url"] if result else None
 
-    # 2. VFS → gzip JSON → S3
+    # 2. VFS → gzip JSON → S3（包含 __meta__ 中间产物）
+    if session.literature:
+        session.vfs.write("__meta__/literature.json", json.dumps(session.literature, ensure_ascii=False))
+    if session.content:
+        session.vfs.write("__meta__/content.json", json.dumps(session.content, ensure_ascii=False))
+    if session.design_context:
+        session.vfs.write("__meta__/design_context.txt", session.design_context)
+    if session.embedding_index and session.embedding_index.chunks:
+        session.vfs.write("__meta__/embeddings.json", session.embedding_index.serialize())
+
     vfs_json = session.vfs.serialize().encode("utf-8")
+
+    # 序列化完成后清理 __meta__ 文件
+    for f in list(session.vfs.list_files()):
+        if f.startswith("__meta__/"):
+            session.vfs.delete(f)
     vfs_gz = gzip.compress(vfs_json)
     vfs_key = f"users/{session.user_id}/papers/{session.id}/vfs.json.gz"
     storage.upload_bytes(vfs_gz, vfs_key, "application/gzip")
@@ -76,6 +90,34 @@ def restore_session(paper_id: str, storage, db) -> PaperSession | None:
             vfs_json = gzip.decompress(vfs_gz).decode("utf-8")
             vfs = VirtualFileSystem.deserialize(vfs_json)
 
+    # 从 VFS 的 __meta__ 命名空间恢复 session 中间产物
+    literature = []
+    content = {}
+    design_context = ""
+
+    meta_lit = vfs.read("__meta__/literature.json")
+    if meta_lit:
+        literature = json.loads(meta_lit)
+        vfs.delete("__meta__/literature.json")
+
+    meta_content = vfs.read("__meta__/content.json")
+    if meta_content:
+        content = json.loads(meta_content)
+        vfs.delete("__meta__/content.json")
+
+    meta_dc = vfs.read("__meta__/design_context.txt")
+    if meta_dc:
+        design_context = meta_dc
+        vfs.delete("__meta__/design_context.txt")
+
+    # 恢复 embedding 索引
+    from .embeddings import EmbeddingIndex
+    embedding_index = EmbeddingIndex()
+    meta_emb = vfs.read("__meta__/embeddings.json")
+    if meta_emb:
+        embedding_index = EmbeddingIndex.deserialize(meta_emb)
+        vfs.delete("__meta__/embeddings.json")
+
     session = PaperSession(
         id=record.id,
         user_id=record.user_id,
@@ -86,5 +128,9 @@ def restore_session(paper_id: str, storage, db) -> PaperSession | None:
         pdf_s3_key=record.pdf_s3_key,
         vfs_s3_key=record.vfs_s3_key,
         file_plan=json.loads(record.outline_json) if record.outline_json else {},
+        literature=literature,
+        content=content,
+        design_context=design_context,
+        embedding_index=embedding_index,
     )
     return session

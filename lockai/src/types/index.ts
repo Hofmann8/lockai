@@ -19,8 +19,10 @@ export interface ChatSession {
 export interface ChatRequest {
   message: string;
   history?: ChatMessage[];
+  ai_role?: string;
   user_id?: string;
   session_id?: string;
+  user_name?: string; // [mod-dragon]
 }
 
 // 聊天响应
@@ -82,6 +84,8 @@ export interface ErrorResponse {
 export interface PaperGenerateRequest {
   topic: string;
   user_id?: string;
+  design_context?: string;
+  paper_id?: string;
 }
 
 export interface PaperReviseRequest {
@@ -109,16 +113,3 @@ export interface PaperFileContent {
   path: string;
   content: string;
 }
-
-export type PaperEventType = 'session_created' | 'progress' | 'completed' | 'error';
-
-export interface PaperEvent {
-  type: PaperEventType;
-  session_id?: string;
-  stage?: string;
-  detail?: string;
-  pdf_url?: string;
-  message?: string;
-}
-
-export type PaperEventCallback = (event: PaperEvent) => void;

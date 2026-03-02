@@ -8,6 +8,7 @@ import { sendChatMessageStream, StreamEvent, generateSessionTitle } from '@/lib/
 import { getSession, createSession, addMessage } from '@/lib/chat-history';
 import { getAuthState } from '@/lib/auth';
 import { useAppShell } from '@/components/AppShell';
+import { EffectiveAIRole } from '@/lib/settings';
 
 const initialState: ChatState = {
   messages: [],
@@ -27,6 +28,8 @@ export default function ChatPage() {
   const [drawingPrompt, setDrawingPrompt] = useState('');
   const [generatedImages, setGeneratedImages] = useState<string[]>([]);
   const [isInputActive, setIsInputActive] = useState(false);
+  // [mod-dragon] 生日彩蛋状态
+  const [birthdayEgg, setBirthdayEgg] = useState<{ seq: number; userId: string; userName: string; triggeredAt: string } | null>(null);
 
   // 加载当前会话消息
   useEffect(() => {
@@ -41,7 +44,7 @@ export default function ChatPage() {
     }
   }, [currentSessionId]);
 
-  const handleSendMessage = useCallback(async (content: string) => {
+  const handleSendMessage = useCallback(async (content: string, effectiveRole: EffectiveAIRole) => {
     if (!content.trim() || state.isLoading) return;
 
     let sessionId = currentSessionId;
@@ -84,6 +87,7 @@ export default function ChatPage() {
     setIsDrawing(false);
     setDrawingPrompt('');
     setGeneratedImages([]);
+    setBirthdayEgg(null); // [mod-dragon]
 
     let fullContent = '';
     const images: string[] = [];
@@ -123,6 +127,15 @@ export default function ChatPage() {
         case 'drawing':
           setIsDrawing(true);
           setDrawingPrompt(event.prompt || '');
+          break;
+        case 'birthday_egg':
+          // [mod-dragon] 生日彩蛋触发
+          setBirthdayEgg({
+            seq: event.eggSeq || 0,
+            userId: event.eggUserId || '',
+            userName: event.eggUserName || '',
+            triggeredAt: event.eggTriggeredAt || '',
+          });
           break;
         case 'image':
           if (event.image) {
@@ -174,8 +187,10 @@ export default function ChatPage() {
       {
         message: content.trim(),
         history: state.messages,
+        ai_role: effectiveRole,
         user_id: getAuthState().user?.id,
         session_id: sessionId,
+        user_name: getAuthState().user?.name, // [mod-dragon]
       },
       handleEvent
     );
@@ -230,6 +245,7 @@ export default function ChatPage() {
             drawingPrompt={drawingPrompt}
             generatedImages={generatedImages}
             isInputActive={isInputActive}
+            birthdayEgg={birthdayEgg}
           />
         </div>
       </div>

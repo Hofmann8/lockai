@@ -264,7 +264,9 @@ class LLMService:
                     name = fn.get("name", "")
                     try:
                         arguments = json.loads(fn.get("arguments", "{}"))
-                    except json.JSONDecodeError:
+                        if not isinstance(arguments, dict):
+                            arguments = {}
+                    except (json.JSONDecodeError, TypeError):
                         arguments = {}
 
                     print(f"[LLM] tool_call: {name}({json.dumps(arguments, ensure_ascii=False)[:200]})")

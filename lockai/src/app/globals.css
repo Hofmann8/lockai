@@ -66,6 +66,56 @@
   }
 }
 
+/* === MOD: Dragon birthday theme — START === */
+.dragon {
+  --primary: #f472b6;
+  --primary-foreground: #ffffff;
+  --accent: #fbbf24;
+  --accent-foreground: #1c1917;
+  --ring: #f472b6;
+}
+
+.dragon.dark {
+  --background: #1a0a1e;
+  --foreground: #fdf2f8;
+  --muted: #2d1033;
+  --muted-foreground: #d8b4fe;
+  --primary: #f472b6;
+  --primary-foreground: #1a0a1e;
+  --secondary: #2d1033;
+  --secondary-foreground: #fdf2f8;
+  --accent: #fbbf24;
+  --accent-foreground: #1a0a1e;
+  --destructive: #fb7185;
+  --destructive-foreground: #1a0a1e;
+  --border: #4a1942;
+  --input: #4a1942;
+  --ring: #f472b6;
+  --card: #2d1033;
+  --card-foreground: #fdf2f8;
+}
+
+.dragon.light {
+  --background: #fdf2f8;
+  --foreground: #4a044e;
+  --muted: #fce7f3;
+  --muted-foreground: #a21caf;
+  --primary: #ec4899;
+  --primary-foreground: #ffffff;
+  --secondary: #fce7f3;
+  --secondary-foreground: #4a044e;
+  --accent: #f59e0b;
+  --accent-foreground: #ffffff;
+  --destructive: #e11d48;
+  --destructive-foreground: #ffffff;
+  --border: #f9a8d4;
+  --input: #f9a8d4;
+  --ring: #ec4899;
+  --card: #ffffff;
+  --card-foreground: #4a044e;
+}
+/* === MOD: Dragon birthday theme — END === */
+
 @theme inline {
   --color-background: var(--background);
   --color-foreground: var(--foreground);

@@ -40,7 +40,7 @@ export function GenerateForm({ onSubmit, disabled = false }: GenerateFormProps) 
           一句话，完成论文
         </h2>
         <p className="text-sm text-muted-foreground">
-          输入研究主题，AI 自动完成文献检索、结构规划、内容撰写与 LaTeX 排版
+          输入研究主题，AI 自动完成文献检索、结构规划、内容撰写与精美排版
         </p>
       </div>
 

@@ -252,7 +252,7 @@ export function Sidebar({
                         <div className="flex-1 min-w-0">
                           <span className="block truncate text-sm">{record.topic}</span>
                           <span className="block text-xs text-muted-foreground">
-                            {record.status === 'completed' ? '已完成' : record.status}
+                            {record.status === 'completed' ? '已完成' : record.status === 'planning_chat' ? '规划中' : record.status}
                             {record.created_at && ` · ${new Date(record.created_at).toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' })}`}
                           </span>
                         </div>

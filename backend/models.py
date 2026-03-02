@@ -84,6 +84,8 @@ class PaperRecord(db.Model):
     pdf_url = db.Column(db.String(500))
     outline_json = db.Column(db.Text)
     error = db.Column(db.Text)
+    progress_detail = db.Column(db.String(500), default='')
+    planning_messages = db.Column(db.Text)  # JSON: 规划对话消息
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     completed_at = db.Column(db.DateTime)
 
@@ -94,6 +96,7 @@ class PaperRecord(db.Model):
             'status': self.status,
             'pdf_url': self.pdf_url,
             'error': self.error,
+            'progress_detail': self.progress_detail or '',
             'created_at': self.created_at.isoformat(),
             'completed_at': self.completed_at.isoformat() if self.completed_at else None,
         }

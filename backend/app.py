@@ -41,7 +41,7 @@ ai_service = AIService()
 # Paper generation service
 llm_service = LLMService()
 storage_service = StorageService()
-paper_service = PaperService(llm_service, storage_service)
+paper_service = PaperService(llm_service, storage_service, app=app)
 
 
 # ============ Session APIs ============
@@ -232,9 +232,10 @@ def chat_stream():
     ai_role = data.get("ai_role", "xiaosuolaoshi")
     user_id = data.get("user_id")
     session_id = data.get("session_id")
+    user_name = data.get("user_name")  # [mod-dragon]
     
     def generate():
-        for chunk in ai_service.chat_stream(message, history, ai_role, user_id, session_id):
+        for chunk in ai_service.chat_stream(message, history, ai_role, user_id, session_id, user_name=user_name):
             event_type = chunk["type"]
             
             if event_type == "content":
@@ -247,6 +248,9 @@ def chat_stream():
                 yield f"event: search_complete\ndata: {{}}\n\n"
             elif event_type == "drawing":
                 yield f"event: drawing\ndata: {json.dumps({'prompt': chunk['content']})}\n\n"
+            # [mod-dragon] 生日彩蛋事件
+            elif event_type == "birthday_egg":
+                yield f"event: birthday_egg\ndata: {json.dumps({'seq': chunk.get('seq'), 'user_id': chunk.get('user_id'), 'user_name': chunk.get('user_name'), 'triggered_at': chunk.get('triggered_at')})}\n\n"
             elif event_type == "image":
                 # 保存图片记录到数据库
                 if chunk.get("s3_key") and user_id:
@@ -313,24 +317,118 @@ def paper_assist():
 
 # ============ Paper Generation APIs ============
 
-@app.route("/api/paper/generate", methods=["POST"])
-def paper_generate():
-    """POST /api/paper/generate — 开始生成论文（SSE 流）"""
+PAPER_PLAN_SYSTEM_PROMPT = """你是 LockAI 的学术论文规划助手。你的任务是和用户讨论论文主题，帮助他们明确研究方向、论文结构、格式规范和关键内容。
+
+当用户提出研究主题后，你需要完成以下工作：
+
+1. 分析主题的可行性和研究价值，给出简要评估
+2. 根据用户的研究方向，推荐合适的引用格式（如 IEEE、APA、GB/T 7714 等），并说明推荐理由
+3. 确认论文的基本格式要素（默认全部包含，除非用户明确不需要）：
+   - 摘要（中英文）
+   - 关键词
+   - 目录
+   - 参考文献列表
+   - 致谢（可选）
+4. 提出论文的建议结构（章节安排、每章重点、预估篇幅）
+5. 讨论可能的研究方法、关键论点、参考方向
+6. 根据用户反馈不断调整方案
+
+回复风格：
+- 简洁专业，不啰嗦
+- 用 Markdown 格式组织内容，方便阅读
+- 每次回复末尾用一个简短的「当前方案摘要」总结已确定的要点（主题、结构、引用格式、格式要素等）
+- 如果用户的想法不够具体，主动提问引导
+- 对于格式要素，如果用户没有特别说明，默认包含摘要和目录，不需要反复确认
+
+注意：你只负责规划和讨论，不要生成 LaTeX 代码。用户确认方案后会进入自动生成流程。"""
+
+
+@app.route("/api/paper/create", methods=["POST"])
+def paper_create():
+    """POST /api/paper/create — 创建论文规划记录（planning_chat 状态）"""
     data = request.get_json()
     if not data:
         return jsonify({"error": "请求体不能为空"}), 400
 
-    topic = data.get("topic")
-    if not topic or not isinstance(topic, str) or not topic.strip():
-        return jsonify({"error": "研究主题不能为空"}), 400
+    topic = data.get("topic", "").strip()
+    if not topic:
+        return jsonify({"error": "主题不能为空"}), 400
 
     user_id = data.get("user_id", "anonymous")
+    paper_id = str(uuid.uuid4().hex)
+
+    record = PaperRecord(
+        id=paper_id,
+        user_id=user_id,
+        topic=topic,
+        status="planning_chat",
+        progress_detail="规划讨论中...",
+    )
+    db.session.add(record)
+    db.session.commit()
+
+    return jsonify({"paper_id": paper_id}), 201
+
+
+@app.route("/api/paper/<paper_id>/planning-messages", methods=["PUT"])
+def paper_save_planning_messages(paper_id):
+    """PUT /api/paper/<paper_id>/planning-messages — 保存规划对话消息"""
+    record = PaperRecord.query.get(paper_id)
+    if not record:
+        return jsonify({"error": "论文不存在"}), 404
+
+    data = request.get_json()
+    messages = data.get("messages", [])
+    record.planning_messages = json.dumps(messages, ensure_ascii=False)
+    # 用第一条用户消息更新 topic
+    first_user = next((m for m in messages if m.get("role") == "user"), None)
+    if first_user:
+        record.topic = first_user["content"][:500]
+    db.session.commit()
+    return jsonify({"ok": True})
+
+
+@app.route("/api/paper/<paper_id>/planning-messages", methods=["GET"])
+def paper_get_planning_messages(paper_id):
+    """GET /api/paper/<paper_id>/planning-messages — 获取规划对话消息"""
+    record = PaperRecord.query.get(paper_id)
+    if not record:
+        return jsonify({"error": "论文不存在"}), 404
+
+    messages = []
+    if record.planning_messages:
+        messages = json.loads(record.planning_messages)
+    return jsonify({"messages": messages})
+
+
+@app.route("/api/paper/plan/chat", methods=["POST"])
+def paper_plan_chat():
+    """POST /api/paper/plan/chat — 论文规划对话（流式 SSE）"""
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "请求体不能为空"}), 400
+
+    messages = data.get("messages", [])
+    if not messages:
+        return jsonify({"error": "消息不能为空"}), 400
+
+    # 构建 LLM 消息
+    llm_messages = [{"role": "system", "content": PAPER_PLAN_SYSTEM_PROMPT}]
+    for msg in messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+        if role in ("user", "assistant") and content:
+            llm_messages.append({"role": role, "content": content})
+
+    paper_model = os.environ.get("MODEL_PAPER_PLANNER") or llm_service.model_primary
 
     def generate():
-        with app.app_context():
-            for event in paper_service.generate(user_id, topic.strip()):
-                event_type = event.get("type", "progress")
-                yield f"event: {event_type}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+        for chunk in llm_service.stream(llm_messages, model=paper_model):
+            if chunk.get("type") == "content":
+                yield f"event: content\ndata: {json.dumps({'content': chunk['content']})}\n\n"
+            elif chunk.get("type") == "error":
+                yield f"event: error\ndata: {json.dumps({'error': chunk['content']})}\n\n"
+        yield f"event: done\ndata: {{}}\n\n"
 
     return Response(
         generate(),
@@ -341,6 +439,30 @@ def paper_generate():
             "X-Accel-Buffering": "no",
         },
     )
+
+
+@app.route("/api/paper/generate", methods=["POST"])
+def paper_generate():
+    """POST /api/paper/generate — 提交论文生成任务（后台执行）"""
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "请求体不能为空"}), 400
+
+    topic = data.get("topic")
+    if not topic or not isinstance(topic, str) or not topic.strip():
+        return jsonify({"error": "研究主题不能为空"}), 400
+
+    user_id = data.get("user_id", "anonymous")
+    design_context = data.get("design_context", "")
+    paper_id = data.get("paper_id")  # 可选：从规划阶段传入已有 paper_id
+
+    result_id = paper_service.start_generate(
+        user_id, topic.strip(),
+        design_context=design_context,
+        paper_id=paper_id,
+    )
+
+    return jsonify({"paper_id": result_id}), 202
 
 
 @app.route("/api/paper/<paper_id>/status", methods=["GET"])
@@ -364,7 +486,7 @@ def paper_status(paper_id):
         return jsonify({"error": "论文不存在"}), 404
 
     # 兜底：DB 里是进行中状态，但内存 session 不存在，说明任务已中断。
-    terminal_statuses = {PaperStatus.COMPLETED.value, PaperStatus.FAILED.value}
+    terminal_statuses = {PaperStatus.COMPLETED.value, PaperStatus.FAILED.value, PaperStatus.PLANNING_CHAT.value}
     if record.status not in terminal_statuses:
         record.status = PaperStatus.FAILED.value
         if not record.error:
@@ -388,7 +510,7 @@ def paper_download(paper_id):
 
 @app.route("/api/paper/<paper_id>/pdf", methods=["GET"])
 def paper_pdf_proxy(paper_id):
-    """GET /api/paper/<paper_id>/pdf — 代理 PDF 内容（解决 S3 不支持 inline 预览）"""
+    """GET /api/paper/<paper_id>/pdf — 代理 PDF 内容（预览用 inline，下载用 attachment）"""
     record = PaperRecord.query.get(paper_id)
     if not record:
         return jsonify({"error": "论文不存在"}), 404
@@ -399,11 +521,14 @@ def paper_pdf_proxy(paper_id):
     if not pdf_bytes:
         return jsonify({"error": "PDF 下载失败"}), 502
 
+    is_download = request.args.get("download") == "1"
+    disposition = "attachment; filename=paper.pdf" if is_download else "inline"
+
     return Response(
         pdf_bytes,
         mimetype="application/pdf",
         headers={
-            "Content-Disposition": "inline",
+            "Content-Disposition": disposition,
             "Cache-Control": "public, max-age=3600",
         },
     )
@@ -463,7 +588,7 @@ def paper_file_content(paper_id, file_path):
 
 @app.route("/api/paper/<paper_id>/revise", methods=["POST"])
 def paper_revise(paper_id):
-    """POST /api/paper/<paper_id>/revise — 修订已有论文（SSE 流）"""
+    """POST /api/paper/<paper_id>/revise — 提交论文修订任务（后台执行）"""
     data = request.get_json()
     if not data:
         return jsonify({"error": "请求体不能为空"}), 400
@@ -472,21 +597,21 @@ def paper_revise(paper_id):
     if not instruction or not isinstance(instruction, str) or not instruction.strip():
         return jsonify({"error": "修改指令不能为空"}), 400
 
-    def generate():
-        with app.app_context():
-            for event in paper_service.revise(paper_id, instruction.strip()):
-                event_type = event.get("type", "progress")
-                yield f"event: {event_type}\ndata: {json.dumps(event, ensure_ascii=False)}\n\n"
+    ok = paper_service.start_revise(paper_id, instruction.strip())
+    if not ok:
+        return jsonify({"error": "论文不存在或数据已丢失"}), 404
 
-    return Response(
-        generate(),
-        mimetype="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "Connection": "keep-alive",
-            "X-Accel-Buffering": "no",
-        },
-    )
+    return jsonify({"paper_id": paper_id}), 202
+
+
+@app.route("/api/paper/<paper_id>/retry", methods=["POST"])
+def paper_retry(paper_id):
+    """POST /api/paper/<paper_id>/retry — 从失败阶段恢复生成"""
+    ok = paper_service.start_retry(paper_id)
+    if not ok:
+        return jsonify({"error": "论文不存在或无法恢复，请重新生成"}), 404
+
+    return jsonify({"paper_id": paper_id}), 202
 
 
 @app.route("/api/papers", methods=["GET"])

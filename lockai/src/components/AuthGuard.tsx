@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
-import { isAuthenticated } from '@/lib/auth';
+import { isAuthenticated, onAuthStateChange } from '@/lib/auth';
 
 interface AuthGuardProps {
   children: React.ReactNode;
@@ -20,15 +20,23 @@ export function AuthGuard({ children }: AuthGuardProps) {
   useEffect(() => {
     const checkAuth = () => {
       const authed = isAuthenticated();
+      setIsAuthed(authed);
       if (!authed) {
         router.push('/');
-      } else {
-        setIsAuthed(true);
       }
       setIsChecking(false);
     };
 
     checkAuth();
+    const unsubscribe = onAuthStateChange(() => {
+      const authed = isAuthenticated();
+      setIsAuthed(authed);
+      if (!authed) {
+        router.push('/');
+      }
+    });
+
+    return unsubscribe;
   }, [router]);
 
   // Show loading state while checking authentication

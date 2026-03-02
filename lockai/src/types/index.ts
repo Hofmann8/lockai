@@ -22,7 +22,6 @@ export interface ChatRequest {
   ai_role?: string;
   user_id?: string;
   session_id?: string;
-  user_name?: string; // [mod-dragon]
 }
 
 // 聊天响应

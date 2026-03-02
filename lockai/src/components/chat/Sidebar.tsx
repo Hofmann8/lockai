@@ -46,10 +46,13 @@ export function Sidebar({
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const avatarRefreshingRef = useRef(false);
   const avatarErrorHandledRef = useRef<string | null>(null);
+  const avatarUrlRef = useRef(avatarUrl);
+  avatarUrlRef.current = avatarUrl;
 
   const refreshAvatar = useCallback(async (force = false) => {
     if (avatarRefreshingRef.current) return;
-    if (!force && avatarUrl && !isSignedUrlExpired(avatarUrl)) return;
+    const current = avatarUrlRef.current;
+    if (!force && current && !isSignedUrlExpired(current)) return;
 
     avatarRefreshingRef.current = true;
     try {
@@ -58,22 +61,21 @@ export function Sidebar({
         avatarErrorHandledRef.current = null;
         setAvatarUrl(url);
         updateAvatarUrl(url);
-      } else if (force && avatarUrl) {
-        // 强制刷新失败时回退到默认头像，避免持续 403。
+      } else if (force && current) {
         setAvatarUrl(null);
         updateAvatarUrl(null);
       }
     } finally {
       avatarRefreshingRef.current = false;
     }
-  }, [avatarUrl]);
+  }, []);
 
-  // 初始化和状态变化时，按需刷新头像签名 URL。
+  // 初始化时刷新一次头像
   useEffect(() => {
     void refreshAvatar(false);
   }, [refreshAvatar]);
 
-  // 在过期前 5 分钟自动续签，避免用户使用中突然 403。
+  // 在过期前 5 分钟自动续签
   useEffect(() => {
     if (!avatarUrl) return;
     const expiresAt = getSignedUrlExpiry(avatarUrl);
@@ -89,18 +91,18 @@ export function Sidebar({
   }, [avatarUrl, refreshAvatar]);
 
   const handleAvatarError = useCallback(() => {
-    if (!avatarUrl) return;
+    const current = avatarUrlRef.current;
+    if (!current) return;
 
-    // 同一 URL 只重试一次，防止加载失败循环。
-    if (avatarErrorHandledRef.current === avatarUrl) {
+    if (avatarErrorHandledRef.current === current) {
       setAvatarUrl(null);
       updateAvatarUrl(null);
       return;
     }
 
-    avatarErrorHandledRef.current = avatarUrl;
+    avatarErrorHandledRef.current = current;
     void refreshAvatar(true);
-  }, [avatarUrl, refreshAvatar]);
+  }, [refreshAvatar]);
 
   const handleDeleteClick = (e: React.MouseEvent, sessionId: string) => {
     e.stopPropagation();

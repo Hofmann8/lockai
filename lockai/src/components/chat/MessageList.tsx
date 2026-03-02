@@ -8,7 +8,6 @@ import { Loader2, Search, Palette } from 'lucide-react';
 import { getCurrentRoleName, onSettingsChange, getSettings, isDeepThinkingMode } from '@/lib/settings';
 import Lottie, { LottieRefCurrentProps } from 'lottie-react';
 import lockAnimation from '../../../public/Unlock.json';
-import dragonAnimation from '../../../public/Dragon.json'; // [mod-dragon]
 import Image from 'next/image';
 import { useTheme } from '@/lib/theme';
 
@@ -23,33 +22,7 @@ interface MessageListProps {
   drawingPrompt?: string;
   generatedImages?: string[];
   isInputActive?: boolean;
-  // [mod-dragon] 生日彩蛋
-  birthdayEgg?: { seq: number; userId: string; userName: string; triggeredAt: string } | null;
-}
-
-// [mod-dragon] 生日贺卡组件
-function DragonBirthdayCard({ egg }: { egg: { seq: number; userId: string; userName: string; triggeredAt: string } }) {
-  return (
-    <div className="w-80 rounded-2xl border-2 border-pink-400/50 bg-gradient-to-br from-pink-50 to-amber-50 dark:from-pink-950/40 dark:to-amber-950/30 p-6 shadow-lg animate-scale-in">
-      <div className="text-center space-y-3">
-        <div className="text-4xl">🎉🐉🎂</div>
-        <h3 className="text-lg font-bold bg-gradient-to-r from-pink-500 to-amber-500 bg-clip-text text-transparent">
-          Happy Birthday Dragon!
-        </h3>
-        <p className="text-sm text-muted-foreground">
-          {egg.userName} 祝舞队队长 Dragon 生日快乐
-        </p>
-        <div className="pt-2 border-t border-pink-200 dark:border-pink-800 space-y-1">
-          <p className="text-xs text-muted-foreground/70">
-            彩蛋编号 #{egg.seq}
-          </p>
-          <p className="text-xs text-muted-foreground/70">
-            {new Date(egg.triggeredAt).toLocaleString('zh-CN')}
-          </p>
-        </div>
-      </div>
-    </div>
-  );
+  onRecall?: (message: ChatMessage) => void;
 }
 
 export function MessageList({ 
@@ -63,7 +36,7 @@ export function MessageList({
   drawingPrompt = '',
   generatedImages = [],
   isInputActive = false,
-  birthdayEgg = null,
+  onRecall,
 }: MessageListProps) {
   const bottomRef = useRef<HTMLDivElement>(null);
   const lottieRef = useRef<LottieRefCurrentProps>(null);
@@ -74,8 +47,6 @@ export function MessageList({
   const thinkingTimerRef = useRef<NodeJS.Timeout | null>(null);
   const prevInputActive = useRef(isInputActive);
   const { resolvedTheme } = useTheme();
-  // [mod-dragon] 生日贺卡展开状态
-  const [showBirthdayCard, setShowBirthdayCard] = useState(false);
 
   useEffect(() => {
     setRoleName(getCurrentRoleName());
@@ -113,7 +84,6 @@ export function MessageList({
   // 控制 Lottie 动画播放方向
   useEffect(() => {
     if (!lottieRef.current) return;
-    if (currentRole === 'dragon') return; // [mod-dragon] Dragon 自己 loop，不干预
     
     if (isInputActive && !prevInputActive.current) {
       // 从锁着到开锁：播放 45→69
@@ -135,21 +105,12 @@ export function MessageList({
     return (
       <div className="h-full flex flex-col items-center justify-center text-muted-foreground animate-fade-in">
         <div className="w-20 h-20 mb-4 opacity-50">
-          {/* [mod-dragon] Dragon 自动循环播放，锁由 isInputActive 驱动 */}
-          {currentRole === 'dragon' ? (
-            <Lottie
-              animationData={dragonAnimation}
-              loop={true}
-              autoplay={true}
-            />
-          ) : (
-            <Lottie
-              lottieRef={lottieRef}
-              animationData={lockAnimation}
-              loop={false}
-              autoplay={false}
-            />
-          )}
+          <Lottie
+            lottieRef={lottieRef}
+            animationData={lockAnimation}
+            loop={false}
+            autoplay={false}
+          />
         </div>
         <p className="text-lg font-medium">开始与{roleName}对话</p>
         <p className="text-sm mt-1">输入消息开始聊天</p>
@@ -160,7 +121,7 @@ export function MessageList({
   return (
     <div className="px-4 pt-6 pb-6 space-y-6">
       {messages.map((message) => (
-        <Message key={message.id} message={message} />
+        <Message key={message.id} message={message} onRecall={onRecall} />
       ))}
 
       {/* 流式输出中的消息 */}
@@ -374,39 +335,7 @@ export function MessageList({
                 深度思考耗时较长，切换快速思考模式可以更快响应
               </p>
             )}
-            {/* [mod-dragon] Dragon 思考提示 */}
-            {currentRole === 'dragon' && isDeepThinking && thinkingSeconds >= 6 && thinkingSeconds < 20 && (
-              <p className="text-xs text-muted-foreground/70 mt-2 animate-fade-in">
-                Dragon 脑子转起来了 别催
-              </p>
-            )}
-            {currentRole === 'dragon' && isDeepThinking && thinkingSeconds >= 20 && thinkingSeconds < 40 && (
-              <p className="text-xs text-muted-foreground/70 mt-2 animate-fade-in">
-                他在想一个很牛的回答 你先别急
-              </p>
-            )}
-            {currentRole === 'dragon' && isDeepThinking && thinkingSeconds >= 40 && (
-              <p className="text-xs text-muted-foreground/70 mt-2 animate-fade-in">
-                bro 憋大招呢 再给他一点时间
-              </p>
-            )}
           </div>
-        </div>
-      )}
-
-      {/* [mod-dragon] 生日彩蛋按钮 + 贺卡 */}
-      {birthdayEgg && !isLoading && (
-        <div className="flex justify-start ml-14 animate-fade-in">
-          {!showBirthdayCard ? (
-            <button
-              onClick={() => setShowBirthdayCard(true)}
-              className="px-4 py-2 rounded-xl bg-gradient-to-r from-pink-500 to-amber-400 text-white text-sm font-medium hover:opacity-90 transition-opacity cursor-pointer animate-bounce-subtle"
-            >
-              🎂 查看生日贺卡
-            </button>
-          ) : (
-            <DragonBirthdayCard egg={birthdayEgg} />
-          )}
         </div>
       )}
 

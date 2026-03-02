@@ -5,7 +5,7 @@ import { ChatMessage, ChatState } from '@/types';
 import { MessageList } from '@/components/chat/MessageList';
 import { MessageInput } from '@/components/chat/MessageInput';
 import { sendChatMessageStream, StreamEvent, generateSessionTitle } from '@/lib/api';
-import { getSession, createSession, addMessage } from '@/lib/chat-history';
+import { getSession, createSession, addMessage, truncateMessages } from '@/lib/chat-history';
 import { getAuthState } from '@/lib/auth';
 import { useAppShell } from '@/components/AppShell';
 import { EffectiveAIRole } from '@/lib/settings';
@@ -17,7 +17,7 @@ const initialState: ChatState = {
 };
 
 export default function ChatPage() {
-  const { currentSessionId, setCurrentSessionId, loadSessions } = useAppShell();
+  const { currentSessionId, setCurrentSessionId, loadSessions, sessions } = useAppShell();
   
   const [state, setState] = useState<ChatState>(initialState);
   const [streamingContent, setStreamingContent] = useState('');
@@ -28,8 +28,8 @@ export default function ChatPage() {
   const [drawingPrompt, setDrawingPrompt] = useState('');
   const [generatedImages, setGeneratedImages] = useState<string[]>([]);
   const [isInputActive, setIsInputActive] = useState(false);
-  // [mod-dragon] 生日彩蛋状态
-  const [birthdayEgg, setBirthdayEgg] = useState<{ seq: number; userId: string; userName: string; triggeredAt: string } | null>(null);
+  const [recallText, setRecallText] = useState<string | undefined>(undefined);
+  const [recallTick, setRecallTick] = useState(0);
 
   // 加载当前会话消息
   useEffect(() => {
@@ -87,7 +87,6 @@ export default function ChatPage() {
     setIsDrawing(false);
     setDrawingPrompt('');
     setGeneratedImages([]);
-    setBirthdayEgg(null); // [mod-dragon]
 
     let fullContent = '';
     const images: string[] = [];
@@ -127,15 +126,6 @@ export default function ChatPage() {
         case 'drawing':
           setIsDrawing(true);
           setDrawingPrompt(event.prompt || '');
-          break;
-        case 'birthday_egg':
-          // [mod-dragon] 生日彩蛋触发
-          setBirthdayEgg({
-            seq: event.eggSeq || 0,
-            userId: event.eggUserId || '',
-            userName: event.eggUserName || '',
-            triggeredAt: event.eggTriggeredAt || '',
-          });
           break;
         case 'image':
           if (event.image) {
@@ -190,7 +180,6 @@ export default function ChatPage() {
         ai_role: effectiveRole,
         user_id: getAuthState().user?.id,
         session_id: sessionId,
-        user_name: getAuthState().user?.name, // [mod-dragon]
       },
       handleEvent
     );
@@ -205,8 +194,11 @@ export default function ChatPage() {
       };
       await addMessage(sessionId, msgToSave);
 
-      if (newMessages.length === 1) {
-        const title = await generateSessionTitle(sessionId, content.trim(), savedAssistantContent);
+      // 检查 session 是否还没有生成过标题（默认"新对话"）
+      const currentSession = sessions.find(s => s.id === sessionId);
+      if (!currentSession || currentSession.title === '新对话') {
+        const firstUserMsg = state.messages.find(m => m.role === 'user')?.content || content.trim();
+        const title = await generateSessionTitle(sessionId, firstUserMsg, savedAssistantContent);
         if (title) {
           await loadSessions();
         }
@@ -217,6 +209,23 @@ export default function ChatPage() {
   const clearError = useCallback(() => {
     setState(prev => ({ ...prev, error: null }));
   }, []);
+
+  const handleRecall = useCallback(async (message: ChatMessage) => {
+    if (!currentSessionId) return;
+    // 截断后端数据库
+    await truncateMessages(currentSessionId, message.id);
+    // 截断前端状态：保留该消息之前的消息
+    setState(prev => {
+      const idx = prev.messages.findIndex(m => m.id === message.id);
+      return {
+        ...prev,
+        messages: idx > 0 ? prev.messages.slice(0, idx) : [],
+      };
+    });
+    // 把消息内容放回输入框
+    setRecallText(message.content);
+    setRecallTick(t => t + 1);
+  }, [currentSessionId]);
 
   return (
     <div className="flex flex-col h-screen pt-12">
@@ -245,7 +254,7 @@ export default function ChatPage() {
             drawingPrompt={drawingPrompt}
             generatedImages={generatedImages}
             isInputActive={isInputActive}
-            birthdayEgg={birthdayEgg}
+            onRecall={handleRecall}
           />
         </div>
       </div>
@@ -256,6 +265,8 @@ export default function ChatPage() {
           onSend={handleSendMessage}
           disabled={state.isLoading}
           onActiveChange={setIsInputActive}
+          defaultValue={recallText}
+          key={recallTick}
         />
         <p className="text-xs text-muted-foreground text-center mt-3">
           LockAI 可能会出错，请核实重要信息

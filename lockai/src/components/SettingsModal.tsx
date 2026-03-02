@@ -86,6 +86,7 @@ export function SettingsModal({ isOpen, onClose }: SettingsModalProps) {
               关于 LockAI
             </label>
             <div className="text-xs text-muted-foreground space-y-1">
+              <p>版本：0.3</p>
               <p>开发者：Hofmann</p>
               <p>
                 联系邮箱：

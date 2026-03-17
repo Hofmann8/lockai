@@ -12,6 +12,7 @@ from datetime import datetime
 from .agents import ResearcherAgent, PlannerAgent, WriterAgent, FormatterAgent
 from .latex import get_compiler
 from .session import PaperSession, PaperStatus, SessionManager
+from services.terminal import paper_events
 
 
 class PaperService:
@@ -52,6 +53,8 @@ class PaperService:
         if detail:
             session.progress_detail = detail
         self._sync_db(session)
+        # 推送事件到监控总线
+        paper_events.emit(session.id, "progress", stage=status.value, detail=detail)
 
     def _sync_db(self, session: PaperSession, create_if_missing: bool = False) -> None:
         """将 session 状态同步到 PaperRecord"""
@@ -209,8 +212,13 @@ class PaperService:
                 (PaperStatus.FORMATTING, self.formatter),
             ]
 
+            # 设置 paper_id 以便 agent 推送事件
+            for _, agent in agents_pipeline:
+                agent._current_paper_id = session.id
+
             for status, agent in agents_pipeline:
                 self._update_progress(session, status, f"{status.value} 阶段开始...")
+                paper_events.emit(session.id, "agent_start", agent=type(agent).__name__, stage=status.value)
 
                 passed = False
                 max_gate_retries = 2  # gate 不通过时最多重试 2 次
@@ -223,14 +231,18 @@ class PaperService:
                                 if detail:
                                     session.progress_detail = detail
                                     self._sync_db(session)
+                            # 把 agent 的所有事件都推送到监控
+                            paper_events.emit(session.id, "agent_event", agent=type(agent).__name__, event=event)
                     except Exception as e:
                         session.error = f"{status.value} 阶段失败: {e}"
                         self._update_progress(session, PaperStatus.FAILED, session.error)
+                        paper_events.emit(session.id, "error", agent=type(agent).__name__, error=str(e))
                         self._save_vfs_snapshot(session)
                         return
 
                     # Gate 检查
                     gate = agent.gate_check(session)
+                    paper_events.emit(session.id, "gate_check", agent=type(agent).__name__, ok=gate.ok, retry=gate.retry, reason=gate.reason)
                     if gate.ok:
                         passed = True
                         break
@@ -278,9 +290,11 @@ class PaperService:
         for attempt in range(1 + max_repair):
             try:
                 result = self.compiler.compile(session.vfs.get_all(), "main.tex")
+                paper_events.emit(session.id, "compile", attempt=attempt + 1, success=result.success, error=result.error if not result.success else None, log=(result.log or "")[-2000:])
             except Exception as e:
                 session.error = f"编译异常: {e}"
                 self._update_progress(session, PaperStatus.FAILED, session.error)
+                paper_events.emit(session.id, "error", stage="compiling", error=str(e))
                 return
 
             if result.success:
@@ -327,6 +341,7 @@ class PaperService:
             pass
 
         print(f"[Paper] 论文生成完成: {session.id}")
+        paper_events.emit(session.id, "completed", pdf_url=session.pdf_url)
 
 
     # ---- 后台重试（LLM 智能诊断修复） ----
@@ -581,6 +596,10 @@ class PaperService:
 
             self._update_progress(session, PaperStatus.FORMATTING, "正在按要求修改...")
 
+            # 设置 paper_id 以便推送事件
+            self.formatter._current_paper_id = session.id
+            self.writer._current_paper_id = session.id
+
             vfs = session.vfs
             modified_files: list[str] = []
             needs_full_rerun: str | None = None
@@ -704,7 +723,7 @@ class PaperService:
     def _revise_rewrite_chapter(
         self, session: PaperSession, file_path: str, requirements: str, modified_files: list[str]
     ) -> str:
-        """重写单个章节：调 writer 重新撰写纯文本 → formatter 转 LaTeX"""
+        """重写单个章节：writer 直接输出 LaTeX，strip code fences 后写入 VFS"""
         outline = session.file_plan.get("outline", {})
         chapter_plan = outline.get(file_path)
         if not chapter_plan:
@@ -723,13 +742,15 @@ class PaperService:
 
         global_req = session.file_plan.get("global_requirements", "")
         chapter_req = chapter_plan.get("requirements", "")
+        title = chapter_plan.get('title', '')
+        sections = chapter_plan.get('sections', [])
 
-        # 1. Writer 重写纯文本
-        write_prompt = f"""重写学术论文章节（纯文本，不要 LaTeX 标记）：
+        # Writer 直接输出 LaTeX
+        write_prompt = f"""重写学术论文章节，直接输出 LaTeX 格式：
 
 论文主题: {session.topic}
-章节标题: {chapter_plan.get('title', '')}
-子节: {', '.join(chapter_plan.get('sections', []))}
+章节标题: {title}
+子节: {', '.join(sections)}
 要点: {', '.join(chapter_plan.get('key_points', []))}
 目标字数: {chapter_plan.get('target_words', 800)}
 
@@ -741,32 +762,26 @@ class PaperService:
 {f'章节特定要求: {chapter_req}' if chapter_req else ''}
 
 要求：
-1. 学术写作风格，严谨客观
-2. 引用格式用 [refN]
-3. 不要使用列表/枚举结构
-4. 按修改要求重写，但保持学术论文的连贯性"""
+1. 用 \\section{{{title}}} 开头
+2. 子节用 \\subsection{{}} 标记
+3. 引用格式用 \\cite{{refN}}，如 \\cite{{ref1}}
+4. 数学内容用 $...$ 或 \\[...\\]
+5. 特殊字符必须转义（% → \\%，& → \\&，_ → \\_，# → \\#）
+6. 绝对不使用 itemize/enumerate/item，用段落自然组织
+7. 学术写作风格，严谨客观
+8. 按修改要求重写，但保持学术论文的连贯性
+9. 不要输出 \\documentclass、\\begin{{document}} 等文档框架
+10. 不要输出 ```latex 等代码块标记"""
 
         new_content = self.writer._complete([{"role": "user", "content": write_prompt}])
         if not new_content:
             return f"错误: 重写 {file_path} 失败"
 
-        # 更新 session.content
+        # 更新 session.content（现在存的就是 LaTeX）
         session.content[file_path] = new_content
 
-        # 2. Formatter 转 LaTeX
-        citation_style = session.file_plan.get("citation_style", "plainnat")
-        latex_content = self.formatter._to_latex(
-            chapter_plan.get("title", ""),
-            new_content,
-            chapter_plan.get("sections", []),
-            chapter_req, global_req, citation_style,
-        )
-
-        if not latex_content:
-            return f"错误: {file_path} LaTeX 转换失败"
-
-        # 去掉可能的代码块标记
-        latex_content = self.formatter._strip_code_fences(latex_content)
+        # strip code fences 后写入 VFS
+        latex_content = self.formatter._strip_code_fences(new_content)
         session.vfs.write(file_path, latex_content)
         modified_files.append(file_path)
 

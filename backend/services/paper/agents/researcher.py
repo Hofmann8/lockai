@@ -25,11 +25,10 @@ class ResearcherAgent(BaseAgent):
         """提供文献列表和摘要给 gate 检查"""
         parts = [f"论文主题: {session.topic}"]
         parts.append(f"文献数量: {len(session.literature)}")
-        for i, lit in enumerate(session.literature[:5]):
-            parts.append(f"  [{i+1}] {lit.get('title', '?')} ({lit.get('year', '?')})")
-        if len(session.literature) > 5:
-            parts.append(f"  ... 共 {len(session.literature)} 篇")
-        parts.append(f"综述摘要前 500 字: {session.literature_summary[:500]}")
+        for i, lit in enumerate(session.literature):
+            parts.append(f"  [{i+1}] title={lit.get('title', '?')}, year={lit.get('year', '?')}")
+        parts.append(f"\n综述摘要 ({len(session.literature_summary)} 字):")
+        parts.append(session.literature_summary[:1000])
         return "\n".join(parts)
 
     def run(self, session: PaperSession) -> Generator[dict, None, None]:

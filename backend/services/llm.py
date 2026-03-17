@@ -2,187 +2,192 @@
 LLM API 调用服务
 """
 
-import os
+from __future__ import annotations
+
 import json
+import os
+import re
+from pathlib import Path
+from typing import Any, Generator, Optional
+
 import httpx
-from typing import Generator, Optional
+
+from .provider_runtime import ProviderRuntime
+
+
+ENV_SUB_RE = re.compile(r'\$\{(\w+)\}')
+RETIRED_CHAT_MODEL_ALIASES = {
+    "xiaosuolaoshi": "campbell",
+}
 
 
 class LLMService:
-    """LLM API 调用服务"""
-    
+    """LLM API 调用服务。"""
+
     def __init__(self):
-        self.base_url = os.environ.get("API_BASE_URL", "https://api.vectorengine.ai")
-        self.model_primary = os.environ.get("MODEL_PRIMARY", "gemini-3-pro-preview")
-        self.model_search = os.environ.get("MODEL_SEARCH", "gemini-2.5-pro-all")
-        self.model_keyword = os.environ.get("MODEL_KEYWORD", "qwen-plus")
-        self.model_image = os.environ.get("MODEL_IMAGE", "gemini-2.0-flash-exp-image-generation")
         self.temperature = float(os.environ.get("AI_TEMPERATURE", "0.7"))
         self.max_tokens = int(os.environ.get("AI_MAX_TOKENS", "8192"))
-        
-        self._api_keys = self._load_api_keys()
-        self._key_index = 0
-        
-        # Qwen 配置（用于 keyword 提取和标题生成）
+        self.models_config_path = os.environ.get("MODELS_CONFIG", "models.json")
+        self._backend_dir = Path(__file__).resolve().parent.parent
+        self._models_cache: list[dict[str, Any]] = []
+        self._key_index_by_model: dict[str, int] = {}
+
+        # 兼容旧代码的默认配置
+        self.legacy_api_base = os.environ.get("API_BASE_URL", "https://api.vectorengine.ai")
         self.qwen_base_url = os.environ.get("QWEN_API_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
         self.qwen_api_key = os.environ.get("QWEN_API_KEY", "")
-    
-    def _load_api_keys(self) -> list:
-        """加载所有 API Keys"""
-        keys = []
-        i = 1
-        while True:
-            key = os.environ.get(f"API_KEY_{i}")
-            if key:
-                keys.append(key)
-                i += 1
-            else:
-                break
-        return keys
-    
-    def _get_api_key(self) -> Optional[str]:
-        """轮询获取 API Key"""
-        if not self._api_keys:
+        self.provider_runtime = ProviderRuntime(self)
+
+        self.reload_models()
+
+    def reload_models(self) -> list[dict[str, Any]]:
+        self._models_cache = self._load_models()
+        self._refresh_compat_fields()
+        return self._models_cache
+
+    def list_models(self) -> list[dict[str, Any]]:
+        return list(self._models_cache)
+
+    def get_chat_models(self) -> list[dict[str, Any]]:
+        return [
+            cfg for cfg in self._models_cache
+            if cfg.get("visible", True) and cfg.get("available", True)
+        ]
+
+    def normalize_chat_model_id(self, model_id: str | None = None) -> str:
+        target = str(model_id or "").strip()
+        if not target:
+            return self.get_default_chat_model_id()
+
+        target = RETIRED_CHAT_MODEL_ALIASES.get(target, target)
+        chat_model_ids = {str(cfg.get("id")) for cfg in self.get_chat_models()}
+        if target in chat_model_ids:
+            return target
+        return self.get_default_chat_model_id()
+
+    def get_default_chat_model_id(self) -> str:
+        for cfg in self.get_chat_models():
+            if cfg.get("is_default"):
+                return str(cfg["id"])
+        chat_models = self.get_chat_models()
+        if chat_models:
+            return str(chat_models[0]["id"])
+        return "campbell"
+
+    def get_model_config(self, model_id: str | None = None) -> dict[str, Any]:
+        target = model_id or self.get_default_chat_model_id()
+        for cfg in self._models_cache:
+            if cfg.get("id") == target:
+                return dict(cfg)
+        return self._build_legacy_model_config(target)
+
+    def resolve_chat_transport(self, model: str | dict[str, Any] | None = None) -> str:
+        return self.provider_runtime.resolve_transport(model)
+
+    def get_api_key(self, model: str | dict[str, Any] | None = None) -> Optional[str]:
+        cfg = model if isinstance(model, dict) else self.get_model_config(model)
+        keys = self._collect_api_keys(cfg)
+        if not keys:
             return None
-        key = self._api_keys[self._key_index % len(self._api_keys)]
-        self._key_index += 1
-        return key
-    
-    def stream(self, messages: list, model: str = None) -> Generator[dict, None, None]:
-        """流式调用 API"""
-        api_key = self._get_api_key()
+
+        model_id = str(cfg.get("id") or cfg.get("model") or "default")
+        idx = self._key_index_by_model.get(model_id, 0)
+        self._key_index_by_model[model_id] = (idx + 1) % len(keys)
+        return keys[idx]
+
+    def _get_api_key(self, model: str | dict[str, Any] | None = None) -> Optional[str]:
+        return self.get_api_key(model or self.get_default_chat_model_id())
+
+    def stream_chat_completion(
+        self,
+        messages: list,
+        model: str | None = None,
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        enable_thinking: bool | None = None,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> Generator[dict[str, Any], None, None]:
+        cfg = self.get_model_config(model)
+        api_key = self.get_api_key(cfg)
         if not api_key:
             yield {"type": "error", "content": "API 密钥未配置"}
             return
-        
-        model = model or self.model_primary
-        
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-            "stream": True
-        }
-        
-        print(f"\n[LLM] 流式调用: {model}")
-        
-        chunk_count = 0
+
+        payload = self._build_payload(
+            cfg,
+            messages,
+            stream=True,
+            tools=tools,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            enable_thinking=enable_thinking,
+            extra_payload=extra_payload,
+        )
+
+        print(f"\n[LLM] 流式调用: {cfg.get('model')} via {cfg.get('id')}")
+
         try:
-            with httpx.Client(timeout=120.0) as client:
+            with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0)) as client:
                 with client.stream(
                     "POST",
-                    f"{self.base_url}/v1/chat/completions",
-                    headers=headers,
-                    json=payload
+                    self._chat_endpoint(cfg["api_base"]),
+                    headers=self._build_headers(api_key),
+                    json=payload,
                 ) as response:
                     if response.status_code != 200:
-                        error_text = response.read().decode()
-                        print(f"[LLM] 错误: {response.status_code} - {error_text}")
+                        error_text = response.read().decode("utf-8", errors="replace")
+                        print(f"[LLM] 错误: {response.status_code} - {error_text[:500]}")
                         yield {"type": "error", "content": f"API 请求失败: {response.status_code}"}
                         return
-                    
+
                     for line in response.iter_lines():
-                        if not line:
+                        if not line or not line.startswith("data: "):
                             continue
-                        if line.startswith("data: "):
-                            data_str = line[6:]
-                            if data_str == "[DONE]":
-                                break
-                            try:
-                                data = json.loads(data_str)
-                                choices = data.get("choices", [])
-                                if not choices:
-                                    continue
-                                delta = choices[0].get("delta", {})
-                                content = delta.get("content") or ""
-                                if content:
-                                    chunk_count += 1
-                                    yield {"type": "content", "content": content}
-                            except json.JSONDecodeError:
-                                continue
-            
-            if chunk_count == 0:
-                print(f"[LLM] 警告: {model} 返回了 0 个内容 chunk")
+                        data_str = line[6:]
+                        if data_str == "[DONE]":
+                            break
+                        try:
+                            data = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
+                        choices = data.get("choices") or []
+                        if not choices:
+                            continue
+                        choice = choices[0]
+                        yield {
+                            "type": "delta",
+                            "delta": choice.get("delta", {}),
+                            "finish_reason": choice.get("finish_reason"),
+                        }
         except httpx.TimeoutException:
             yield {"type": "error", "content": "请求超时"}
-        except Exception as e:
-            print(f"[LLM] 异常: {type(e).__name__}: {e}")
-            yield {"type": "error", "content": f"请求失败: {str(e)}"}
-    
-    def stream_qwen(self, messages: list, model: str = "qwen-plus", enable_search: bool = True, enable_thinking: bool = False) -> Generator[dict, None, None]:
-        """流式调用 Qwen API（用于 Leo/Scooby 模式）"""
-        if not self.qwen_api_key:
-            yield {"type": "error", "content": "Qwen API 密钥未配置"}
-            return
-        
-        headers = {
-            "Authorization": f"Bearer {self.qwen_api_key}",
-            "Content-Type": "application/json"
-        }
-        
-        payload = {
-            "model": model,
-            "messages": messages,
-            "temperature": self.temperature,
-            "max_tokens": self.max_tokens,
-            "stream": True,
-            "enable_search": enable_search,
-            "stream_options": {"include_usage": True}
-        }
-        
-        # Qwen3 系列支持思考模式
-        if enable_thinking:
-            payload["enable_thinking"] = True
-        
-        print(f"\n[LLM-Qwen] 流式调用: {model} (search={enable_search}, thinking={enable_thinking})")
-        
-        try:
-            with httpx.Client(timeout=120.0) as client:
-                with client.stream(
-                    "POST",
-                    f"{self.qwen_base_url}/chat/completions",
-                    headers=headers,
-                    json=payload
-                ) as response:
-                    if response.status_code != 200:
-                        error_text = response.read().decode()
-                        print(f"[LLM-Qwen] 错误: {response.status_code} - {error_text}")
-                        yield {"type": "error", "content": f"Qwen 请求失败: {response.status_code}"}
-                        return
-                    
-                    for line in response.iter_lines():
-                        if not line:
-                            continue
-                        if line.startswith("data: "):
-                            data_str = line[6:]
-                            if data_str == "[DONE]":
-                                break
-                            try:
-                                data = json.loads(data_str)
-                                choices = data.get("choices", [])
-                                if not choices:
-                                    continue
-                                
-                                delta = choices[0].get("delta", {})
-                                
-                                # 回复内容（忽略 reasoning_content）
-                                content = delta.get("content")
-                                if content:
-                                    yield {"type": "content", "content": content}
-                            except json.JSONDecodeError:
-                                continue
-        except httpx.TimeoutException:
-            yield {"type": "error", "content": "Qwen 请求超时"}
-        except Exception as e:
-            print(f"[LLM-Qwen] 异常: {type(e).__name__}: {e}")
-            yield {"type": "error", "content": f"Qwen 请求失败: {str(e)}"}
-    
+        except Exception as exc:
+            print(f"[LLM] 异常: {type(exc).__name__}: {exc}")
+            yield {"type": "error", "content": f"请求失败: {exc}"}
+
+    def stream(
+        self,
+        messages: list,
+        model: str | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+    ) -> Generator[dict[str, Any], None, None]:
+        for chunk in self.stream_chat_completion(
+            messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        ):
+            if chunk.get("type") == "error":
+                yield chunk
+                return
+            delta = chunk.get("delta") or {}
+            content = delta.get("content") or ""
+            if content:
+                yield {"type": "content", "content": content}
+
     def complete_with_tools(
         self,
         messages: list,
@@ -194,178 +199,439 @@ class LLMService:
         api_key: str = None,
         max_rounds: int = 10,
     ) -> str | None:
-        """
-        带 function calling 的多轮对话。
-
-        LLM 可以调用 tools 中定义的函数，由 tool_handler 执行后把结果
-        喂回 LLM，循环直到 LLM 输出纯文本或达到 max_rounds。
-
-        参数:
-            tools: OpenAI 格式的 tool 定义列表
-            tool_handler: callable(name, arguments) -> str，执行工具并返回结果字符串
-            max_rounds: 最大工具调用轮数，防止死循环
-        返回:
-            最终的纯文本回复，或 None
-        """
-        model = model or self.model_primary
-        use_qwen = model.startswith("qwen")
-
-        if use_qwen:
-            api_key = api_key or self.qwen_api_key
-            base_url = self.qwen_base_url
-        else:
-            api_key = api_key or self._get_api_key()
-            base_url = self.base_url
-        endpoint = f"{base_url.rstrip('/')}/chat/completions" if use_qwen else f"{base_url.rstrip('/')}/v1/chat/completions"
-
-        if not api_key:
+        cfg = self._get_runtime_model_config(model, api_key)
+        runtime = self.provider_runtime.build_state(
+            messages=messages,
+            model_config=cfg,
+            tools=tools,
+            temperature=temperature,
+            max_tokens=max_tokens,
+        )
+        if not runtime:
             return None
 
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        }
-
-        msgs = list(messages)  # 不修改原始列表
-
         for round_idx in range(max_rounds):
-            payload = {
-                "model": model,
-                "messages": msgs,
-                "tools": tools,
-                "temperature": temperature if temperature is not None else self.temperature,
-                "max_tokens": max_tokens or self.max_tokens,
-            }
+            print(
+                f"\n[LLM] tool_call round {round_idx + 1}: "
+                f"model={cfg.get('model')} transport={runtime.get('transport')}"
+            )
 
-            print(f"\n[LLM] tool_call round {round_idx + 1}: model={model}")
-
-            try:
-                with httpx.Client(
-                    timeout=httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0)
-                ) as client:
-                    resp = client.post(
-                        endpoint,
-                        headers=headers,
-                        json=payload,
-                    )
-
-                if resp.status_code != 200:
-                    print(f"[LLM] tool_call 错误: HTTP {resp.status_code} - {resp.text[:500]}")
-                    return None
-
-                data = resp.json()
-                choice = data.get("choices", [{}])[0]
-                message = choice.get("message", {})
-                finish_reason = choice.get("finish_reason", "")
-
-                # 如果没有 tool_calls → 返回纯文本
-                tool_calls = message.get("tool_calls")
-                if not tool_calls:
-                    return message.get("content") or None
-
-                # 把 assistant 的 tool_calls 消息加入历史
-                msgs.append(message)
-
-                # 逐个执行 tool_call，把结果加入历史
-                for tc in tool_calls:
-                    fn = tc.get("function", {})
-                    name = fn.get("name", "")
-                    try:
-                        arguments = json.loads(fn.get("arguments", "{}"))
-                        if not isinstance(arguments, dict):
-                            arguments = {}
-                    except (json.JSONDecodeError, TypeError):
-                        arguments = {}
-
-                    print(f"[LLM] tool_call: {name}({json.dumps(arguments, ensure_ascii=False)[:200]})")
-                    result_str = tool_handler(name, arguments)
-
-                    msgs.append({
-                        "role": "tool",
-                        "tool_call_id": tc.get("id", ""),
-                        "content": result_str,
-                    })
-
-                # 如果 finish_reason 不是 tool_calls，也退出
-                if finish_reason != "tool_calls" and finish_reason != "stop":
-                    return message.get("content") or None
-
-            except Exception as e:
-                print(f"[LLM] tool_call 异常: {type(e).__name__}: {e}")
+            response = self.provider_runtime.request_turn(runtime)
+            if response is None:
                 return None
+
+            finish_reason = str(response.get("finish_reason") or "")
+            tool_calls = response.get("tool_calls") or []
+            final_content = str(response.get("content") or "")
+            print(
+                f"[LLM] tool_call round {round_idx + 1} done: "
+                f"finish_reason={finish_reason or 'none'} "
+                f"content_type={type(response.get('raw_content')).__name__} "
+                f"tool_calls={len(tool_calls)}"
+            )
+
+            if not tool_calls:
+                return final_content
+
+            self.provider_runtime.append_assistant_history(
+                runtime,
+                response.get("assistant_history_item"),
+                parsed_calls=tool_calls,
+                content_text=final_content,
+            )
+
+            tool_results: list[dict[str, Any]] = []
+            for call in tool_calls:
+                name = str(call.get("name") or "").strip()
+                arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
+                print(f"[LLM] tool_call: {name}({json.dumps(arguments, ensure_ascii=False)[:200]})")
+                result_str = tool_handler(name, arguments)
+                tool_results.append({
+                    "id": call["id"],
+                    "name": name,
+                    "content": result_str,
+                })
+
+            self.provider_runtime.append_tool_results(runtime, tool_results)
 
         print(f"[LLM] tool_call 达到最大轮数 {max_rounds}")
         return None
 
-    def complete(self, messages: list, model: str = None, temperature: float = None, max_tokens: int = None, api_key: str = None) -> Optional[str]:
-        """
-        非流式语义的 API 调用（内部用 stream 接收，避免长文本超时）。
-        api_key 可覆盖默认 key。
-        """
-        model = model or self.model_primary
-        
-        # 判断是否使用 Qwen
-        use_qwen = model.startswith("qwen")
-        
-        if use_qwen:
-            api_key = api_key or self.qwen_api_key
-            base_url = self.qwen_base_url
-        else:
-            api_key = api_key or self._get_api_key()
-            base_url = self.base_url
-        endpoint = f"{base_url.rstrip('/')}/chat/completions" if use_qwen else f"{base_url.rstrip('/')}/v1/chat/completions"
-        
-        if not api_key:
+    def complete_chat_turn(
+        self,
+        messages: list,
+        model: str = None,
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        api_key: str | None = None,
+        enable_thinking: bool | None = None,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> Optional[dict[str, Any]]:
+        cfg = self._get_runtime_model_config(model, api_key)
+        runtime = self.provider_runtime.build_state(
+            messages=messages,
+            model_config=cfg,
+            tools=tools,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            enable_thinking=enable_thinking,
+            extra_payload=extra_payload,
+        )
+        if not runtime:
             return None
-        
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json"
+
+        print(
+            f"\n[LLM] nonstream turn: model={cfg.get('model')} via {cfg.get('id')} "
+            f"transport={runtime.get('transport')}"
+        )
+
+        response = self.provider_runtime.request_turn(runtime)
+        if response is None:
+            return None
+        print(
+            f"[LLM] nonstream done: finish_reason={response.get('finish_reason') or 'none'} "
+            f"content_type={type(response.get('raw_content')).__name__} "
+            f"tool_calls={len(response.get('tool_calls') or [])}"
+        )
+        return response
+
+    def complete(
+        self,
+        messages: list,
+        model: str = None,
+        temperature: float = None,
+        max_tokens: int = None,
+        api_key: str = None,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> Optional[str]:
+        response = self.complete_message(
+            messages,
+            model=model,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            api_key=api_key,
+            extra_payload=extra_payload,
+        )
+        if response is None:
+            return None
+        return self._normalize_message_content(response.get("content"))
+
+    def complete_message(
+        self,
+        messages: list,
+        model: str = None,
+        *,
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        api_key: str | None = None,
+        enable_thinking: bool | None = None,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> Optional[dict[str, Any]]:
+        cfg = self._get_runtime_model_config(model, api_key)
+        runtime = self.provider_runtime.build_state(
+            messages=messages,
+            model_config=cfg,
+            tools=tools,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            enable_thinking=enable_thinking,
+            extra_payload=extra_payload,
+        )
+        if not runtime:
+            return None
+
+        print(
+            f"\n[LLM] complete_message: model={cfg.get('model')} via {cfg.get('id')} "
+            f"transport={runtime.get('transport')}"
+        )
+
+        response = self.provider_runtime.request_turn(runtime)
+        if response is None:
+            return None
+        return {
+            "message": response.get("message") or {},
+            "finish_reason": response.get("finish_reason", ""),
+            "content": response.get("content"),
+            "tool_calls": response.get("tool_calls") or [],
         }
-        
-        payload = {
-            "model": model,
+
+    def _normalize_message_content(self, content: Any) -> Optional[str]:
+        if content is None:
+            return None
+        if isinstance(content, str):
+            return content or None
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                normalized = self._normalize_message_content(item)
+                if normalized:
+                    parts.append(normalized)
+            if parts:
+                return "\n".join(parts)
+            try:
+                return json.dumps(content, ensure_ascii=False)
+            except TypeError:
+                return str(content)
+        if isinstance(content, dict):
+            for key in ("text", "content", "value", "output_text"):
+                normalized = self._normalize_message_content(content.get(key))
+                if normalized:
+                    return normalized
+            try:
+                return json.dumps(content, ensure_ascii=False)
+            except TypeError:
+                return str(content)
+        return str(content)
+
+    def _get_runtime_model_config(
+        self,
+        model: str | None,
+        api_key: str | None = None,
+    ) -> dict[str, Any]:
+        cfg = self.get_model_config(model)
+        if api_key:
+            cfg["api_key"] = api_key
+            cfg["native_api_key"] = api_key
+        return cfg
+
+    def _parse_tool_calls(self, tool_calls: Any) -> list[dict[str, Any]]:
+        parsed: list[dict[str, Any]] = []
+        for index, tc in enumerate(tool_calls or []):
+            if not isinstance(tc, dict):
+                continue
+            fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+            name = str(fn.get("name") or "").strip()
+            arguments_raw = fn.get("arguments", "{}")
+            try:
+                arguments = json.loads(arguments_raw)
+                if not isinstance(arguments, dict):
+                    arguments = {}
+            except (json.JSONDecodeError, TypeError):
+                arguments = {}
+            parsed.append({
+                "id": str(tc.get("id") or f"tool_call_{index}"),
+                "name": name,
+                "arguments": arguments,
+            })
+        return parsed
+
+    def _load_models(self) -> list[dict[str, Any]]:
+        path = Path(self.models_config_path)
+        if not path.is_absolute():
+            cwd_candidate = Path(os.getcwd()) / path
+            backend_candidate = self._backend_dir / path
+            if cwd_candidate.exists():
+                path = cwd_candidate
+            else:
+                path = backend_candidate
+        if not path.exists():
+            return self._default_models()
+
+        raw = path.read_text(encoding="utf-8")
+        raw = ENV_SUB_RE.sub(lambda match: os.environ.get(match.group(1), ""), raw)
+        models = json.loads(raw)
+        if not isinstance(models, list):
+            return self._default_models()
+        return [cfg for cfg in models if isinstance(cfg, dict)]
+
+    def _refresh_compat_fields(self) -> None:
+        default_cfg = self.get_model_config(self.get_default_chat_model_id())
+        self.model_primary = str(default_cfg.get("model") or default_cfg.get("id") or "campbell")
+        self.base_url = str(default_cfg.get("api_base") or self.legacy_api_base)
+        self.model_search = "search_builtin"
+        self.model_keyword = "search_builtin"
+        self.model_image = "image_generator"
+
+    def _default_models(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": "campbell",
+                "name": "Campbell 1.5",
+                "description": "深度推理与复杂任务处理",
+                "model": "gemini-3.1-pro-preview",
+                "api_base": self.legacy_api_base,
+                "api_key_pool_prefix": "API_KEY_",
+                "provider": "gemini-native",
+                "transport": "gemini-native",
+                "thinking_mode": "optional",
+                "default_thinking": True,
+                "available": True,
+                "visible": True,
+                "is_default": True,
+                "prompt_id": "campbell",
+            },
+            {
+                "id": "scooby",
+                "name": "Scooby 1.7",
+                "description": "通用助理，适合多数对话与创作任务",
+                "model": "gemini-3-pro-preview",
+                "api_base": self.legacy_api_base,
+                "api_key_pool_prefix": "API_KEY_",
+                "provider": "gemini-native",
+                "transport": "gemini-native",
+                "thinking_mode": "optional",
+                "default_thinking": True,
+                "available": True,
+                "visible": True,
+                "prompt_id": "scooby",
+            },
+            {
+                "id": "leo",
+                "name": "Leo 1.7",
+                "description": "响应更快，适合日常问答与轻量任务",
+                "model": "qwen3.5-plus",
+                "api_base": self.qwen_base_url,
+                "api_key": self.qwen_api_key,
+                "provider": "qwen-compatible",
+                "transport": "qwen-compatible",
+                "thinking_mode": "optional",
+                "default_thinking": True,
+                "available": True,
+                "visible": True,
+                "prompt_id": "leo",
+            },
+            {
+                "id": "search_builtin",
+                "name": "联网搜索",
+                "description": "内部搜索执行模型",
+                "model": "qwen3.5-flash",
+                "api_base": self.qwen_base_url,
+                "api_key": self.qwen_api_key,
+                "provider": "qwen-compatible",
+                "transport": "qwen-compatible",
+                "available": True,
+                "visible": False,
+                "temperature": 0.3,
+                "max_tokens": 4096,
+            },
+            {
+                "id": "title_generator",
+                "name": "标题生成",
+                "description": "内部标题生成模型",
+                "model": "qwen-plus",
+                "api_base": self.qwen_base_url,
+                "api_key": self.qwen_api_key,
+                "provider": "qwen-compatible",
+                "transport": "qwen-compatible",
+                "available": True,
+                "visible": False,
+                "temperature": 0.3,
+                "max_tokens": 32,
+            },
+            {
+                "id": "image_generator",
+                "name": "图片生成",
+                "description": "内部图像生成模型",
+                "model": "gemini-3.1-flash-image-preview",
+                "api_base": self.legacy_api_base,
+                "api_key_pool_prefix": "API_KEY_",
+                "image_api_key_env": "API_KEY_PAPER",
+                "provider": "gemini-native",
+                "transport": "gemini-native",
+                "available": True,
+                "visible": False,
+            },
+        ]
+
+    def _build_legacy_model_config(self, model_name: str) -> dict[str, Any]:
+        if (model_name or "").startswith("qwen"):
+            return {
+                "id": model_name,
+                "name": model_name,
+                "model": model_name,
+                "api_base": self.qwen_base_url,
+                "api_key": self.qwen_api_key,
+                "provider": "qwen-compatible",
+                "transport": "qwen-compatible",
+                "thinking_mode": "never",
+                "available": True,
+                "visible": False,
+            }
+        return {
+            "id": model_name,
+            "name": model_name,
+            "model": model_name,
+            "api_base": self.legacy_api_base,
+            "api_key_pool_prefix": "API_KEY_",
+            "provider": "openai-compatible",
+            "transport": "openai-compatible",
+            "thinking_mode": "never",
+            "available": True,
+            "visible": False,
+        }
+
+    def _collect_api_keys(self, cfg: dict[str, Any]) -> list[str]:
+        keys: list[str] = []
+
+        inline_key = str(cfg.get("api_key") or "").strip()
+        if inline_key:
+            keys.append(inline_key)
+
+        for key in cfg.get("api_keys") or []:
+            clean = str(key or "").strip()
+            if clean:
+                keys.append(clean)
+
+        prefix = str(cfg.get("api_key_pool_prefix") or "").strip()
+        if prefix:
+            idx = 1
+            while True:
+                env_key = os.environ.get(f"{prefix}{idx}", "").strip()
+                if not env_key:
+                    break
+                keys.append(env_key)
+                idx += 1
+
+        unique: list[str] = []
+        seen = set()
+        for key in keys:
+            if key and key not in seen:
+                seen.add(key)
+                unique.append(key)
+        return unique
+
+    def _build_payload(
+        self,
+        cfg: dict[str, Any],
+        messages: list,
+        *,
+        stream: bool,
+        tools: list[dict[str, Any]] | None = None,
+        temperature: float | None = None,
+        max_tokens: int | None = None,
+        enable_thinking: bool | None = None,
+        extra_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "model": cfg["model"],
             "messages": messages,
-            "temperature": temperature if temperature is not None else self.temperature,
-            "max_tokens": max_tokens or self.max_tokens,
-            "stream": True,
+            "stream": stream,
+            "temperature": temperature if temperature is not None else cfg.get("temperature", self.temperature),
+            "max_tokens": max_tokens if max_tokens is not None else cfg.get("max_tokens", self.max_tokens),
         }
-        
-        print(f"\n[LLM] complete(stream): model={model}, key=...{api_key[-6:] if api_key else 'None'}")
-        
-        try:
-            chunks: list[str] = []
-            with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0)) as client:
-                with client.stream(
-                    "POST",
-                    endpoint,
-                    headers=headers,
-                    json=payload,
-                ) as response:
-                    if response.status_code != 200:
-                        error_text = response.read().decode()
-                        print(f"[LLM] 错误: HTTP {response.status_code} - {error_text[:500]}")
-                        return None
-                    
-                    for line in response.iter_lines():
-                        if not line or not line.startswith("data: "):
-                            continue
-                        data_str = line[6:]
-                        if data_str == "[DONE]":
-                            break
-                        try:
-                            data = json.loads(data_str)
-                            delta = data.get("choices", [{}])[0].get("delta", {})
-                            content = delta.get("content", "")
-                            if content:
-                                chunks.append(content)
-                        except json.JSONDecodeError:
-                            continue
-            
-            result = "".join(chunks)
-            print(f"[LLM] 成功: {len(result)} 字符")
-            return result if result else None
-        except Exception as e:
-            print(f"[LLM] 异常: {type(e).__name__}: {e}")
-        
-        return None
+        if tools:
+            payload["tools"] = tools
+
+        provider = str(cfg.get("provider") or "")
+        if enable_thinking is not None and provider.startswith("qwen"):
+            payload["enable_thinking"] = bool(enable_thinking)
+        if extra_payload:
+            payload.update(extra_payload)
+        return payload
+
+    def _build_headers(self, api_key: str) -> dict[str, str]:
+        return {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+
+    def _chat_endpoint(self, api_base: str) -> str:
+        base = (api_base or self.legacy_api_base).rstrip("/")
+        if base.endswith("/chat/completions"):
+            return base
+        if base.endswith("/v1"):
+            return f"{base}/chat/completions"
+        return f"{base}/v1/chat/completions"

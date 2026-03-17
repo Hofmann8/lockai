@@ -6,15 +6,21 @@ Main application entry point with API routes for chat and paper assistance.
 import os
 import json
 import uuid
-from flask import Flask, request, jsonify, Response
+import tempfile
+from datetime import datetime
+from pathlib import Path
+from queue import Empty
+from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 from dotenv import load_dotenv
 
 from models import db, ChatSession, ChatMessage, GeneratedImage, PaperRecord
 from services.ai import AIService
+from services.asr import ASRService, ASRServiceError, RealtimeASRSessionManager
 from services.llm import LLMService
 from services.storage import StorageService
 from services.paper import PaperService, SessionManager, PaperStatus
+from services.terminal import paper_events
 
 load_dotenv()
 
@@ -35,21 +41,46 @@ db.init_app(app)
 # Create tables
 with app.app_context():
     db.create_all()
-    # 确保 chat_messages 表有 images 列（SQLite 不会自动加新列）
+    # 轻量 schema backfill（SQLite 无 migration）
     from sqlalchemy import inspect, text
     inspector = inspect(db.engine)
-    columns = [c['name'] for c in inspector.get_columns('chat_messages')]
-    if 'images' not in columns:
+    message_columns = [c['name'] for c in inspector.get_columns('chat_messages')]
+    if 'images' not in message_columns:
         db.session.execute(text('ALTER TABLE chat_messages ADD COLUMN images TEXT'))
         db.session.commit()
         print("[DB] 已添加 chat_messages.images 列")
+    if 'tool_trace' not in message_columns:
+        db.session.execute(text('ALTER TABLE chat_messages ADD COLUMN tool_trace TEXT'))
+        db.session.commit()
+        print("[DB] 已添加 chat_messages.tool_trace 列")
+    session_columns = [c['name'] for c in inspector.get_columns('chat_sessions')]
+    if 'model_id' not in session_columns:
+        db.session.execute(text("ALTER TABLE chat_sessions ADD COLUMN model_id TEXT DEFAULT 'campbell'"))
+        db.session.commit()
+        print("[DB] 已添加 chat_sessions.model_id 列")
+    migrated = db.session.execute(text("UPDATE chat_sessions SET model_id = 'campbell' WHERE model_id = 'xiaosuolaoshi'"))
+    db.session.commit()
+    if (migrated.rowcount or 0) > 0:
+        print(f"[DB] 已迁移 {migrated.rowcount} 条会话模型到 campbell")
 
 ai_service = AIService()
+asr_service = ASRService()
+asr_session_manager = RealtimeASRSessionManager(asr_service)
 
 # Paper generation service
 llm_service = LLMService()
 storage_service = StorageService()
 paper_service = PaperService(llm_service, storage_service, app=app)
+
+# Dev terminal (调试用，不暴露在主页面)
+from dev_routes import dev_bp
+app.register_blueprint(dev_bp)
+
+
+@app.route("/api/models", methods=["GET"])
+def get_models():
+    """获取可用聊天模型列表"""
+    return jsonify({"models": ai_service.available_models()})
 
 
 # ============ Session APIs ============
@@ -68,15 +99,18 @@ def get_sessions():
 @app.route("/api/sessions", methods=["POST"])
 def create_session():
     """创建新会话"""
-    data = request.get_json()
+    data = request.get_json() or {}
     user_id = data.get('user_id')
     if not user_id:
         return jsonify({"error": "缺少 user_id"}), 400
+
+    model_id = ai_service.normalize_chat_model_id(data.get('model_id'))
     
     session = ChatSession(
         id=str(uuid.uuid4()),
         user_id=user_id,
-        title=data.get('title', '新对话')
+        title=data.get('title', '新对话'),
+        model_id=model_id,
     )
     db.session.add(session)
     db.session.commit()
@@ -103,9 +137,12 @@ def update_session(session_id):
     if not session:
         return jsonify({"error": "会话不存在"}), 404
     
-    data = request.get_json()
+    data = request.get_json() or {}
     if 'title' in data:
         session.title = data['title']
+    if data.get('model_id'):
+        session.model_id = ai_service.normalize_chat_model_id(data['model_id'])
+    session.updated_at = datetime.utcnow()
     db.session.commit()
     return jsonify(session.to_dict())
 
@@ -117,7 +154,7 @@ def generate_session_title(session_id):
     if not session:
         return jsonify({"error": "会话不存在"}), 404
     
-    data = request.get_json()
+    data = request.get_json() or {}
     user_message = data.get('user_message', '')
     assistant_message = data.get('assistant_message', '')
     
@@ -126,6 +163,7 @@ def generate_session_title(session_id):
     
     title = ai_service.generate_title(user_message, assistant_message)
     session.title = title
+    session.updated_at = datetime.utcnow()
     db.session.commit()
     
     return jsonify({"title": title})
@@ -179,7 +217,7 @@ def truncate_messages(session_id):
     if not session:
         return jsonify({"error": "会话不存在"}), 404
 
-    data = request.get_json()
+    data = request.get_json() or {}
     message_id = data.get("message_id")
     if not message_id:
         return jsonify({"error": "缺少 message_id"}), 400
@@ -193,6 +231,7 @@ def truncate_messages(session_id):
         ChatMessage.session_id == session_id,
         ChatMessage.created_at >= target.created_at
     ).delete()
+    session.updated_at = datetime.utcnow()
     db.session.commit()
 
     return jsonify({"success": True})
@@ -229,6 +268,139 @@ def upload_image():
     return jsonify({"url": result["url"]})
 
 
+@app.route("/api/asr/transcribe", methods=["POST"])
+def transcribe_audio():
+    """上传音频并执行语音转写。"""
+    audio = request.files.get("audio")
+    if not audio:
+        return jsonify({"error": "缺少 audio 文件"}), 400
+
+    audio_bytes = audio.read()
+    if not audio_bytes:
+        return jsonify({"error": "音频内容不能为空"}), 400
+
+    suffix = Path(audio.filename or "").suffix.lower() or f".{asr_service.audio_format}"
+    temp_path: str | None = None
+
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as temp_file:
+            temp_file.write(audio_bytes)
+            temp_path = temp_file.name
+
+        result = asr_service.transcribe_file(temp_path)
+        return jsonify(result)
+    except ASRServiceError as exc:
+        return jsonify({"error": str(exc)}), 503
+    except Exception as exc:
+        print(f"[ASR] 转写失败: {type(exc).__name__}: {exc}")
+        return jsonify({"error": "语音转写失败"}), 500
+    finally:
+        if temp_path:
+            try:
+                os.remove(temp_path)
+            except OSError:
+                pass
+
+
+@app.route("/api/asr/sessions", methods=["POST"])
+def create_realtime_asr_session():
+    """创建实时 ASR 会话。"""
+    try:
+        session = asr_session_manager.create()
+        return jsonify({
+            "session_id": session.id,
+            "sample_rate": asr_service.sample_rate,
+            "format": "pcm",
+        }), 201
+    except ASRServiceError as exc:
+        return jsonify({"error": str(exc)}), 503
+    except Exception as exc:
+        print(f"[ASR] 创建实时会话失败: {type(exc).__name__}: {exc}")
+        return jsonify({"error": "创建实时语音会话失败"}), 500
+
+
+@app.route("/api/asr/sessions/<session_id>/audio", methods=["POST"])
+def push_realtime_asr_audio(session_id):
+    """向实时 ASR 会话发送 PCM 音频分片。"""
+    session = asr_session_manager.get(session_id)
+    if not session:
+        return jsonify({"error": "语音会话不存在"}), 404
+
+    audio_bytes = request.get_data(cache=False)
+    if not audio_bytes:
+        return jsonify({"error": "音频分片不能为空"}), 400
+
+    try:
+        session.push_audio(audio_bytes)
+        return jsonify({"ok": True})
+    except ASRServiceError as exc:
+        return jsonify({"error": str(exc)}), 409
+    except Exception as exc:
+        print(f"[ASR] 推送音频失败: {type(exc).__name__}: {exc}")
+        return jsonify({"error": "推送音频失败"}), 500
+
+
+@app.route("/api/asr/sessions/<session_id>/stop", methods=["POST"])
+def stop_realtime_asr_session(session_id):
+    """结束实时 ASR 会话。"""
+    session = asr_session_manager.get(session_id)
+    if not session:
+        return jsonify({"error": "语音会话不存在"}), 404
+
+    session.request_stop()
+    return jsonify({"ok": True, "text": session.text})
+
+
+@app.route("/api/asr/sessions/<session_id>/cancel", methods=["POST"])
+def cancel_realtime_asr_session(session_id):
+    """立即截断并关闭实时 ASR 会话。"""
+    session = asr_session_manager.get(session_id)
+    if not session:
+        return jsonify({"error": "语音会话不存在"}), 404
+
+    text = session.text
+    asr_session_manager.cancel(session_id)
+    return jsonify({"ok": True, "text": text})
+
+
+@app.route("/api/asr/sessions/<session_id>/stream", methods=["GET"])
+def stream_realtime_asr_session(session_id):
+    """SSE 订阅实时 ASR 文本更新。"""
+    session = asr_session_manager.get(session_id)
+    if not session:
+        return jsonify({"error": "语音会话不存在"}), 404
+
+    include_history = request.args.get("history", "1") == "1"
+    q = session.subscribe(include_history=include_history)
+
+    def generate():
+        try:
+            while True:
+                try:
+                    event = q.get(timeout=15)
+                    yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                    if event.get("type") in {"complete", "error"}:
+                        break
+                except Empty:
+                    yield f"data: {json.dumps({'type': 'heartbeat'})}\n\n"
+        except GeneratorExit:
+            pass
+        finally:
+            session.unsubscribe(q)
+            if session.done_event.is_set():
+                asr_session_manager.close(session_id)
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.route("/api/sessions/<session_id>/messages", methods=["POST"])
 def add_message(session_id):
     """添加消息到会话"""
@@ -238,23 +410,35 @@ def add_message(session_id):
         print(f"[API] 会话不存在: {session_id}")
         return jsonify({"error": "会话不存在"}), 404
     
-    data = request.get_json()
+    data = request.get_json() or {}
     print(f"[API] 消息数据: role={data.get('role')}, content={data.get('content', '')[:50]}...")
-    if not data.get('role') or not data.get('content'):
-        return jsonify({"error": "缺少 role 或 content"}), 400
+    if not data.get('role'):
+        return jsonify({"error": "缺少 role"}), 400
     
     # images 此时已经是 S3 URL 列表
     image_urls = data.get('images')
-    images_json = json.dumps(image_urls) if image_urls else None
+    tool_trace = data.get('tool_trace')
+    content = data.get('content')
+    has_content = isinstance(content, str) and bool(content.strip())
+    has_images = isinstance(image_urls, list) and len(image_urls) > 0
+    has_tool_trace = isinstance(tool_trace, list) and len(tool_trace) > 0
+
+    if not has_content and not has_images and not has_tool_trace:
+        return jsonify({"error": "消息内容不能为空"}), 400
+
+    images_json = json.dumps(image_urls) if has_images else None
+    tool_trace_json = json.dumps(tool_trace, ensure_ascii=False) if isinstance(tool_trace, list) and tool_trace else None
     
     message = ChatMessage(
         id=data.get('id', str(uuid.uuid4())),
         session_id=session_id,
         role=data['role'],
-        content=data['content'],
+        content=content if isinstance(content, str) else '',
         images=images_json,
+        tool_trace=tool_trace_json,
     )
     db.session.add(message)
+    session.updated_at = datetime.utcnow()
     db.session.commit()
     print(f"[API] 消息保存成功: {message.id}")
     return jsonify(message.to_dict()), 201
@@ -275,13 +459,28 @@ def chat():
         return jsonify({"error": "消息内容不能为空", "code": "INVALID_REQUEST"}), 400
     
     history = data.get("history", [])
+    model_id = data.get("model_id") or data.get("ai_role") or ai_service.get_default_model_id()
+    user_id = data.get("user_id")
+    session_id = data.get("session_id")
+    images = data.get("images") or []
+    thinking = data.get("thinking")
+    current_message_id = data.get("current_message_id")
     
     result = ""
-    for chunk in ai_service.chat_stream(message, history):
+    for chunk in ai_service.chat_stream(
+        message,
+        history,
+        model_id=model_id,
+        user_id=user_id,
+        session_id=session_id,
+        images=images,
+        thinking=thinking,
+        current_message_id=current_message_id,
+    ):
         if chunk["type"] == "error":
-            return jsonify({"error": chunk["content"]}), 500
-        if chunk["type"] in ["content", "search_result"]:
-            result += chunk["content"]
+            return jsonify({"error": chunk["message"]}), 500
+        if chunk["type"] == "content_delta":
+            result += chunk["delta"]
     
     return jsonify({"message": result})
 
@@ -299,50 +498,29 @@ def chat_stream():
         return jsonify({"error": "消息内容不能为空"}), 400
     
     history = data.get("history", [])
-    ai_role = data.get("ai_role", "xiaosuolaoshi")
+    model_id = data.get("model_id") or data.get("ai_role") or ai_service.get_default_model_id()
     user_id = data.get("user_id")
     session_id = data.get("session_id")
     images = data.get("images")  # S3 公开 URL 列表
+    thinking = data.get("thinking")
+    current_message_id = data.get("current_message_id")
     
     def generate():
-        for chunk in ai_service.chat_stream(message, history, ai_role, user_id, session_id, images=images):
-            event_type = chunk["type"]
-            
-            if event_type == "content":
-                yield f"event: content\ndata: {json.dumps({'content': chunk['content']})}\n\n"
-            elif event_type == "searching":
-                yield f"event: searching\ndata: {json.dumps({'query': chunk['content']})}\n\n"
-            elif event_type == "search_progress":
-                yield f"event: search_progress\ndata: {json.dumps({'keywords': chunk['keywords']})}\n\n"
-            elif event_type == "search_complete":
-                yield f"event: search_complete\ndata: {{}}\n\n"
-            elif event_type == "drawing":
-                yield f"event: drawing\ndata: {json.dumps({'prompt': chunk['content']})}\n\n"
-            elif event_type == "image":
-                # 保存图片记录到数据库
-                if chunk.get("s3_key") and user_id:
-                    try:
-                        img = GeneratedImage(
-                            id=chunk.get("image_id", str(uuid.uuid4())),
-                            user_id=user_id,
-                            session_id=session_id,
-                            prompt=chunk.get("prompt"),
-                            s3_key=chunk["s3_key"],
-                            url=chunk["content"]
-                        )
-                        db.session.add(img)
-                        db.session.commit()
-                    except Exception as e:
-                        print(f"[DB] 保存图片记录失败: {e}")
-                
-                yield f"event: image\ndata: {json.dumps({'image': chunk['content']})}\n\n"
-            elif event_type == "error":
-                yield f"event: error\ndata: {json.dumps({'error': chunk['content']})}\n\n"
-            elif event_type == "done":
-                yield f"event: done\ndata: {{}}\n\n"
+        for chunk in ai_service.chat_stream(
+            message,
+            history,
+            model_id=model_id,
+            user_id=user_id,
+            session_id=session_id,
+            images=images,
+            thinking=thinking,
+            current_message_id=current_message_id,
+        ):
+            yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+        yield "data: [DONE]\n\n"
     
     return Response(
-        generate(),
+        stream_with_context(generate()),
         mimetype="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -434,6 +612,8 @@ def paper_create():
     db.session.add(record)
     db.session.commit()
 
+    paper_events.emit(paper_id, "created", topic=topic, user_id=user_id)
+
     return jsonify({"paper_id": paper_id}), 201
 
 
@@ -498,7 +678,7 @@ def paper_plan_chat():
         yield f"event: done\ndata: {{}}\n\n"
 
     return Response(
-        generate(),
+        stream_with_context(generate()),
         mimetype="text/event-stream",
         headers={
             "Cache-Control": "no-cache",
@@ -528,6 +708,8 @@ def paper_generate():
         design_context=design_context,
         paper_id=paper_id,
     )
+
+    paper_events.emit(result_id, "generate_start", topic=topic.strip(), user_id=user_id)
 
     return jsonify({"paper_id": result_id}), 202
 

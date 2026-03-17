@@ -3,34 +3,14 @@
 import { useState } from 'react';
 import Link from 'next/link';
 import Image from 'next/image';
-import { usePathname, useRouter } from 'next/navigation';
-import { MessageSquare, FileText, Menu, X, LogOut, Settings } from 'lucide-react';
+import { useRouter } from 'next/navigation';
+import { Menu, X, LogOut, Settings } from 'lucide-react';
 import { logout } from '@/lib/auth';
 import { useTheme } from '@/lib/theme';
 import { ThemeToggle } from '@/components/ThemeToggle';
 import { SettingsModal } from '@/components/SettingsModal';
 
-interface NavItem {
-  href: string;
-  label: string;
-  icon: React.ReactNode;
-}
-
-const navItems: NavItem[] = [
-  {
-    href: '/chat',
-    label: 'Chat',
-    icon: <MessageSquare className="h-5 w-5" />,
-  },
-  {
-    href: '/paper',
-    label: 'Paper',
-    icon: <FileText className="h-5 w-5" />,
-  },
-];
-
 export function Navbar() {
-  const pathname = usePathname();
   const router = useRouter();
   const { resolvedTheme } = useTheme();
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false);
@@ -81,31 +61,6 @@ export function Navbar() {
                 LockAI
               </span>
             </Link>
-
-            {/* Desktop Navigation */}
-            <div className="hidden md:flex items-center gap-1">
-              {navItems.map((item) => {
-                const isActive = pathname === item.href;
-                return (
-                  <Link
-                    key={item.href}
-                    href={item.href}
-                    className={`
-                      flex items-center gap-2 px-4 py-2 rounded-xl font-medium
-                      transition-colors duration-200 cursor-pointer
-                      ${isActive 
-                        ? 'bg-primary text-primary-foreground' 
-                        : 'text-muted-foreground hover:text-foreground hover:bg-muted'
-                      }
-                    `}
-                  >
-                    {item.icon}
-                    <span>{item.label}</span>
-                  </Link>
-                );
-              })}
-            </div>
-
             {/* Desktop Actions */}
             <div className="hidden md:flex items-center gap-2">
               <ThemeToggle />
@@ -145,29 +100,6 @@ export function Navbar() {
           {/* Mobile Navigation Menu */}
           {isMobileMenuOpen && (
             <div className="md:hidden border-t border-border px-4 py-4 space-y-2 animate-slide-up">
-              {navItems.map((item) => {
-                const isActive = pathname === item.href;
-                return (
-                  <Link
-                    key={item.href}
-                    href={item.href}
-                    onClick={closeMobileMenu}
-                    className={`
-                      flex items-center gap-3 px-4 py-3 rounded-xl font-medium
-                      transition-colors duration-200 cursor-pointer
-                      ${isActive 
-                        ? 'bg-primary text-primary-foreground' 
-                        : 'text-muted-foreground hover:text-foreground hover:bg-muted'
-                      }
-                    `}
-                  >
-                    {item.icon}
-                    <span>{item.label}</span>
-                  </Link>
-                );
-              })}
-              
-              {/* Mobile Logout Button */}
               <button
                 onClick={() => {
                   closeMobileMenu();

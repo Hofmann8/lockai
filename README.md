@@ -51,7 +51,7 @@ npm run dev
 
 ## 功能
 
-- 多角色 AI 对话（小锁老师 / Leo）
+- 多角色 AI 对话（Campbell / Scooby / Leo）
 - 实时联网搜索
 - AI 图像生成
 - 论文阅读辅助（解释/总结/翻译）

@@ -2,10 +2,100 @@
 Database Models
 """
 
-from datetime import datetime
+import json
+import re
+from datetime import datetime, timezone
+
 from flask_sqlalchemy import SQLAlchemy
 
 db = SQLAlchemy()
+
+
+TOOL_MARKER_RE = re.compile(r'<!--tool:(\d+)-->')
+MARKDOWN_IMAGE_RE = re.compile(r'!\[[^\]]*]\(([^)\s]+)(?:\s+\"[^\"]*\")?\)')
+THINKING_BLOCK_RE = re.compile(r'<(?:think|thinking|analysis)\b[^>]*>.*?</(?:think|thinking|analysis)>', re.IGNORECASE | re.DOTALL)
+SPECIAL_REASONING_TOKEN_RE = re.compile(r'<\|.*?\|>')
+
+
+def _tool_image_urls(trace):
+    urls = set()
+    for item in trace or []:
+        if item.get('kind') != 'image_gen':
+            continue
+        image_url = (item.get('url') or '').strip()
+        if image_url:
+            urls.add(image_url)
+        preview_url = (item.get('previewUrl') or '').strip()
+        if preview_url:
+            urls.add(preview_url)
+    return urls
+
+
+def _inject_legacy_tool_markers(content, trace):
+    safe_content = content or ''
+    if not trace or TOOL_MARKER_RE.search(safe_content):
+        return safe_content
+
+    insertions = []
+    for idx, item in enumerate(trace):
+        if item.get('kind') != 'image_gen':
+            insertions.append((len(safe_content), idx))
+            continue
+        image_url = (item.get('url') or '').strip()
+        if image_url:
+            image_md = f"![生成的图片]({image_url})"
+            image_pos = safe_content.find(image_md)
+            if image_pos >= 0:
+                insertions.append((image_pos, idx))
+                continue
+        insertions.append((len(safe_content), idx))
+
+    patched = safe_content
+    for pos, idx in sorted(insertions, reverse=True):
+        patched = f"{patched[:pos]}<!--tool:{idx}-->{patched[pos:]}"
+    return patched
+
+
+def strip_assistant_reasoning(content):
+    safe_content = str(content or '')
+    if not safe_content:
+        return ''
+
+    cleaned = THINKING_BLOCK_RE.sub('', safe_content)
+    cleaned = SPECIAL_REASONING_TOKEN_RE.sub('', cleaned)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    return cleaned.strip()
+
+
+def sanitize_assistant_content(content, trace):
+    safe_content = strip_assistant_reasoning(content)
+    safe_content = _inject_legacy_tool_markers(safe_content, trace)
+    image_urls = _tool_image_urls(trace)
+    if not safe_content or not image_urls:
+        return safe_content
+
+    kept_lines = []
+    for line in safe_content.splitlines():
+        stripped = line.strip()
+        if stripped:
+            match = MARKDOWN_IMAGE_RE.fullmatch(stripped)
+            if match and match.group(1) in image_urls:
+                continue
+        kept_lines.append(line)
+
+    cleaned = '\n'.join(kept_lines)
+    cleaned = re.sub(r'\n{3,}', '\n\n', cleaned)
+    return strip_assistant_reasoning(cleaned)
+
+
+def _serialize_utc(dt: datetime | None) -> str | None:
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return dt.isoformat().replace('+00:00', 'Z')
 
 
 class ChatSession(db.Model):
@@ -15,6 +105,7 @@ class ChatSession(db.Model):
     id = db.Column(db.String(36), primary_key=True)
     user_id = db.Column(db.String(36), nullable=False, index=True)
     title = db.Column(db.String(100), default='新对话')
+    model_id = db.Column(db.String(100), nullable=False, default='campbell')
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -25,8 +116,9 @@ class ChatSession(db.Model):
             'id': self.id,
             'user_id': self.user_id,
             'title': self.title,
-            'created_at': self.created_at.isoformat(),
-            'updated_at': self.updated_at.isoformat(),
+            'model_id': self.model_id,
+            'created_at': _serialize_utc(self.created_at),
+            'updated_at': _serialize_utc(self.updated_at),
         }
 
 
@@ -39,21 +131,35 @@ class ChatMessage(db.Model):
     role = db.Column(db.String(20), nullable=False)  # 'user' or 'assistant'
     content = db.Column(db.Text, nullable=False)
     images = db.Column(db.Text, nullable=True)  # JSON: S3 URL 列表
+    tool_trace = db.Column(db.Text, nullable=True)  # JSON: 工具调用记录
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     
     def to_dict(self):
-        import json
         images_list = None
         if self.images:
-            images_list = json.loads(self.images)
+            try:
+                images_list = json.loads(self.images)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                images_list = None
+        trace = []
+        if self.tool_trace:
+            try:
+                parsed = json.loads(self.tool_trace)
+                if isinstance(parsed, list):
+                    trace = parsed
+            except (TypeError, ValueError, json.JSONDecodeError):
+                trace = []
+        normalized_content = sanitize_assistant_content(self.content, trace) if self.role == 'assistant' else self.content
         result = {
             'id': self.id,
             'role': self.role,
-            'content': self.content,
-            'timestamp': self.created_at.isoformat(),
+            'content': normalized_content,
+            'timestamp': _serialize_utc(self.created_at),
         }
         if images_list:
             result['images'] = images_list
+        if trace:
+            result['tool_trace'] = trace
         return result
 
 
@@ -75,7 +181,7 @@ class GeneratedImage(db.Model):
             'id': self.id,
             'url': self.url,
             'prompt': self.prompt,
-            'created_at': self.created_at.isoformat(),
+            'created_at': _serialize_utc(self.created_at),
         }
 
 
@@ -105,6 +211,6 @@ class PaperRecord(db.Model):
             'pdf_url': self.pdf_url,
             'error': self.error,
             'progress_detail': self.progress_detail or '',
-            'created_at': self.created_at.isoformat(),
-            'completed_at': self.completed_at.isoformat() if self.completed_at else None,
+            'created_at': _serialize_utc(self.created_at),
+            'completed_at': _serialize_utc(self.completed_at),
         }

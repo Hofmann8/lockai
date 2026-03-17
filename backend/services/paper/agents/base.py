@@ -8,6 +8,7 @@ from abc import ABC, abstractmethod
 from typing import Generator
 
 from ..session import PaperSession
+from services.terminal import paper_events
 
 
 class BaseAgent(ABC):
@@ -20,24 +21,47 @@ class BaseAgent(ABC):
         self.llm = llm_service
         self.model = model
         self.api_key = api_key
+        self._current_paper_id: str | None = None  # 当前正在处理的 paper_id，用于事件推送
 
     def _complete(self, messages: list, **kwargs) -> str | None:
         """调用 LLM，自动注入 model 和 api_key"""
-        return self.llm.complete(
+        # 推送 LLM 调用事件
+        if self._current_paper_id:
+            # 只推送最后一条 user message 的前 500 字作为摘要
+            last_user = next((m for m in reversed(messages) if m.get("role") == "user"), None)
+            prompt_preview = (last_user["content"][:500] + "...") if last_user and len(last_user.get("content", "")) > 500 else (last_user.get("content", "") if last_user else "")
+            paper_events.emit(self._current_paper_id, "llm_call", agent=type(self).__name__, model=kwargs.get("model") or self.model or "default", prompt_preview=prompt_preview)
+
+        result = self.llm.complete(
             messages,
             model=kwargs.pop("model", self.model),
             api_key=self.api_key,
             **kwargs,
         )
 
+        if self._current_paper_id:
+            paper_events.emit(self._current_paper_id, "llm_result", agent=type(self).__name__, length=len(result) if result else 0, preview=(result[:500] + "...") if result and len(result) > 500 else (result or ""))
+
+        return result
+
     def _complete_with_tools(
         self, messages: list, tools: list[dict], tool_handler: callable, **kwargs
     ) -> str | None:
-        """带 function calling 的 LLM 调用，自动注入 model 和 api_key"""
+        """带 function calling 的 LLM 调用，自动注入 model 和 api_key，包装 tool_handler 以推送事件"""
+        original_handler = tool_handler
+
+        def instrumented_handler(name: str, arguments: dict) -> str:
+            if self._current_paper_id:
+                paper_events.emit(self._current_paper_id, "tool_call", agent=type(self).__name__, tool=name, arguments=arguments)
+            result = original_handler(name, arguments)
+            if self._current_paper_id:
+                paper_events.emit(self._current_paper_id, "tool_result", agent=type(self).__name__, tool=name, result=result[:2000] if len(result) > 2000 else result)
+            return result
+
         return self.llm.complete_with_tools(
             messages,
             tools=tools,
-            tool_handler=tool_handler,
+            tool_handler=instrumented_handler,
             model=kwargs.pop("model", self.model),
             api_key=self.api_key,
             **kwargs,

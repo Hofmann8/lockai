@@ -30,6 +30,8 @@ downloads/
 eggs/
 .eggs/
 lib/
+!lockai/src/lib/
+!lockai/src/lib/**
 lib64/
 parts/
 sdist/
@@ -159,3 +161,14 @@ temp/
 # Deploy artifacts
 *.zip
 lockai-deploy.zip
+
+# ============================================
+# Test & Debug Artifacts
+# ============================================
+backend/tests/_tmp_runtime/
+backend/scripts/backend/tmp/
+
+# ============================================
+# Next.js env (production secrets)
+# ============================================
+lockai/.env.production

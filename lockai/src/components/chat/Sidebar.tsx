@@ -1,9 +1,8 @@
 'use client';
 
 import { useState, useEffect, useCallback, useRef } from 'react';
-import Link from 'next/link';
 import Image from 'next/image';
-import { usePathname, useRouter } from 'next/navigation';
+import { useRouter } from 'next/navigation';
 import { Plus, MessageSquare, Trash2, ChevronLeft, LogOut, Settings, FileText, Check, X } from 'lucide-react';
 import { ChatSession, AuthState, PaperRecord } from '@/types';
 import { deleteSession } from '@/lib/chat-history';
@@ -22,11 +21,6 @@ interface SidebarProps {
   isPaper?: boolean;
 }
 
-const navItems = [
-  { href: '/chat', label: 'Chat', icon: MessageSquare },
-  { href: '/paper', label: 'Paper', icon: FileText },
-];
-
 export function Sidebar({
   sessions,
   paperRecords,
@@ -40,7 +34,6 @@ export function Sidebar({
   isPaper = false,
 }: SidebarProps) {
   const router = useRouter();
-  const pathname = usePathname();
   const [user] = useState<AuthState['user']>(() => getAuthState().user);
   const [avatarUrl, setAvatarUrl] = useState<string | null>(() => getAuthState().user?.avatarUrl || null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
@@ -128,12 +121,16 @@ export function Sidebar({
     router.push('/');
   };
 
+  const DAY_MS = 24 * 60 * 60 * 1000;
+
+  const getLocalDayStamp = (date: Date) => Date.UTC(date.getFullYear(), date.getMonth(), date.getDate());
+
   const formatDate = (date: Date) => {
-    const now = new Date();
-    const diff = now.getTime() - date.getTime();
-    const days = Math.floor(diff / (1000 * 60 * 60 * 24));
-    
-    if (days === 0) return '今天';
+    const todayStamp = getLocalDayStamp(new Date());
+    const targetStamp = getLocalDayStamp(date);
+    const days = Math.floor((todayStamp - targetStamp) / DAY_MS);
+
+    if (days <= 0) return '今天';
     if (days === 1) return '昨天';
     if (days < 7) return `${days}天前`;
     return date.toLocaleDateString('zh-CN', { month: 'short', day: 'numeric' });
@@ -146,17 +143,43 @@ export function Sidebar({
     return groups;
   }, {} as Record<string, ChatSession[]>);
 
+  const handleSelectSession = (sessionId: string) => {
+    onSelectSession(sessionId);
+    // 移动端选中后自动关闭
+    if (typeof window !== 'undefined' && window.innerWidth < 768 && !isCollapsed) {
+      onToggleCollapse();
+    }
+  };
+
+  const handleNewChat = () => {
+    onNewChat();
+    if (typeof window !== 'undefined' && window.innerWidth < 768 && !isCollapsed) {
+      onToggleCollapse();
+    }
+  };
+
   return (
-    <aside
-      className={`
-        fixed left-0 top-0 h-full z-40
-        bg-card/95 backdrop-blur-xl border-r border-border
-        transition-[width] duration-300 ease-in-out overflow-hidden
-        ${isCollapsed ? 'w-16' : 'w-72'}
-      `}
-    >
-      {/* Toggle Button - 固定位置，不随状态变化 */}
-      <div className="absolute top-0 left-0 w-16 flex items-center justify-center p-4 z-10">
+    <>
+      {/* 移动端遮罩 */}
+      {!isCollapsed && (
+        <div
+          className="fixed inset-0 z-30 bg-black/40 backdrop-blur-sm md:hidden"
+          onClick={onToggleCollapse}
+        />
+      )}
+      <aside
+        className={`
+          fixed left-0 top-0 h-full z-40
+          bg-card/95 backdrop-blur-xl border-r border-border
+          transition-all duration-300 ease-in-out overflow-hidden
+          w-72
+          ${isCollapsed ? '-translate-x-full' : 'translate-x-0'}
+          md:translate-x-0
+          ${isCollapsed ? 'md:w-16' : 'md:w-72'}
+        `}
+      >
+      {/* Toggle Button - 固定位置，不随状态变化（仅桌面端显示） */}
+      <div className="absolute top-0 left-0 w-16 hidden md:flex items-center justify-center p-4 z-10">
         <button
           onClick={onToggleCollapse}
           className="p-2 rounded-lg hover:bg-muted transition-colors cursor-pointer"
@@ -165,43 +188,26 @@ export function Sidebar({
           <ChevronLeft className={`w-5 h-5 transition-transform duration-300 ${isCollapsed ? 'rotate-180' : ''}`} />
         </button>
       </div>
+      {/* 移动端关闭按钮 */}
+      <div className="absolute top-0 right-0 md:hidden flex items-center justify-center p-4 z-10">
+        <button
+          onClick={onToggleCollapse}
+          className="p-2 rounded-lg hover:bg-muted transition-colors cursor-pointer"
+          aria-label="关闭侧边栏"
+        >
+          <X className="w-5 h-5" />
+        </button>
+      </div>
 
       {/* 展开状态内容 - 固定宽度 */}
       <div className={`absolute inset-0 w-72 flex flex-col transition-opacity duration-200 ${isCollapsed ? 'opacity-0 pointer-events-none' : 'opacity-100'}`}>
         {/* Header placeholder */}
         <div className="h-[73px] border-b border-border" />
 
-        {/* Navigation */}
-        <div className="p-3 border-b border-border">
-          <div className="flex gap-1">
-            {navItems.map((item) => {
-              const Icon = item.icon;
-              const isActive = pathname === item.href;
-              return (
-                <Link
-                  key={item.href}
-                  href={item.href}
-                  className={`
-                    flex-1 flex items-center justify-center gap-2 px-3 py-2 rounded-xl text-sm font-medium
-                    transition-colors cursor-pointer
-                    ${isActive 
-                      ? 'bg-primary text-primary-foreground' 
-                      : 'text-muted-foreground hover:text-foreground hover:bg-muted'
-                    }
-                  `}
-                >
-                  <Icon className="w-4 h-4" />
-                  <span>{item.label}</span>
-                </Link>
-              );
-            })}
-          </div>
-        </div>
-
         {/* New Chat / New Project Button */}
         <div className="p-3">
           <button
-            onClick={onNewChat}
+            onClick={handleNewChat}
             className="flex items-center gap-3 w-full p-3 rounded-xl bg-primary text-primary-foreground font-medium hover:opacity-90 transition-all cursor-pointer"
           >
             <Plus className="w-5 h-5 shrink-0" />
@@ -220,7 +226,7 @@ export function Sidebar({
                 {paperRecords.map((record) => (
                   <div
                     key={record.id}
-                    onClick={() => confirmDeleteId !== record.id && onSelectSession(record.id)}
+                    onClick={() => confirmDeleteId !== record.id && handleSelectSession(record.id)}
                     className={`
                       group flex items-center gap-3 w-full p-3 rounded-xl text-left
                       transition-colors cursor-pointer
@@ -282,7 +288,7 @@ export function Sidebar({
                 {dateSessions.map((session) => (
                   <div
                     key={session.id}
-                    onClick={() => confirmDeleteId !== session.id && onSelectSession(session.id)}
+                    onClick={() => confirmDeleteId !== session.id && handleSelectSession(session.id)}
                     className={`
                       group flex items-center gap-3 w-full p-3 rounded-xl text-left
                       transition-colors cursor-pointer
@@ -372,40 +378,15 @@ export function Sidebar({
         </div>
       </div>
 
-      {/* 收起状态内容 - 固定宽度 */}
-      <div className={`absolute inset-0 w-16 flex flex-col transition-opacity duration-200 ${isCollapsed ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
+      {/* 收起状态内容 - 固定宽度（仅桌面端） */}
+      <div className={`absolute inset-0 w-16 hidden md:flex flex-col transition-opacity duration-200 ${isCollapsed ? 'opacity-100' : 'opacity-0 pointer-events-none'}`}>
         {/* Header placeholder */}
         <div className="h-[73px] border-b border-border" />
-
-        {/* Navigation */}
-        <div className="p-3 border-b border-border space-y-1">
-          {navItems.map((item) => {
-            const Icon = item.icon;
-            const isActive = pathname === item.href;
-            return (
-              <Link
-                key={`collapsed-${item.href}`}
-                href={item.href}
-                className={`
-                  flex items-center justify-center p-2 rounded-xl
-                  transition-colors cursor-pointer
-                  ${isActive 
-                    ? 'bg-primary text-primary-foreground' 
-                    : 'text-muted-foreground hover:text-foreground hover:bg-muted'
-                  }
-                `}
-                title={item.label}
-              >
-                <Icon className="w-5 h-5" />
-              </Link>
-            );
-          })}
-        </div>
 
         {/* New Chat Button */}
         <div className="p-3">
           <button
-            onClick={onNewChat}
+            onClick={handleNewChat}
             className="flex items-center justify-center w-full p-3 rounded-xl bg-primary text-primary-foreground font-medium hover:opacity-90 transition-all cursor-pointer"
           >
             <Plus className="w-5 h-5" />
@@ -417,7 +398,7 @@ export function Sidebar({
           {sessions.slice(0, 8).map((session) => (
             <button
               key={`collapsed-session-${session.id}`}
-              onClick={() => onSelectSession(session.id)}
+              onClick={() => handleSelectSession(session.id)}
               className={`
                 flex items-center justify-center w-full p-3 rounded-xl mb-1
                 transition-colors cursor-pointer
@@ -468,5 +449,6 @@ export function Sidebar({
         </div>
       </div>
     </aside>
+    </>
   );
 }

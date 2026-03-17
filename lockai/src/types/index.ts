@@ -1,50 +1,207 @@
-// 聊天消息
+// Chat messages
+export interface SearchToolTrace {
+  kind: 'search';
+  query: string;
+  status: 'running' | 'done';
+  success?: boolean;
+}
+
+export interface ImageGenRequest {
+  subject?: string;
+  details?: string;
+  style?: string;
+  composition?: string;
+  camera?: string;
+  lighting?: string;
+  colorTone?: string;
+  background?: string;
+  textOverlay?: string;
+  negativePrompt?: string;
+  prompt?: string;
+  imageConfig?: {
+    aspectRatio?: string;
+    imageSize?: string;
+  };
+}
+
+export interface ImageEditRequest {
+  instruction?: string;
+  sourceImageId?: string;
+  sourceScope?: 'current_upload' | 'latest_tool_image' | 'latest_user_upload' | 'latest_any';
+  sourceHint?: string;
+  sourceIndex?: number;
+  preserve?: string;
+  negativePrompt?: string;
+  imageConfig?: {
+    aspectRatio?: string;
+    imageSize?: string;
+  };
+}
+
+export interface ImageGenToolTrace {
+  kind: 'image_gen';
+  assetId?: string;
+  mode?: 'generate' | 'edit';
+  prompt: string;
+  status: 'running' | 'done';
+  success?: boolean;
+  request?: ImageGenRequest;
+  editRequest?: ImageEditRequest;
+  resolvedEditRequest?: ImageEditRequest;
+  url?: string;
+  sourceLabel?: string;
+  sourceImageId?: string;
+  sourceImageUrl?: string;
+  outputWidth?: number;
+  outputHeight?: number;
+  outputAspectRatio?: string;
+}
+
+export type ToolTrace = SearchToolTrace | ImageGenToolTrace;
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant';
   content: string;
-  images?: string[];  // S3 公开 URL
+  images?: string[];
+  tool_trace?: ToolTrace[];
   timestamp: Date;
 }
 
-// 对话会话
+// Chat session
 export interface ChatSession {
   id: string;
   title: string;
+  model_id: string;
   messages: ChatMessage[];
   createdAt: Date;
   updatedAt: Date;
 }
 
-// 聊天请求
-export interface ChatRequest {
-  message: string;
-  images?: string[];  // S3 公开 URL
-  history?: ChatMessage[];
-  ai_role?: string;
-  user_id?: string;
-  session_id?: string;
+export interface ChatModel {
+  id: string;
+  name: string;
+  description: string;
+  available: boolean;
+  is_default: boolean;
+  thinking_mode: 'always' | 'never' | 'optional';
+  default_thinking?: boolean;
+  tags?: string[];
 }
 
-// 聊天响应
+// Chat request/response
+export interface ChatRequest {
+  message: string;
+  images?: string[];
+  history?: ChatMessage[];
+  model_id?: string;
+  user_id?: string;
+  session_id?: string;
+  thinking?: boolean;
+  current_message_id?: string;
+}
+
 export interface ChatResponse {
   message: string;
   error?: string;
 }
 
-// 论文 AI 辅助请求
-export interface PaperAssistRequest {
-  text: string;
-  action: 'explain' | 'summarize' | 'translate';
-}
-
-// 论文 AI 辅助响应
-export interface PaperAssistResponse {
-  result: string;
+export interface RealtimeAsrSessionResponse {
+  session_id: string;
+  sample_rate: number;
+  format: string;
   error?: string;
 }
 
-// 认证状态
+export interface RealtimeAsrEvent {
+  type: 'started' | 'partial' | 'final' | 'complete' | 'error' | 'heartbeat';
+  text?: string;
+  message?: string;
+  ts?: number;
+  session_id?: string;
+  paper_id?: string;
+}
+
+// Streaming events
+export interface StreamMessageStartEvent {
+  type: 'message_start';
+  message_id: string;
+}
+
+export interface StreamContentDeltaEvent {
+  type: 'content_delta';
+  delta: string;
+}
+
+export interface StreamSearchStartEvent {
+  type: 'search_start';
+  message_id?: string;
+  query: string;
+}
+
+export interface StreamSearchEndEvent {
+  type: 'search_end';
+  message_id?: string;
+  query: string;
+  success: boolean;
+}
+
+export interface StreamImageGenStartEvent {
+  type: 'image_gen_start';
+  message_id?: string;
+  prompt: string;
+  mode?: 'generate' | 'edit';
+  assetId?: string;
+  request?: ImageGenRequest;
+  editRequest?: ImageEditRequest;
+}
+
+export interface StreamImageGenEndEvent {
+  type: 'image_gen_end';
+  message_id?: string;
+  prompt: string;
+  mode?: 'generate' | 'edit';
+  success: boolean;
+  assetId?: string;
+  url?: string;
+  request?: ImageGenRequest;
+  editRequest?: ImageEditRequest;
+  resolvedEditRequest?: ImageEditRequest;
+  sourceLabel?: string;
+  sourceImageId?: string;
+  sourceImageUrl?: string;
+  outputWidth?: number;
+  outputHeight?: number;
+  outputAspectRatio?: string;
+}
+
+export interface StreamMessageEndEvent {
+  type: 'message_end';
+  message_id: string;
+}
+
+export interface StreamTitleUpdateEvent {
+  type: 'title_update';
+  title: string;
+}
+
+export interface StreamErrorEvent {
+  type: 'error';
+  message: string;
+}
+
+export type StreamEvent =
+  | StreamMessageStartEvent
+  | StreamContentDeltaEvent
+  | StreamSearchStartEvent
+  | StreamSearchEndEvent
+  | StreamImageGenStartEvent
+  | StreamImageGenEndEvent
+  | StreamMessageEndEvent
+  | StreamTitleUpdateEvent
+  | StreamErrorEvent;
+
+// Auth state
 export interface AuthState {
   isAuthenticated: boolean;
   user?: {
@@ -55,14 +212,25 @@ export interface AuthState {
   };
 }
 
-// 聊天状态
+// Chat page state
 export interface ChatState {
   messages: ChatMessage[];
   isLoading: boolean;
   error: string | null;
 }
 
-// 论文状态
+// Paper AI assistance
+export interface PaperAssistRequest {
+  text: string;
+  action: 'explain' | 'summarize' | 'translate';
+}
+
+export interface PaperAssistResponse {
+  result: string;
+  error?: string;
+}
+
+// Paper state
 export interface PaperState {
   latexContent: string;
   pdfFile: File | null;
@@ -74,7 +242,7 @@ export interface PaperState {
   isAiLoading: boolean;
 }
 
-// 错误响应格式
+// Errors
 export interface ErrorResponse {
   error: string;
   code: string;

@@ -3,6 +3,7 @@
 import { useState, useCallback, useEffect, useTransition, createContext, useContext, ReactNode } from 'react';
 import { usePathname } from 'next/navigation';
 import { ChatSession, PaperRecord } from '@/types';
+import { Menu } from 'lucide-react';
 import { Sidebar } from '@/components/chat/Sidebar';
 import { SettingsModal } from '@/components/SettingsModal';
 import { getSessions, getSession } from '@/lib/chat-history';
@@ -48,9 +49,16 @@ export function AppShell({ children }: AppShellProps) {
   const [paperNewProjectTick, setPaperNewProjectTick] = useState(0);
   const [paperHeaderTitle, setPaperHeaderTitle] = useState('');
   const [paperHeaderAction, setPaperHeaderAction] = useState<ReactNode | null>(null);
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(true);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [isPending, startTransition] = useTransition();
+
+  // 移动端默认收起 sidebar，桌面端默认展开
+  useEffect(() => {
+    if (window.innerWidth >= 768) {
+      setSidebarCollapsed(false);
+    }
+  }, []);
 
   const isChat = pathname === '/chat';
   const isPaper = pathname === '/paper';
@@ -155,15 +163,25 @@ export function AppShell({ children }: AppShellProps) {
       <div
         className={`
           min-h-screen transition-[margin] duration-300
-          ${sidebarCollapsed ? 'ml-16' : 'ml-72'}
+          ${sidebarCollapsed ? 'md:ml-16' : 'md:ml-72'}
         `}
       >
         <div
-          className="fixed top-4 left-4 right-4 z-10 transition-[margin] duration-300"
-          style={{ marginLeft: sidebarCollapsed ? '64px' : '288px' }}
+          className={`
+            fixed top-4 left-4 right-4 z-10 transition-[margin] duration-300
+            ${sidebarCollapsed ? 'md:ml-16' : 'md:ml-72'}
+          `}
         >
           <div className="relative flex items-center justify-between">
-            <div className="text-xl text-foreground logo-text">LockAI</div>
+            {/* 移动端汉堡菜单 */}
+            <button
+              onClick={() => setSidebarCollapsed(false)}
+              className="md:hidden p-2 -ml-2 rounded-lg hover:bg-muted transition-colors cursor-pointer"
+              aria-label="打开侧边栏"
+            >
+              <Menu className="w-5 h-5" />
+            </button>
+            <div className="hidden md:block text-xl text-foreground logo-text">LockAI</div>
             {isChat && (
               <div className="absolute left-1/2 -translate-x-1/2 text-sm text-muted-foreground truncate max-w-[50%]">
                 {currentSessionTitle}

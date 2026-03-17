@@ -1,9 +1,12 @@
 """
 FormatterAgent — 排版师 Agent
-将纯文本转为 LaTeX，写入 VFS
-根据 plan 元数据动态生成 main.tex（摘要、目录、引用格式）
+WriterAgent 已直接输出 LaTeX，本 Agent 负责：
+1. 生成 main.tex 文档框架（根据 plan 元数据动态构建）
+2. 将 writer 输出的 LaTeX 章节写入 VFS（strip code fences）
+3. 生成 refs.bib
+4. 轻量级质量检查
+5. 编译错误修复（repair）
 绝对不使用 itemize/enumerate/item 结构
-最终执行轻量级质量检查
 """
 
 from typing import Generator
@@ -24,7 +27,7 @@ _BIBSTYLE_MAP = {
 
 
 class FormatterAgent(BaseAgent):
-    """排版师 Agent：将纯文本转为 LaTeX，写入 VFS"""
+    """排版师 Agent：组装 main.tex + 写入章节 + refs.bib + 质量检查"""
 
     GATE_CRITERIA = (
         "1. VFS 中必须有 main.tex 和至少 1 个 chapters/*.tex 文件和 refs.bib\n"
@@ -58,26 +61,15 @@ class FormatterAgent(BaseAgent):
         yield {"type": "progress", "stage": "formatting", "detail": "生成 main.tex..."}
         vfs.write("main.tex", self._generate_main(plan, session))
 
-        # 2. 逐章转换 LaTeX
+        # 2. 将 writer 输出的 LaTeX 章节直接写入 VFS（仅 strip code fences）
         outline = plan.get("outline", {})
-        global_req = plan.get("global_requirements", "")
-        citation_style = plan.get("citation_style", "plainnat")
         chapter_files = sorted(k for k in outline if k.startswith("chapters/"))
 
         for file_path in chapter_files:
-            chapter_plan = outline[file_path]
             content = session.content.get(file_path, "")
-            title = chapter_plan.get("title", "")
-            chapter_req = chapter_plan.get("requirements", "")
-
-            yield {"type": "progress", "stage": "formatting", "detail": f"格式化 {file_path}..."}
-
-            latex_content = self._to_latex(
-                title, content,
-                chapter_plan.get("sections", []),
-                chapter_req, global_req, citation_style,
-            )
-            vfs.write(file_path, latex_content)
+            yield {"type": "progress", "stage": "formatting", "detail": f"写入 {file_path}..."}
+            cleaned = self._strip_code_fences(content) if content else ""
+            vfs.write(file_path, cleaned)
 
         # 3. 生成 refs.bib
         yield {"type": "progress", "stage": "formatting", "detail": "生成 refs.bib..."}
@@ -111,8 +103,8 @@ class FormatterAgent(BaseAgent):
         if include_abstract:
             abstract_text = session.content.get("__abstract__", "")
             if abstract_text:
-                # 用 LLM 把纯文本摘要转为 LaTeX 安全格式
-                abstract_latex = self._abstract_to_latex(abstract_text)
+                # writer 已输出 LaTeX 安全文本，只需 strip code fences
+                abstract_latex = self._strip_code_fences(abstract_text)
                 abstract_block = (
                     "\n\\begin{abstract}\n"
                     f"{abstract_latex}\n"
@@ -151,57 +143,6 @@ class FormatterAgent(BaseAgent):
             "\\bibliography{refs}\n"
             "\\end{document}\n"
         )
-
-    def _abstract_to_latex(self, text: str) -> str:
-        """用 LLM 将纯文本摘要转为 LaTeX 安全内容"""
-        prompt = f"""将以下纯文本摘要转换为 LaTeX 格式（只输出摘要正文内容，不要 \\begin{{abstract}} 等环境标记）：
-
-{text}
-
-要求：
-1. 转义特殊字符（%、&、_、#等）
-2. 引用标记 [refN] 转为 \\cite{{refN}}
-3. 不要使用 itemize/enumerate/item
-4. 只输出纯 LaTeX 文本内容，不要代码块标记"""
-        result = self._complete([{"role": "user", "content": prompt}])
-        if result:
-            return self._strip_code_fences(result)
-        return text
-
-    # ---- 章节 LaTeX 转换 ----
-
-    def _to_latex(
-        self, title: str, content: str, sections: list,
-        chapter_req: str = "", global_req: str = "", citation_style: str = "",
-    ) -> str:
-        """用 LLM 将纯文本转换为 LaTeX 格式"""
-        req_section = ""
-        if global_req:
-            req_section += f"\n全局格式要求: {global_req}"
-        if chapter_req:
-            req_section += f"\n本章节特定要求: {chapter_req}"
-
-        prompt = f"""将以下纯文本转换为 LaTeX 格式：
-
-章节标题: {title}
-子节标题: {', '.join(sections)}
-引用格式: {citation_style or 'natbib/plainnat'}
-{req_section}
-
-内容:
-{content}
-
-要求：
-1. 用 \\section{{{title}}} 开头
-2. 子节用 \\subsection{{}}
-3. 引用标记 [refN] 转为 \\cite{{refN}}
-4. 数学内容用 $...$ 或 \\[...\\]
-5. 绝对不使用 itemize/enumerate/item
-6. 用段落自然组织，段间空行分隔
-7. 只输出 LaTeX 内容，不要 documentclass 等
-8. 不要输出 ```latex 等代码块标记"""
-
-        return self._complete([{"role": "user", "content": prompt}]) or ""
 
     # ---- LLM 质量检查 ----
 

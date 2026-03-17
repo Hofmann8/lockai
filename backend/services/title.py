@@ -24,7 +24,7 @@ class TitleService:
         
         result = self.llm.complete(
             messages, 
-            model="qwen-plus",
+            model="title_generator",
             temperature=0.3,
             max_tokens=20
         )

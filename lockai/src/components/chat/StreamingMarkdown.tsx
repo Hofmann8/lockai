@@ -4,7 +4,7 @@ import ReactMarkdown from 'react-markdown';
 import remarkMath from 'remark-math';
 import remarkGfm from 'remark-gfm';
 import rehypeKatex from 'rehype-katex';
-import { fixIncompleteMarkdown } from '@/lib/markdown';
+import { fixIncompleteMarkdown, fixEmphasisFlanking } from '@/lib/markdown';
 import 'katex/dist/katex.min.css';
 
 interface StreamingMarkdownProps {
@@ -94,7 +94,7 @@ export function StreamingMarkdown({ content, showCursor = true }: StreamingMarkd
           ),
         }}
       >
-        {fixIncompleteMarkdown(content)}
+        {fixEmphasisFlanking(fixIncompleteMarkdown(content))}
       </ReactMarkdown>
       {showCursor && (
         <span className="inline-block w-0.5 h-4 bg-primary animate-pulse ml-0.5 align-middle" />

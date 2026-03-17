@@ -268,26 +268,28 @@ export function PlanChat({ onStartGenerate, initialPaperId }: PlanChatProps) {
               </p>
             </div>
 
-            <div className="group/hero relative rounded-2xl bg-card border border-border opacity-60 cursor-not-allowed">
+            <div className="group/hero relative rounded-2xl bg-card border border-border transition-shadow duration-200 hover:shadow-md focus-within:shadow-md focus-within:border-primary/50">
               <div className="flex items-center gap-3 px-4 py-3">
                 <input
                   type="text"
-                  disabled
+                  value={input}
+                  onChange={(e) => setInput(e.target.value)}
+                  onKeyDown={handleHeroKeyDown}
                   placeholder="输入研究主题，例如：基于 Transformer 的图像分类方法综述"
-                  className="flex-1 bg-transparent text-foreground placeholder:text-muted-foreground focus:outline-none text-base cursor-not-allowed"
+                  className="flex-1 bg-transparent text-foreground placeholder:text-muted-foreground focus:outline-none text-base"
                 />
                 <button
-                  disabled
-                  className="shrink-0 w-10 h-10 rounded-xl bg-primary text-primary-foreground flex items-center justify-center opacity-50 cursor-not-allowed transition-colors duration-200"
+                  onClick={() => sendMessage()}
+                  disabled={!input.trim() || isStreaming}
+                  className="shrink-0 w-10 h-10 rounded-xl bg-primary text-primary-foreground flex items-center justify-center hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors duration-200 cursor-pointer"
                   aria-label="开始"
                 >
-                  <Send className="w-5 h-5" />
+                  {isStreaming ? (
+                    <Loader2 className="w-5 h-5 animate-spin" />
+                  ) : (
+                    <Send className="w-5 h-5" />
+                  )}
                 </button>
-              </div>
-              <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover/hero:opacity-100 transition-opacity duration-200 pointer-events-none">
-                <span className="bg-foreground/80 text-background text-xs font-medium px-3 py-1.5 rounded-lg shadow-lg">
-                  功能升级中，敬请期待
-                </span>
               </div>
             </div>
 
@@ -353,25 +355,29 @@ export function PlanChat({ onStartGenerate, initialPaperId }: PlanChatProps) {
       {/* Input bar — disabled: coming soon */}
       <div className="shrink-0 px-4 pb-3">
         <div className="max-w-3xl mx-auto">
-          <div className="group/chat relative flex items-end gap-2 rounded-2xl border border-border bg-card px-4 py-2.5 opacity-60 cursor-not-allowed">
+          <div className="group/chat relative flex items-end gap-2 rounded-2xl border border-border bg-card px-4 py-2.5 transition-shadow duration-200 hover:shadow-md focus-within:shadow-md focus-within:border-primary/50">
             <textarea
-              disabled
+              ref={inputRef}
+              value={input}
+              onChange={handleTextareaChange}
+              onKeyDown={handleChatKeyDown}
               placeholder="继续讨论..."
               rows={1}
-              className="flex-1 bg-transparent text-foreground placeholder:text-muted-foreground outline-none text-sm resize-none leading-relaxed cursor-not-allowed"
+              disabled={isStreaming}
+              className="flex-1 bg-transparent text-foreground placeholder:text-muted-foreground outline-none text-sm resize-none leading-relaxed disabled:opacity-50"
             />
             <button
-              disabled
-              className="shrink-0 p-2 rounded-xl bg-primary text-primary-foreground opacity-40 cursor-not-allowed transition-colors"
+              onClick={() => sendMessage()}
+              disabled={!input.trim() || isStreaming}
+              className="shrink-0 p-2 rounded-xl bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-40 disabled:cursor-not-allowed transition-colors cursor-pointer"
               aria-label="发送"
             >
-              <Send className="w-4 h-4" />
+              {isStreaming ? (
+                <Loader2 className="w-4 h-4 animate-spin" />
+              ) : (
+                <Send className="w-4 h-4" />
+              )}
             </button>
-            <div className="absolute inset-0 flex items-center justify-center opacity-0 group-hover/chat:opacity-100 transition-opacity duration-200 pointer-events-none">
-              <span className="bg-foreground/80 text-background text-xs font-medium px-3 py-1.5 rounded-lg shadow-lg">
-                功能升级中，敬请期待
-              </span>
-            </div>
           </div>
           <p className="text-xs text-muted-foreground text-center mt-2">
             LockAI 可能会出错，请核实重要信息。仅供日常课程作业的辅助参考，不可用于正式学术发表

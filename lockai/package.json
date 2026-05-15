@@ -1,6 +1,6 @@
 {
   "name": "lockai",
-  "version": "0.6.0",
+  "version": "0.8.0",
   "private": true,
   "scripts": {
     "dev": "set NODE_OPTIONS=--max-old-space-size=4096 && next dev",
@@ -20,6 +20,7 @@
     "react-pdf": "^10.3.0",
     "react-syntax-highlighter": "^16.1.0",
     "rehype-katex": "^7.0.1",
+    "rehype-raw": "^7.0.0",
     "remark-gfm": "^4.0.1",
     "remark-math": "^6.0.0"
   },

@@ -15,7 +15,7 @@ import httpx
 
 from models import strip_assistant_reasoning
 
-from .tool_contracts import build_anthropic_tools, build_gemini_function_declarations
+from .tool_contracts import build_anthropic_tools
 
 
 class ProviderRuntime:
@@ -39,10 +39,10 @@ class ProviderRuntime:
         model_name = self._clean_optional_string(cfg.get("model") or cfg.get("id")).lower()
         if model_name.startswith("claude") or "anthropic" in model_name:
             return "anthropic-native"
-        if "gemini" in model_name:
-            return "gemini-native"
         if model_name.startswith("qwen"):
             return "qwen-compatible"
+        if model_name.startswith("deepseek"):
+            return "deepseek-compatible"
         return "openai-compatible"
 
     def build_state(
@@ -55,26 +55,19 @@ class ProviderRuntime:
         temperature: float | None = None,
         max_tokens: int | None = None,
         enable_thinking: bool | None = None,
+        reasoning_effort: str | None = None,
         extra_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         cfg = dict(model_config) if isinstance(model_config, dict) else self.llm.get_model_config(model_id)
         transport = self.resolve_transport(cfg)
-        if transport.startswith("gemini"):
-            return self._build_gemini_state(
-                cfg,
-                messages=messages,
-                tools=tools,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                enable_thinking=enable_thinking,
-                extra_payload=extra_payload,
-            )
         if transport.startswith("anthropic"):
             return self._build_anthropic_state(
                 cfg,
                 messages=messages,
                 tools=tools,
                 max_tokens=max_tokens,
+                enable_thinking=enable_thinking,
+                reasoning_effort=reasoning_effort,
             )
         return self._build_openai_state(
             cfg,
@@ -83,6 +76,7 @@ class ProviderRuntime:
             temperature=temperature,
             max_tokens=max_tokens,
             enable_thinking=enable_thinking,
+            reasoning_effort=reasoning_effort,
             extra_payload=extra_payload,
         )
 
@@ -93,14 +87,11 @@ class ProviderRuntime:
         kind = str(state.get("kind") or "openai-compatible")
         try:
             with httpx.Client(timeout=self.request_timeout) as client:
-                if kind == "gemini-native":
-                    response = self._request_gemini_turn(client, state)
-                    return self._parse_gemini_response(response)
                 if kind == "anthropic-native":
                     response = self._request_anthropic_turn(client, state)
                     return self._parse_anthropic_response(response)
                 response = self._request_openai_turn(client, state)
-                return self._parse_openai_response(response)
+                return self._parse_openai_response(response, state=state)
         except Exception as exc:
             print(f"[LLM] provider turn 异常 ({kind}): {type(exc).__name__}: {exc}")
             return None
@@ -114,25 +105,6 @@ class ProviderRuntime:
         content_text: str,
     ) -> None:
         kind = str(state.get("kind") or "openai-compatible")
-        if kind == "gemini-native":
-            if isinstance(assistant_history_item, dict):
-                state["history"].append(assistant_history_item)
-                return
-            parts: list[dict[str, Any]] = []
-            if content_text:
-                parts.append({"text": content_text})
-            for call in parsed_calls:
-                parts.append({
-                    "functionCall": {
-                        "name": call["name"],
-                        "id": call["id"],
-                        "args": call.get("arguments") or {},
-                    }
-                })
-            if parts:
-                state["history"].append({"role": "model", "parts": parts})
-            return
-
         if kind == "anthropic-native":
             if isinstance(assistant_history_item, dict):
                 state["history"].append(assistant_history_item)
@@ -166,20 +138,6 @@ class ProviderRuntime:
             return
 
         kind = str(state.get("kind") or "openai-compatible")
-        if kind == "gemini-native":
-            parts: list[dict[str, Any]] = []
-            for result in tool_results:
-                parts.append({
-                    "functionResponse": {
-                        "name": result["name"],
-                        "response": {
-                            "result": self._normalize_tool_result_content(result.get("content")),
-                        },
-                    }
-                })
-            state["history"].append({"role": "user", "parts": parts})
-            return
-
         if kind == "anthropic-native":
             blocks: list[dict[str, Any]] = []
             for result in tool_results:
@@ -207,6 +165,7 @@ class ProviderRuntime:
         temperature: float | None,
         max_tokens: int | None,
         enable_thinking: bool | None,
+        reasoning_effort: str | None,
         extra_payload: dict[str, Any] | None,
     ) -> dict[str, Any] | None:
         api_key = self.llm.get_api_key(cfg)
@@ -223,48 +182,7 @@ class ProviderRuntime:
             "temperature": temperature if temperature is not None else cfg.get("temperature", self.llm.temperature),
             "max_tokens": max_tokens if max_tokens is not None else cfg.get("max_tokens", self.llm.max_tokens),
             "enable_thinking": enable_thinking,
-            "extra_payload": dict(extra_payload or {}),
-        }
-
-    def _build_gemini_state(
-        self,
-        cfg: dict[str, Any],
-        *,
-        messages: list[dict[str, Any]],
-        tools: list[dict[str, Any]] | None,
-        temperature: float | None,
-        max_tokens: int | None,
-        enable_thinking: bool | None,
-        extra_payload: dict[str, Any] | None,
-    ) -> dict[str, Any] | None:
-        api_key = self._select_native_api_key(
-            cfg,
-            env_candidates=("FANGGROUP_GEMINI_API_KEY", "GEMINI_API_KEY"),
-            allow_model_api_key_fallback=True,
-        )
-        if not api_key:
-            return None
-
-        system_instruction, history = self._convert_history_to_gemini_contents(messages)
-        api_base = (
-            self._clean_optional_string(cfg.get("native_api_base"))
-            or self._clean_optional_string(os.environ.get("GEMINI_API_BASE"))
-            or self._clean_optional_string(cfg.get("api_base"))
-            or self.llm.legacy_api_base
-        )
-        return {
-            "kind": "gemini-native",
-            "transport": self.resolve_transport(cfg),
-            "model_id": cfg["model"],
-            "url": self._build_gemini_chat_url(api_base, cfg["model"]),
-            "headers": {"Content-Type": "application/json"},
-            "params": {"key": api_key},
-            "system_instruction": system_instruction,
-            "history": history,
-            "tools": self._build_gemini_function_declarations(tools),
-            "temperature": temperature if temperature is not None else cfg.get("temperature", self.llm.temperature),
-            "max_tokens": max_tokens if max_tokens is not None else cfg.get("max_tokens", self.llm.max_tokens),
-            "enable_thinking": enable_thinking,
+            "reasoning_effort": reasoning_effort,
             "extra_payload": dict(extra_payload or {}),
         }
 
@@ -275,6 +193,8 @@ class ProviderRuntime:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
         max_tokens: int | None,
+        enable_thinking: bool | None,
+        reasoning_effort: str | None,
     ) -> dict[str, Any] | None:
         api_key = self._select_native_api_key(
             cfg,
@@ -298,13 +218,16 @@ class ProviderRuntime:
         api_base = (
             self._clean_optional_string(cfg.get("native_api_base"))
             or self._clean_optional_string(os.environ.get("ANTHROPIC_API_BASE"))
+            or self._clean_optional_string(cfg.get("api_base"))
             or "https://api.anthropic.com"
         )
+        native_base = self._strip_v1_suffix(api_base)
+        default_max = max(256, int(os.environ.get("ANTHROPIC_MAX_TOKENS", "16384")))
         return {
             "kind": "anthropic-native",
             "transport": self.resolve_transport(cfg),
             "model_id": cfg["model"],
-            "url": f"{api_base.rstrip('/')}/v1/messages",
+            "url": f"{native_base}/v1/messages",
             "headers": {
                 "x-api-key": api_key,
                 "anthropic-version": os.environ.get("ANTHROPIC_API_VERSION", "2023-06-01"),
@@ -313,7 +236,9 @@ class ProviderRuntime:
             "system_instruction": system_instruction,
             "history": history,
             "tools": self._build_anthropic_tools(tools),
-            "max_tokens": max_tokens if max_tokens is not None else max(256, int(os.environ.get("ANTHROPIC_MAX_TOKENS", "4096"))),
+            "max_tokens": max_tokens if max_tokens is not None else default_max,
+            "enable_thinking": enable_thinking,
+            "reasoning_effort": reasoning_effort,
         }
 
     def _request_openai_turn(self, client: httpx.Client, state: dict[str, Any]) -> dict[str, Any]:
@@ -326,54 +251,23 @@ class ProviderRuntime:
         }
         if state.get("tools"):
             payload["tools"] = state["tools"]
-        if state.get("enable_thinking") is not None and str(state.get("transport") or "").startswith("qwen"):
+        transport_str = str(state.get("transport") or "")
+        if state.get("enable_thinking") is not None and transport_str.startswith("qwen"):
             payload["enable_thinking"] = bool(state["enable_thinking"])
+        elif transport_str.startswith("deepseek"):
+            thinking_on = True if state.get("enable_thinking") is None else bool(state["enable_thinking"])
+            payload["thinking"] = {"type": "enabled" if thinking_on else "disabled"}
+            if thinking_on:
+                for banned in ("temperature", "top_p", "presence_penalty", "frequency_penalty"):
+                    payload.pop(banned, None)
+                effort = self._clean_optional_string(state.get("reasoning_effort")).lower()
+                if effort in {"max", "xhigh"}:
+                    payload["reasoning_effort"] = "max"
         payload.update(state.get("extra_payload") or {})
         response = client.post(state["url"], headers=state["headers"], json=payload)
         if response.status_code != 200:
             raise RuntimeError(f"HTTP {response.status_code} - {response.text[:500]}")
         return response.json()
-
-    def _request_gemini_turn(self, client: httpx.Client, state: dict[str, Any]) -> dict[str, Any]:
-        payload: dict[str, Any] = {
-            "contents": state["history"],
-            "generationConfig": {
-                "temperature": state["temperature"],
-                "maxOutputTokens": state["max_tokens"],
-            },
-        }
-        if state.get("enable_thinking") is not None:
-            payload["generationConfig"]["thinkingConfig"] = self._build_gemini_thinking_config(
-                state["model_id"],
-                bool(state["enable_thinking"]),
-            )
-        if state.get("system_instruction"):
-            payload["systemInstruction"] = {"parts": [{"text": state["system_instruction"]}]}
-        if state.get("tools"):
-            payload["tools"] = [{"functionDeclarations": state["tools"]}]
-            payload["toolConfig"] = {"functionCallingConfig": {"mode": "AUTO"}}
-        payload.update(state.get("extra_payload") or {})
-        response = client.post(
-            state["url"],
-            headers=state["headers"],
-            params=state.get("params"),
-            json=payload,
-        )
-        if response.status_code != 200:
-            raise RuntimeError(f"HTTP {response.status_code} - {response.text[:500]}")
-        return response.json()
-
-    def _build_gemini_thinking_config(self, model_id: str, enable_thinking: bool) -> dict[str, Any]:
-        model_name = self._clean_optional_string(model_id).lower()
-        if model_name.startswith("gemini-3"):
-            return {
-                # Gemini 3 thinking uses qualitative levels rather than an on/off budget.
-                "thinkingLevel": "HIGH" if enable_thinking else "LOW",
-            }
-        return {
-            # For 2.5-style models, a zero budget disables thinking while a positive budget enables it.
-            "thinkingBudget": 1024 if enable_thinking else 0,
-        }
 
     def _request_anthropic_turn(self, client: httpx.Client, state: dict[str, Any]) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -385,19 +279,39 @@ class ProviderRuntime:
             payload["system"] = state["system_instruction"]
         if state.get("tools"):
             payload["tools"] = state["tools"]
+        if state.get("enable_thinking"):
+            effort = self._clean_optional_string(state.get("reasoning_effort")).lower()
+            budget = 8192 if effort in {"max", "xhigh"} else 4096
+            if payload["max_tokens"] <= budget:
+                payload["max_tokens"] = budget + 4096
+            payload["thinking"] = {"type": "enabled", "budget_tokens": budget}
+            # extended thinking 要求 temperature=1（或不传），这里直接省略 temperature
         response = client.post(state["url"], headers=state["headers"], json=payload)
         if response.status_code != 200:
             raise RuntimeError(f"HTTP {response.status_code} - {response.text[:500]}")
         return response.json()
 
-    def _parse_openai_response(self, payload: dict[str, Any]) -> dict[str, Any]:
+    def _parse_openai_response(
+        self,
+        payload: dict[str, Any],
+        *,
+        state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         choice = (payload.get("choices") or [{}])[0]
         message = choice.get("message", {}) or {}
         raw_content = message.get("content")
         visible_content = self._extract_visible_openai_content(raw_content)
+        transport_str = str((state or {}).get("transport") or "")
+        # DeepSeek 在工具调用链中要求把 reasoning_content 原样回传，否则下一轮 400
+        preserved_reasoning = (
+            self._clean_optional_string(message.get("reasoning_content"))
+            if transport_str.startswith("deepseek")
+            else ""
+        )
         assistant_history_item = self._build_openai_assistant_history_item(
             visible_content,
             self.llm._parse_tool_calls(message.get("tool_calls")),
+            reasoning_content=preserved_reasoning or None,
         )
         return {
             "message": message,
@@ -406,71 +320,6 @@ class ProviderRuntime:
             "tool_calls": self.llm._parse_tool_calls(message.get("tool_calls")),
             "finish_reason": choice.get("finish_reason", ""),
             "assistant_history_item": assistant_history_item,
-        }
-
-    def _parse_gemini_response(self, payload: dict[str, Any]) -> dict[str, Any]:
-        candidates = payload.get("candidates") or []
-        if not candidates:
-            raise RuntimeError("模型返回空响应，请重试")
-
-        candidate = candidates[0] if isinstance(candidates[0], dict) else {}
-        content_obj = candidate.get("content") if isinstance(candidate.get("content"), dict) else {}
-        parts = content_obj.get("parts") if isinstance(content_obj.get("parts"), list) else []
-        if parts and not self._clean_optional_string(content_obj.get("role")):
-            content_obj = {"role": "model", "parts": parts}
-
-        text_fragments: list[str] = []
-        tool_calls: list[dict[str, Any]] = []
-        visible_parts: list[dict[str, Any]] = []
-        for part in parts:
-            if not isinstance(part, dict):
-                continue
-            if self._is_reasoning_part(part):
-                continue
-
-            visible_part: dict[str, Any] = {}
-            if part.get("thoughtSignature") is not None:
-                visible_part["thoughtSignature"] = part.get("thoughtSignature")
-            if part.get("thought_signature") is not None:
-                visible_part["thought_signature"] = part.get("thought_signature")
-            text = strip_assistant_reasoning(self._clean_optional_string(part.get("text")))
-            if text:
-                text_fragments.append(text)
-                visible_part["text"] = text
-            function_call = part.get("functionCall") or part.get("function_call")
-            if isinstance(function_call, dict):
-                name = self._clean_optional_string(function_call.get("name"))
-                if name:
-                    raw_args = function_call.get("args", {})
-                    if isinstance(raw_args, str):
-                        try:
-                            raw_args = json.loads(raw_args)
-                        except json.JSONDecodeError:
-                            raw_args = {}
-                    if not isinstance(raw_args, dict):
-                        raw_args = {}
-                    call_id = self._clean_optional_string(function_call.get("id")) or str(uuid.uuid4())
-                    tool_calls.append({
-                        "id": call_id,
-                        "name": name,
-                        "arguments": raw_args,
-                    })
-                    visible_part["functionCall"] = {
-                        "name": name,
-                        "id": call_id,
-                        "args": raw_args,
-                    }
-
-            if visible_part:
-                visible_parts.append(visible_part)
-
-        return {
-            "message": {"role": "model", "parts": visible_parts} if visible_parts else {},
-            "raw_content": parts,
-            "content": strip_assistant_reasoning("".join(text_fragments).strip()),
-            "tool_calls": tool_calls,
-            "finish_reason": self._clean_optional_string(candidate.get("finishReason")),
-            "assistant_history_item": {"role": "model", "parts": visible_parts} if visible_parts else None,
         }
 
     def _parse_anthropic_response(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -485,6 +334,9 @@ class ProviderRuntime:
             if not isinstance(block, dict):
                 continue
             block_type = block.get("type")
+            if block_type == "thinking" or block_type == "redacted_thinking":
+                # 思考块对前端不可见；也不写回 history（下一轮无需）
+                continue
             if block_type == "text":
                 text = strip_assistant_reasoning(self._clean_optional_string(block.get("text")))
                 if text:
@@ -546,49 +398,6 @@ class ProviderRuntime:
             non_system_messages.append(item)
         return "\n\n".join(system_parts).strip(), non_system_messages
 
-    def _convert_history_to_gemini_contents(self, history: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
-        system_instruction, non_system_messages = self._split_history_system_messages(history)
-        contents: list[dict[str, Any]] = []
-        for item in non_system_messages:
-            role = item.get("role")
-            if role not in {"user", "assistant"}:
-                continue
-            parts = self._convert_history_content_to_gemini_parts(item.get("content"))
-            if not parts:
-                continue
-            contents.append({
-                "role": "model" if role == "assistant" else "user",
-                "parts": parts,
-            })
-        return system_instruction, contents
-
-    def _convert_history_content_to_gemini_parts(self, content: Any) -> list[dict[str, Any]]:
-        if isinstance(content, str):
-            text = content.strip()
-            return [{"text": text}] if text else []
-
-        if not isinstance(content, list):
-            text = self._extract_message_text_content(content).strip()
-            return [{"text": text}] if text else []
-
-        parts: list[dict[str, Any]] = []
-        for item in content:
-            if not isinstance(item, dict):
-                continue
-            item_type = item.get("type")
-            if item_type == "text":
-                text = self._clean_optional_string(item.get("text"))
-                if text:
-                    parts.append({"text": text})
-                continue
-            if item_type == "image_url":
-                image_url = self._clean_optional_string((item.get("image_url") or {}).get("url"))
-                if image_url:
-                    part = self._encode_image_url_as_gemini_part(image_url)
-                    if part:
-                        parts.append(part)
-        return parts
-
     def _convert_history_content_to_anthropic_blocks(self, content: Any) -> list[dict[str, Any]]:
         if isinstance(content, str):
             text = content.strip()
@@ -616,28 +425,14 @@ class ProviderRuntime:
                         blocks.append(block)
         return blocks
 
-    def _build_gemini_function_declarations(self, tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
-        return build_gemini_function_declarations(tools)
-
     def _build_anthropic_tools(self, tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
         return build_anthropic_tools(tools)
 
-    def _build_gemini_chat_url(self, api_base: str, model_id: str) -> str:
+    def _strip_v1_suffix(self, api_base: str) -> str:
         stripped = (api_base or self.llm.legacy_api_base).rstrip("/")
         if stripped.endswith("/v1"):
-            stripped = stripped[:-3]
-        return f"{stripped}/v1beta/models/{model_id}:generateContent"
-
-    def _encode_image_url_as_gemini_part(self, image_url: str) -> dict[str, Any] | None:
-        image_bytes, mime_type = self._download_source_image(image_url)
-        if not image_bytes:
-            return None
-        return {
-            "inline_data": {
-                "mime_type": mime_type or "image/png",
-                "data": base64.b64encode(image_bytes).decode("utf-8"),
-            }
-        }
+            return stripped[:-3]
+        return stripped
 
     def _encode_image_url_as_anthropic_block(self, image_url: str) -> dict[str, Any] | None:
         image_bytes, mime_type = self._download_source_image(image_url)
@@ -758,10 +553,14 @@ class ProviderRuntime:
         self,
         content_text: str,
         parsed_calls: list[dict[str, Any]],
+        *,
+        reasoning_content: str | None = None,
     ) -> dict[str, Any] | None:
         assistant_message: dict[str, Any] = {"role": "assistant"}
         if content_text:
             assistant_message["content"] = content_text
+        if reasoning_content:
+            assistant_message["reasoning_content"] = reasoning_content
         if parsed_calls:
             assistant_message["tool_calls"] = self._build_openai_tool_calls(parsed_calls)
         return assistant_message if len(assistant_message) > 1 else None

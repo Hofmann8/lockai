@@ -4,6 +4,8 @@ export interface SearchToolTrace {
   query: string;
   status: 'running' | 'done';
   success?: boolean;
+  startedAtMs?: number;
+  durationSeconds?: number;
 }
 
 export interface ImageGenRequest {
@@ -45,16 +47,20 @@ export interface ImageGenToolTrace {
   prompt: string;
   status: 'running' | 'done';
   success?: boolean;
+  startedAtMs?: number;
+  durationSeconds?: number;
   request?: ImageGenRequest;
   editRequest?: ImageEditRequest;
   resolvedEditRequest?: ImageEditRequest;
   url?: string;
+  blurredUrl?: string;
   sourceLabel?: string;
   sourceImageId?: string;
   sourceImageUrl?: string;
   outputWidth?: number;
   outputHeight?: number;
   outputAspectRatio?: string;
+  modelLabel?: string;
 }
 
 export type ToolTrace = SearchToolTrace | ImageGenToolTrace;
@@ -78,6 +84,8 @@ export interface ChatSession {
   updatedAt: Date;
 }
 
+export type ThinkingLevel = 'fast' | 'standard' | 'deep';
+
 export interface ChatModel {
   id: string;
   name: string;
@@ -87,6 +95,7 @@ export interface ChatModel {
   thinking_mode: 'always' | 'never' | 'optional';
   default_thinking?: boolean;
   tags?: string[];
+  supports_reasoning_effort?: boolean;
 }
 
 // Chat request/response
@@ -98,7 +107,9 @@ export interface ChatRequest {
   user_id?: string;
   session_id?: string;
   thinking?: boolean;
+  reasoning_effort?: 'high' | 'max';
   current_message_id?: string;
+  image_quality?: 'standard' | 'hd';
 }
 
 export interface ChatResponse {
@@ -154,6 +165,7 @@ export interface StreamImageGenStartEvent {
   assetId?: string;
   request?: ImageGenRequest;
   editRequest?: ImageEditRequest;
+  modelLabel?: string;
 }
 
 export interface StreamImageGenEndEvent {
@@ -164,6 +176,7 @@ export interface StreamImageGenEndEvent {
   success: boolean;
   assetId?: string;
   url?: string;
+  blurredUrl?: string;
   request?: ImageGenRequest;
   editRequest?: ImageEditRequest;
   resolvedEditRequest?: ImageEditRequest;
@@ -173,6 +186,7 @@ export interface StreamImageGenEndEvent {
   outputWidth?: number;
   outputHeight?: number;
   outputAspectRatio?: string;
+  modelLabel?: string;
 }
 
 export interface StreamMessageEndEvent {

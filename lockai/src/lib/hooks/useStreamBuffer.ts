@@ -2,45 +2,58 @@
 
 import { useCallback, useEffect, useRef, useState } from 'react';
 
-const CHAR_INTERVAL_MS = 12;
-const CHARS_PER_STEP = 30;
+const BASE_INTERVAL_MS = 16;
+const MIN_CHARS_PER_STEP = 6;
+const MAX_CHARS_PER_STEP = 120;
 
 export function useStreamBuffer() {
   const [displayedContent, setDisplayedContent] = useState('');
   const bufferRef = useRef('');
   const cursorRef = useRef(0);
-  const rafRef = useRef<number | null>(null);
-  const lastTickRef = useRef(0);
+  const timerRef = useRef<number | null>(null);
   const activeRef = useRef(false);
 
-  const tick = useCallback((now: number) => {
+  const clearTimer = useCallback(() => {
+    if (timerRef.current !== null) {
+      window.clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+  }, []);
+
+  const tick = useCallback(() => {
     if (!activeRef.current) return;
 
     const pending = bufferRef.current.length - cursorRef.current;
     if (pending <= 0) {
-      rafRef.current = null;
       return;
     }
 
-    const elapsed = now - lastTickRef.current;
-    if (elapsed >= CHAR_INTERVAL_MS) {
-      const chars = Math.max(1, Math.floor(pending / CHARS_PER_STEP));
-      const end = Math.min(cursorRef.current + chars, bufferRef.current.length);
-      const slice = bufferRef.current.slice(cursorRef.current, end);
-      cursorRef.current = end;
+    const chars = Math.max(
+      MIN_CHARS_PER_STEP,
+      Math.min(MAX_CHARS_PER_STEP, Math.ceil(pending / 12)),
+    );
+    const end = Math.min(cursorRef.current + chars, bufferRef.current.length);
+    const slice = bufferRef.current.slice(cursorRef.current, end);
+    cursorRef.current = end;
+    if (slice) {
       setDisplayedContent((prev) => prev + slice);
-      lastTickRef.current = now;
     }
 
-    rafRef.current = requestAnimationFrame(tick);
+    if (bufferRef.current.length - cursorRef.current > 0) {
+      timerRef.current = window.setTimeout(() => {
+        timerRef.current = null;
+        tick();
+      }, BASE_INTERVAL_MS);
+    }
   }, []);
 
   const start = useCallback(() => {
+    clearTimer();
     bufferRef.current = '';
     cursorRef.current = 0;
     activeRef.current = true;
     setDisplayedContent('');
-  }, []);
+  }, [clearTimer]);
 
   const push = useCallback((text: string) => {
     if (!text) return;
@@ -48,35 +61,31 @@ export function useStreamBuffer() {
     if (!activeRef.current) {
       activeRef.current = true;
     }
-    if (rafRef.current === null) {
-      lastTickRef.current = performance.now();
-      rafRef.current = requestAnimationFrame(tick);
+    if (timerRef.current === null) {
+      timerRef.current = window.setTimeout(() => {
+        timerRef.current = null;
+        tick();
+      }, BASE_INTERVAL_MS);
     }
   }, [tick]);
 
   const flush = useCallback(() => {
     activeRef.current = false;
-    if (rafRef.current !== null) {
-      cancelAnimationFrame(rafRef.current);
-      rafRef.current = null;
-    }
+    clearTimer();
     const remaining = bufferRef.current.slice(cursorRef.current);
     if (remaining) {
       cursorRef.current = bufferRef.current.length;
       setDisplayedContent((prev) => prev + remaining);
     }
-  }, []);
+  }, [clearTimer]);
 
   const reset = useCallback(() => {
     activeRef.current = false;
-    if (rafRef.current !== null) {
-      cancelAnimationFrame(rafRef.current);
-      rafRef.current = null;
-    }
+    clearTimer();
     bufferRef.current = '';
     cursorRef.current = 0;
     setDisplayedContent('');
-  }, []);
+  }, [clearTimer]);
 
   const getBufferedContent = useCallback(() => bufferRef.current, []);
   const getPendingCharCount = useCallback(
@@ -86,11 +95,9 @@ export function useStreamBuffer() {
 
   useEffect(() => {
     return () => {
-      if (rafRef.current !== null) {
-        cancelAnimationFrame(rafRef.current);
-      }
+      clearTimer();
     };
-  }, []);
+  }, [clearTimer]);
 
   return { displayedContent, push, start, flush, reset, getBufferedContent, getPendingCharCount };
 }

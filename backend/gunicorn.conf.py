@@ -13,8 +13,8 @@ workers = int(os.environ.get("GUNICORN_WORKERS", 1))  # 小内存机器用 1 个
 worker_class = "gevent"  # 协程模式，支持高并发长连接
 worker_connections = int(os.environ.get("GUNICORN_CONNECTIONS", 50))  # 每个 worker 50 并发
 
-# 超时配置（SSE 长连接需要较长超时）
-timeout = 120
+# 超时配置（SSE 长连接和长任务需要更长超时）
+timeout = 300
 graceful_timeout = 30
 keepalive = 5
 

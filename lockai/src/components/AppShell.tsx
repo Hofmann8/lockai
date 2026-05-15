@@ -6,7 +6,7 @@ import { ChatSession, PaperRecord } from '@/types';
 import { Menu } from 'lucide-react';
 import { Sidebar } from '@/components/chat/Sidebar';
 import { SettingsModal } from '@/components/SettingsModal';
-import { getSessions, getSession } from '@/lib/chat-history';
+import { getSessions, getSession, deleteSession } from '@/lib/chat-history';
 import { listPapers, deletePaper } from '@/lib/api';
 import { getAuthState } from '@/lib/auth';
 
@@ -68,9 +68,7 @@ export function AppShell({ children }: AppShellProps) {
 
   const loadSessions = useCallback(async () => {
     const data = await getSessions();
-    startTransition(() => {
-      setSessions(data);
-    });
+    setSessions(data);
     return data;
   }, []);
 
@@ -116,16 +114,23 @@ export function AppShell({ children }: AppShellProps) {
 
   const handleDeleteSession = useCallback(async (sessionId: string) => {
     if (isPaper) {
-      await deletePaper(sessionId);
+      setPaperRecords(prev => prev.filter(p => p.id !== sessionId));
       if (sessionId === currentPaperId) {
         setCurrentPaperId(null);
       }
-      loadPaperRecords();
+      const ok = await deletePaper(sessionId);
+      if (!ok) {
+        loadPaperRecords();
+      }
     } else {
+      setSessions(prev => prev.filter(s => s.id !== sessionId));
       if (sessionId === currentSessionId) {
         setCurrentSessionId(null);
       }
-      loadSessions();
+      const ok = await deleteSession(sessionId);
+      if (!ok) {
+        loadSessions();
+      }
     }
   }, [isPaper, loadSessions, loadPaperRecords, currentSessionId, currentPaperId, setCurrentPaperId]);
 

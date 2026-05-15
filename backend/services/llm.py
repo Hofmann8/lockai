@@ -107,6 +107,7 @@ class LLMService:
         temperature: float | None = None,
         max_tokens: int | None = None,
         enable_thinking: bool | None = None,
+        reasoning_effort: str | None = None,
         extra_payload: dict[str, Any] | None = None,
     ) -> Generator[dict[str, Any], None, None]:
         cfg = self.get_model_config(model)
@@ -123,6 +124,7 @@ class LLMService:
             temperature=temperature,
             max_tokens=max_tokens,
             enable_thinking=enable_thinking,
+            reasoning_effort=reasoning_effort,
             extra_payload=extra_payload,
         )
 
@@ -304,6 +306,7 @@ class LLMService:
         temperature: float = None,
         max_tokens: int = None,
         api_key: str = None,
+        enable_thinking: bool | None = None,
         extra_payload: dict[str, Any] | None = None,
     ) -> Optional[str]:
         response = self.complete_message(
@@ -312,6 +315,7 @@ class LLMService:
             temperature=temperature,
             max_tokens=max_tokens,
             api_key=api_key,
+            enable_thinking=enable_thinking,
             extra_payload=extra_payload,
         )
         if response is None:
@@ -451,11 +455,12 @@ class LLMService:
                 "id": "campbell",
                 "name": "Campbell 1.5",
                 "description": "深度推理与复杂任务处理",
-                "model": "gemini-3.1-pro-preview",
+                "model": "claude-sonnet-4-6",
                 "api_base": self.legacy_api_base,
-                "api_key_pool_prefix": "API_KEY_",
-                "provider": "gemini-native",
-                "transport": "gemini-native",
+                "api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
+                "provider": "anthropic-native",
+                "transport": "anthropic-native",
+                "native_api_key_env": "ANTHROPIC_API_KEY",
                 "thinking_mode": "optional",
                 "default_thinking": True,
                 "available": True,
@@ -465,13 +470,13 @@ class LLMService:
             },
             {
                 "id": "scooby",
-                "name": "Scooby 1.7",
+                "name": "Scooby 2.0",
                 "description": "通用助理，适合多数对话与创作任务",
-                "model": "gemini-3-pro-preview",
-                "api_base": self.legacy_api_base,
-                "api_key_pool_prefix": "API_KEY_",
-                "provider": "gemini-native",
-                "transport": "gemini-native",
+                "model": "deepseek-v4-pro",
+                "api_base": os.environ.get("DEEPSEEK_API_BASE_URL", "https://api.deepseek.com"),
+                "api_key": os.environ.get("DEEPSEEK_API_KEY", ""),
+                "provider": "deepseek-compatible",
+                "transport": "deepseek-compatible",
                 "thinking_mode": "optional",
                 "default_thinking": True,
                 "available": True,
@@ -480,13 +485,13 @@ class LLMService:
             },
             {
                 "id": "leo",
-                "name": "Leo 1.7",
+                "name": "Leo 2.0",
                 "description": "响应更快，适合日常问答与轻量任务",
-                "model": "qwen3.5-plus",
-                "api_base": self.qwen_base_url,
-                "api_key": self.qwen_api_key,
-                "provider": "qwen-compatible",
-                "transport": "qwen-compatible",
+                "model": "deepseek-v4-flash",
+                "api_base": os.environ.get("DEEPSEEK_API_BASE_URL", "https://api.deepseek.com"),
+                "api_key": os.environ.get("DEEPSEEK_API_KEY", ""),
+                "provider": "deepseek-compatible",
+                "transport": "deepseek-compatible",
                 "thinking_mode": "optional",
                 "default_thinking": True,
                 "available": True,
@@ -523,14 +528,27 @@ class LLMService:
             },
             {
                 "id": "image_generator",
-                "name": "图片生成",
-                "description": "内部图像生成模型",
-                "model": "gemini-3.1-flash-image-preview",
+                "name": "Campbell 1.5 Image",
+                "description": "实时绘图（Gemini 3 Pro Image Preview）",
+                "model": "gemini-3-pro-image-preview",
+                "edit_model": "gemini-3-pro-image-preview",
+                "api_base": os.environ.get("GEMINI_API_BASE_URL", self.legacy_api_base),
+                "image_api_key_env": "GEMINI_API_KEY",
+                "provider": "openai-image",
+                "transport": "openai-image",
+                "available": True,
+                "visible": False,
+            },
+            {
+                "id": "image_generator_hd",
+                "name": "Campbell 2.0 Image",
+                "description": "高清绘图（gpt-image-2，较慢）",
+                "model": "gpt-image-2",
+                "edit_model": "gpt-image-2",
                 "api_base": self.legacy_api_base,
                 "api_key_pool_prefix": "API_KEY_",
-                "image_api_key_env": "API_KEY_PAPER",
-                "provider": "gemini-native",
-                "transport": "gemini-native",
+                "provider": "openai-image",
+                "transport": "openai-image",
                 "available": True,
                 "visible": False,
             },
@@ -547,6 +565,19 @@ class LLMService:
                 "provider": "qwen-compatible",
                 "transport": "qwen-compatible",
                 "thinking_mode": "never",
+                "available": True,
+                "visible": False,
+            }
+        if (model_name or "").startswith("deepseek"):
+            return {
+                "id": model_name,
+                "name": model_name,
+                "model": model_name,
+                "api_base": os.environ.get("DEEPSEEK_API_BASE_URL", "https://api.deepseek.com"),
+                "api_key": os.environ.get("DEEPSEEK_API_KEY", ""),
+                "provider": "deepseek-compatible",
+                "transport": "deepseek-compatible",
+                "thinking_mode": "optional",
                 "available": True,
                 "visible": False,
             }
@@ -603,6 +634,7 @@ class LLMService:
         temperature: float | None = None,
         max_tokens: int | None = None,
         enable_thinking: bool | None = None,
+        reasoning_effort: str | None = None,
         extra_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -616,8 +648,18 @@ class LLMService:
             payload["tools"] = tools
 
         provider = str(cfg.get("provider") or "")
+        transport = str(cfg.get("transport") or provider)
         if enable_thinking is not None and provider.startswith("qwen"):
             payload["enable_thinking"] = bool(enable_thinking)
+        elif transport.startswith("deepseek") or provider.startswith("deepseek"):
+            thinking_on = True if enable_thinking is None else bool(enable_thinking)
+            payload["thinking"] = {"type": "enabled" if thinking_on else "disabled"}
+            if thinking_on:
+                for banned in ("temperature", "top_p", "presence_penalty", "frequency_penalty"):
+                    payload.pop(banned, None)
+                effort = (reasoning_effort or "").strip().lower()
+                if effort in {"max", "xhigh"}:
+                    payload["reasoning_effort"] = "max"
         if extra_payload:
             payload.update(extra_payload)
         return payload

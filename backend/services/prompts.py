@@ -44,7 +44,7 @@ def get_generic_prompt(series: str = None) -> str:
 
 
 def get_campbell_prompt() -> str:
-    """Campbell 系列系统提示词（Gemini 原生工具调用）"""
+    """Campbell 系列系统提示词（Anthropic 原生工具调用）"""
     return f"""你是 LockAI Campbell 系列的 AI 助手，负责高质量推理、联网搜索和图像任务。
 
 {get_identity_protection("Campbell")}

@@ -5,7 +5,6 @@ import Image from 'next/image';
 import { useRouter } from 'next/navigation';
 import { Plus, MessageSquare, Trash2, ChevronLeft, LogOut, Settings, FileText, Check, X } from 'lucide-react';
 import { ChatSession, AuthState, PaperRecord } from '@/types';
-import { deleteSession } from '@/lib/chat-history';
 import { getAuthState, logout, fetchUserAvatar, getSignedUrlExpiry, isSignedUrlExpired, updateAvatarUrl } from '@/lib/auth';
 
 interface SidebarProps {
@@ -102,11 +101,8 @@ export function Sidebar({
     setConfirmDeleteId(sessionId);
   };
 
-  const handleConfirmDelete = async (e: React.MouseEvent, sessionId: string) => {
+  const handleConfirmDelete = (e: React.MouseEvent, sessionId: string) => {
     e.stopPropagation();
-    if (!isPaper) {
-      await deleteSession(sessionId);
-    }
     onDeleteSession(sessionId);
     setConfirmDeleteId(null);
   };

@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
-import { ChatMessage, ChatModel, ChatState, ToolTrace } from '@/types';
+import { ChatMessage, ChatModel, ChatState, ThinkingLevel, ToolTrace } from '@/types';
 import { MessageList } from '@/components/chat/MessageList';
 import { MessageInput } from '@/components/chat/MessageInput';
 import { sendChatMessageStream, getModels, uploadImage } from '@/lib/api';
@@ -50,7 +50,12 @@ function upsertRunningSearchTrace(trace: ToolTrace[] | undefined, query: string)
     next[next.length - 1] = { ...last, query: query.trim() || last.query };
     return next;
   }
-  next.push({ kind: 'search', query: query.trim(), status: 'running' });
+  next.push({
+    kind: 'search',
+    query: query.trim(),
+    status: 'running',
+    startedAtMs: Date.now(),
+  });
   return next;
 }
 
@@ -59,11 +64,24 @@ function finalizeSearchTrace(trace: ToolTrace[] | undefined, query: string, succ
   for (let i = next.length - 1; i >= 0; i -= 1) {
     const item = next[i];
     if (item.kind === 'search' && item.status === 'running') {
-      next[i] = { ...item, query: query.trim() || item.query, status: 'done', success };
+      const startedAtMs = item.startedAtMs ?? Date.now();
+      next[i] = {
+        ...item,
+        query: query.trim() || item.query,
+        status: 'done',
+        success,
+        durationSeconds: Math.max(1, Math.round((Date.now() - startedAtMs) / 1000)),
+      };
       return next;
     }
   }
-  next.push({ kind: 'search', query: query.trim(), status: 'done', success });
+  next.push({
+    kind: 'search',
+    query: query.trim(),
+    status: 'done',
+    success,
+    durationSeconds: 1,
+  });
   return next;
 }
 
@@ -78,6 +96,7 @@ function upsertRunningImageTrace(trace: ToolTrace[] | undefined, patch: Partial<
     kind: 'image_gen',
     ...patch,
     status: 'running',
+    startedAtMs: Date.now(),
     prompt: patch.prompt,
     mode: patch.mode,
   });
@@ -88,11 +107,45 @@ function patchLatestImageTrace(trace: ToolTrace[] | undefined, patch: Partial<Ex
   const next = Array.isArray(trace) ? [...trace] : [];
   for (let i = next.length - 1; i >= 0; i -= 1) {
     if (next[i].kind === 'image_gen') {
-      next[i] = { ...next[i], ...patch } as Extract<ToolTrace, { kind: 'image_gen' }>;
+      const existing = next[i] as Extract<ToolTrace, { kind: 'image_gen' }>;
+      const startedAtMs = existing.startedAtMs ?? Date.now();
+      next[i] = {
+        ...existing,
+        ...patch,
+        durationSeconds: patch.status === 'done'
+          ? Math.max(1, Math.round((Date.now() - startedAtMs) / 1000))
+          : existing.durationSeconds,
+      } as Extract<ToolTrace, { kind: 'image_gen' }>;
       return next;
     }
   }
   return next;
+}
+
+function patchImageTraceByAssetId(
+  trace: ToolTrace[] | undefined,
+  assetId: string | undefined,
+  patch: Partial<Extract<ToolTrace, { kind: 'image_gen' }>>,
+): ToolTrace[] {
+  if (!assetId) {
+    return patchLatestImageTrace(trace, patch);
+  }
+  const next = Array.isArray(trace) ? [...trace] : [];
+  for (let i = next.length - 1; i >= 0; i -= 1) {
+    const item = next[i];
+    if (item.kind !== 'image_gen' || item.assetId !== assetId) continue;
+    const existing = item as Extract<ToolTrace, { kind: 'image_gen' }>;
+    const startedAtMs = existing.startedAtMs ?? Date.now();
+    next[i] = {
+      ...existing,
+      ...patch,
+      durationSeconds: patch.status === 'done'
+        ? Math.max(1, Math.round((Date.now() - startedAtMs) / 1000))
+        : existing.durationSeconds,
+    } as Extract<ToolTrace, { kind: 'image_gen' }>;
+    return next;
+  }
+  return patchLatestImageTrace(next, patch);
 }
 
 function finalizeInterruptedToolTrace(trace: ToolTrace[] | undefined): ToolTrace[] | undefined {
@@ -141,6 +194,10 @@ function isAwaitingToolFollowup(message: ChatMessage | null): boolean {
 
 type PendingToolAction = () => void;
 type PendingToolFinalization = (trace: ToolTrace[] | undefined) => ToolTrace[] | undefined;
+type PendingImageReveal = {
+  assetId?: string;
+  apply: PendingToolFinalization;
+};
 
 async function updateSessionMetadata(sessionId: string, payload: { title?: string; model_id?: string }) {
   await fetch(`${API_BASE_URL}/api/sessions/${sessionId}`, {
@@ -157,7 +214,7 @@ export default function ChatPage() {
   const [state, setState] = useState<ChatState>(initialState);
   const [models, setModels] = useState<ChatModel[]>([]);
   const [selectedModelId, setSelectedModelId] = useState<string>(settings.selectedModelId || DEFAULT_CHAT_MODEL_ID);
-  const [thinkingEnabled, setThinkingEnabled] = useState<boolean>(settings.thinkingEnabled);
+  const [thinkingLevel, setThinkingLevel] = useState<ThinkingLevel>(settings.thinkingLevel);
   const [waitingSeconds, setWaitingSeconds] = useState(0);
   const [searchSeconds, setSearchSeconds] = useState(0);
   const [imageGenSeconds, setImageGenSeconds] = useState(0);
@@ -174,6 +231,7 @@ export default function ChatPage() {
   const streamCommittedContentRef = useRef('');
   const pendingToolActionsRef = useRef<PendingToolAction[]>([]);
   const pendingToolFinalizationsRef = useRef<PendingToolFinalization[]>([]);
+  const pendingImageRevealsRef = useRef<PendingImageReveal[]>([]);
   const toolVisibleUntilRef = useRef(0);
   const toolFinalizationTimerRef = useRef<number | null>(null);
   const {
@@ -195,47 +253,54 @@ export default function ChatPage() {
     streamCommittedContentRef.current = initialContent;
     pendingToolActionsRef.current = [];
     pendingToolFinalizationsRef.current = [];
+    pendingImageRevealsRef.current = [];
     streamEndedRef.current = false;
+    setStreamRenderTick((tick) => tick + 1);
     if (messageId) {
       startStreamBuffer();
+      if (initialContent) {
+        pushStreamBuffer(initialContent);
+      }
       return;
     }
     resetStreamBuffer();
-  }, [resetStreamBuffer, startStreamBuffer]);
+  }, [pushStreamBuffer, resetStreamBuffer, startStreamBuffer]);
 
-  const commitBufferedAssistantContent = useCallback((preserveStreaming = false) => {
-    const buffered = getBufferedContent();
+  const commitBufferedAssistantContent = useCallback(() => {
     const targetId = streamTargetMessageIdRef.current;
-    if (!buffered) {
+    if (!targetId) {
       return streamCommittedContentRef.current;
     }
+
+    const bufferedSegment = getBufferedContent();
+    if (!bufferedSegment) {
+      return streamCommittedContentRef.current;
+    }
+
     flushStreamBuffer();
-    const nextContent = `${streamCommittedContentRef.current}${buffered}`;
+    const nextContent = `${streamCommittedContentRef.current}${bufferedSegment}`;
     streamCommittedContentRef.current = nextContent;
-    if (targetId) {
-      setState((prev) => {
-        let changed = false;
-        const nextMessages = prev.messages.map((msg) => {
-          if (msg.id !== targetId || msg.content === nextContent) {
-            return msg;
-          }
-          changed = true;
-          return { ...msg, content: nextContent };
-        });
-        return changed ? { ...prev, messages: nextMessages } : prev;
+
+    setState((prev) => {
+      let changed = false;
+      const nextMessages = prev.messages.map((msg) => {
+        if (msg.id !== targetId || msg.content === nextContent) {
+          return msg;
+        }
+        changed = true;
+        return { ...msg, content: nextContent };
       });
-    }
-    if (preserveStreaming) {
-      startStreamBuffer();
-    } else {
-      resetStreamBuffer();
-    }
+      return changed ? { ...prev, messages: nextMessages } : prev;
+    });
+
+    startStreamBuffer();
     return nextContent;
-  }, [flushStreamBuffer, getBufferedContent, resetStreamBuffer, startStreamBuffer]);
+  }, [flushStreamBuffer, getBufferedContent, startStreamBuffer]);
 
   const clearPendingToolQueues = useCallback(() => {
     pendingToolActionsRef.current = [];
     pendingToolFinalizationsRef.current = [];
+    pendingImageRevealsRef.current = [];
     toolVisibleUntilRef.current = 0;
     if (toolFinalizationTimerRef.current !== null) {
       window.clearTimeout(toolFinalizationTimerRef.current);
@@ -289,25 +354,33 @@ export default function ChatPage() {
     });
   }, [updateStreamTargetMessage]);
 
+  const revealPendingImages = useCallback(() => {
+    const pending = pendingImageRevealsRef.current;
+    if (pending.length === 0) return;
+    pendingImageRevealsRef.current = [];
+    updateStreamTargetMessage((msg) => {
+      let nextTrace = msg.tool_trace;
+      for (const item of pending) {
+        nextTrace = item.apply(nextTrace);
+      }
+      return nextTrace === msg.tool_trace ? msg : { ...msg, tool_trace: nextTrace };
+    });
+  }, [updateStreamTargetMessage]);
+
   const finalizeStreamingIfReady = useCallback(() => {
     if (!streamEndedRef.current) return;
-    if (getPendingCharCount() > 0) return;
     if (pendingToolActionsRef.current.length > 0) return;
     if (pendingToolFinalizationsRef.current.length > 0) return;
+    if (getPendingCharCount() > 0) return;
 
+    revealPendingImages();
     commitBufferedAssistantContent();
     streamEndedRef.current = false;
     setState((prev) => (prev.isLoading ? { ...prev, isLoading: false } : prev));
     void loadSessions();
-  }, [commitBufferedAssistantContent, getPendingCharCount, loadSessions]);
+  }, [commitBufferedAssistantContent, getPendingCharCount, loadSessions, revealPendingImages]);
 
   const processPendingStreamTransitions = useCallback(() => {
-    if (getPendingCharCount() > 0) {
-      return;
-    }
-    if (pendingToolActionsRef.current.length > 0) {
-      flushPendingToolActions();
-    }
     if (getPendingCharCount() > 0) {
       return;
     }
@@ -324,8 +397,10 @@ export default function ChatPage() {
         return;
       }
       applyPendingToolFinalizations();
+      return;
     }
-    if (getPendingCharCount() > 0) {
+    if (pendingToolActionsRef.current.length > 0) {
+      flushPendingToolActions();
       return;
     }
     finalizeStreamingIfReady();
@@ -338,12 +413,12 @@ export default function ChatPage() {
 
   const scheduleToolAction = useCallback((action: PendingToolAction) => {
     const wrappedAction = () => {
+      revealPendingImages();
       action();
       markToolUiStarted();
     };
     if (
-      getPendingCharCount() <= 0
-      && pendingToolActionsRef.current.length === 0
+      pendingToolActionsRef.current.length === 0
       && pendingToolFinalizationsRef.current.length === 0
     ) {
       wrappedAction();
@@ -351,7 +426,7 @@ export default function ChatPage() {
       return;
     }
     pendingToolActionsRef.current.push(wrappedAction);
-  }, [getPendingCharCount, markToolUiStarted, processPendingStreamTransitions]);
+  }, [markToolUiStarted, processPendingStreamTransitions, revealPendingImages]);
 
   const queueToolFinalization = useCallback((apply: PendingToolFinalization) => {
     pendingToolFinalizationsRef.current.push(apply);
@@ -359,23 +434,10 @@ export default function ChatPage() {
   }, [processPendingStreamTransitions]);
 
   useEffect(() => {
-    const targetId = streamTargetMessageIdRef.current;
-    if (!targetId) return;
-
-    const nextContent = `${streamCommittedContentRef.current}${bufferedAssistantContent}`;
-    setState((prev) => {
-      let changed = false;
-      const nextMessages = prev.messages.map((msg) => {
-        if (msg.id !== targetId || msg.content === nextContent) {
-          return msg;
-        }
-        changed = true;
-        return { ...msg, content: nextContent };
-      });
-      return changed ? { ...prev, messages: nextMessages } : prev;
-    });
-    processPendingStreamTransitions();
-  }, [bufferedAssistantContent, processPendingStreamTransitions]);
+    if (streamEndedRef.current && getPendingCharCount() === 0) {
+      processPendingStreamTransitions();
+    }
+  }, [bufferedAssistantContent, getPendingCharCount, processPendingStreamTransitions]);
 
   useEffect(() => {
     let mounted = true;
@@ -419,17 +481,42 @@ export default function ChatPage() {
     () => models.find((model) => model.id === selectedModelId) ?? null,
     [models, selectedModelId],
   );
+  const [streamRenderTick, setStreamRenderTick] = useState(0);
+  const streamingContentOverride = useMemo(() => {
+    const targetId = streamTargetMessageIdRef.current;
+    if (!targetId) return undefined;
+    return `${streamCommittedContentRef.current}${bufferedAssistantContent}`;
+  }, [bufferedAssistantContent, streamRenderTick]);
 
   const thinkingLocked = !selectedModel || selectedModel.thinking_mode !== 'optional';
+  const thinkingLockReason = thinkingLocked ? '该模型不支持关闭思考' : undefined;
+  const supportsReasoningEffort = Boolean(selectedModel?.supports_reasoning_effort);
+  const thinkingOn = thinkingLevel !== 'fast';
   const effectiveThinking = selectedModel?.thinking_mode === 'always'
     ? true
     : selectedModel?.thinking_mode === 'never'
       ? false
-      : thinkingEnabled;
+      : thinkingOn;
+  const effectiveReasoningEffort: 'high' | 'max' | undefined = supportsReasoningEffort && effectiveThinking
+    ? thinkingLevel === 'deep' ? 'max' : 'high'
+    : undefined;
 
   useEffect(() => {
-    saveSettings({ selectedModelId, thinkingEnabled });
-  }, [selectedModelId, thinkingEnabled]);
+    saveSettings({ selectedModelId, thinkingLevel });
+  }, [selectedModelId, thinkingLevel]);
+
+  useEffect(() => () => {
+    resetStreamBuffer();
+  }, [resetStreamBuffer]);
+
+  const handleReasoningModeToggle = useCallback(() => {
+    if (thinkingLocked) return;
+    if (supportsReasoningEffort) {
+      setThinkingLevel((prev) => prev === 'fast' ? 'standard' : prev === 'standard' ? 'deep' : 'fast');
+      return;
+    }
+    setThinkingLevel((prev) => prev === 'fast' ? 'deep' : 'fast');
+  }, [supportsReasoningEffort, thinkingLocked]);
 
   const lastAssistantMessage = useMemo(() => {
     for (let i = state.messages.length - 1; i >= 0; i -= 1) {
@@ -648,7 +735,9 @@ export default function ChatPage() {
           user_id: getAuthState().user?.id,
           session_id: sessionId,
           thinking: effectiveThinking,
+          reasoning_effort: effectiveReasoningEffort,
           current_message_id: userMessage.id,
+          image_quality: getSettings().imageQuality,
         },
         (event) => {
           switch (event.type) {
@@ -657,12 +746,13 @@ export default function ChatPage() {
               streamTargetMessageIdRef.current = assistantPlaceholderId;
               break;
             case 'content_delta':
+              revealPendingImages();
               processPendingStreamTransitions();
               pushStreamBuffer(event.delta);
               break;
             case 'search_start':
               scheduleToolAction(() => {
-                const baseContent = commitBufferedAssistantContent(true);
+                const baseContent = commitBufferedAssistantContent();
                 updateStreamTargetMessage((msg) => {
                   const nextTrace = upsertRunningSearchTrace(msg.tool_trace, event.query);
                   const nextContent = appendToolMarker(baseContent, nextTrace.length - 1);
@@ -680,7 +770,7 @@ export default function ChatPage() {
               break;
             case 'image_gen_start':
               scheduleToolAction(() => {
-                const baseContent = commitBufferedAssistantContent(true);
+                const baseContent = commitBufferedAssistantContent();
                 updateStreamTargetMessage((msg) => {
                   const nextTrace = upsertRunningImageTrace(msg.tool_trace, {
                     prompt: event.prompt,
@@ -688,6 +778,7 @@ export default function ChatPage() {
                     assetId: event.assetId,
                     request: event.request,
                     editRequest: event.editRequest,
+                    modelLabel: event.modelLabel,
                   });
                   const nextContent = appendToolMarker(baseContent, nextTrace.length - 1);
                   streamCommittedContentRef.current = nextContent;
@@ -703,7 +794,6 @@ export default function ChatPage() {
               queueToolFinalization((trace) => patchLatestImageTrace(trace, {
                 status: 'done',
                 success: event.success,
-                url: event.url,
                 prompt: event.prompt,
                 mode: event.mode,
                 assetId: event.assetId,
@@ -716,12 +806,13 @@ export default function ChatPage() {
                 outputWidth: event.outputWidth,
                 outputHeight: event.outputHeight,
                 outputAspectRatio: event.outputAspectRatio,
+                url: event.success && event.url ? event.url : undefined,
+                blurredUrl: event.success && event.blurredUrl ? event.blurredUrl : undefined,
+                modelLabel: event.modelLabel,
               }));
               break;
             case 'title_update':
-              if (sessionId) {
-                void updateSessionMetadata(sessionId, { title: event.title }).then(() => loadSessions());
-              }
+              void loadSessions();
               break;
             case 'message_end':
               streamEndedRef.current = true;
@@ -797,6 +888,7 @@ export default function ChatPage() {
     currentSessionId,
     selectedModelId,
     effectiveThinking,
+    effectiveReasoningEffort,
     setCurrentSessionId,
     loadSessions,
     updateStreamTargetMessage,
@@ -847,6 +939,8 @@ export default function ChatPage() {
         <MessageList
           messages={state.messages}
           isLoading={state.isLoading}
+          streamingMessageId={streamTargetMessageIdRef.current}
+          streamingContentOverride={streamingContentOverride}
           waitingSeconds={waitingSeconds}
           searchSeconds={searchSeconds}
           imageGenSeconds={imageGenSeconds}
@@ -866,9 +960,12 @@ export default function ChatPage() {
           models={models}
           selectedModelId={selectedModelId}
           onModelChange={handleModelChange}
-          thinkingEnabled={effectiveThinking}
+          thinkingLevel={thinkingLevel}
+          effectiveThinking={effectiveThinking}
+          supportsReasoningEffort={supportsReasoningEffort}
           thinkingLocked={thinkingLocked}
-          onThinkingToggle={() => setThinkingEnabled((prev) => !prev)}
+          thinkingLockReason={thinkingLockReason}
+          onReasoningModeToggle={handleReasoningModeToggle}
           defaultValue={recallText}
           defaultImages={recallImages}
           key={recallTick}

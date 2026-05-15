@@ -1,8 +1,9 @@
 """
 图像生成与编辑服务
 
-优先使用 Gemini 原生 generateContent 接口，
-并兼容当前项目已有的 S3 上传与 SSE 协议。
+通过代理 (vectorengine.ai 等) 调用 OpenAI 兼容的图片生成接口：
+- Campbell 1.5 Image (默认): gemini-3-pro-image-preview，实时
+- Campbell 2.0 Image (hd):  gpt-image-2，高清但较慢
 """
 
 import base64
@@ -24,6 +25,7 @@ from .tool_contracts import (
 )
 
 IMAGE_GEN_TIMEOUT = httpx.Timeout(connect=10.0, read=180.0, write=10.0, pool=10.0)
+IMAGE_GEN_HD_TIMEOUT = httpx.Timeout(connect=10.0, read=900.0, write=10.0, pool=10.0)
 
 
 class ImageService:
@@ -33,8 +35,13 @@ class ImageService:
         self.llm = llm_service
         self.storage = storage_service
 
-    def _get_image_model_config(self) -> dict:
-        return self.llm.get_model_config("image_generator")
+    def _get_image_model_config(self, hd: bool = False) -> dict:
+        model_id = "image_generator_hd" if hd else "image_generator"
+        return self.llm.get_model_config(model_id)
+
+    @staticmethod
+    def model_label(hd: bool) -> str:
+        return "Campbell 2.0 Image" if hd else "Campbell 1.5 Image"
 
     def build_request_prompt(self, request_or_prompt) -> str:
         request = self._normalize_image_request(request_or_prompt)
@@ -52,34 +59,65 @@ class ImageService:
         }.get(origin, "asset")
         return f"asset_{origin_code}_{self._short_ref(message_id or 'current')}_{item_index}"
 
-    def generate(self, request_or_prompt, user_id: str = None, session_id: str = None) -> dict:
+    def generate(
+        self,
+        request_or_prompt,
+        user_id: str = None,
+        session_id: str = None,
+        current_user_image_urls: list[str] = None,
+        current_user_message_id: str = None,
+        hd: bool = False,
+    ) -> dict:
         """生成图片并上传到存储。"""
         image_request = self._normalize_image_request(request_or_prompt)
         prompt = self._build_image_prompt(image_request)
         if not prompt:
             return {"success": False, "error": "缺少绘图描述"}
 
-        print(f"\n[Image] 绘图: {prompt[:80]}...")
+        cfg = self._get_image_model_config(hd=hd)
+        api_key = self._resolve_image_api_key(cfg)
+        if not api_key:
+            return {"success": False, "error": "API 密钥未配置"}
 
-        failures: list[str] = []
-        for payload_variant in self._iter_generation_payloads(image_request, prompt):
-            result, failure = self._request_image(payload_variant)
-            if result:
-                image_bytes, mime_type = result
-                return self._finalize_image_result(
-                    image_bytes=image_bytes,
-                    mime_type=mime_type,
-                    prompt=prompt,
-                    user_id=user_id,
-                    session_id=session_id,
-                )
-            if failure:
-                failures.append(failure)
+        reference_sources, ref_error = self._resolve_reference_sources(
+            image_request.get("referenceImageIds") or [],
+            session_id=session_id,
+            current_user_image_urls=current_user_image_urls or [],
+            current_user_message_id=current_user_message_id,
+        )
+        if ref_error:
+            return {"success": False, "error": ref_error}
 
-        return {
-            "success": False,
-            "error": self._build_image_failure_message(failures),
-        }
+        print(f"\n[Image] 绘图({self.model_label(hd)}): {prompt[:80]}...")
+        if reference_sources:
+            print(f"[Image] 使用参考图 {len(reference_sources)} 张")
+
+        if self._is_gemini_model(cfg.get("model")):
+            extracted, failure = self._gemini_generate(
+                cfg, api_key, image_request, prompt,
+                reference_sources=reference_sources,
+                hd=hd,
+            )
+        else:
+            extracted, failure = self._openai_generate(
+                cfg, api_key, image_request, prompt,
+                reference_sources=reference_sources,
+                hd=hd,
+            )
+        if not extracted:
+            return {"success": False, "error": failure or "未能生成图片，请重试"}
+
+        image_bytes, mime_type = extracted
+        result = self._finalize_image_result(
+            image_bytes=image_bytes,
+            mime_type=mime_type,
+            prompt=prompt,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        if result.get("success"):
+            result["model_label"] = self.model_label(hd)
+        return result
 
     def edit(
         self,
@@ -88,6 +126,7 @@ class ImageService:
         session_id: str = None,
         current_user_image_urls: list[str] = None,
         current_user_message_id: str = None,
+        hd: bool = False,
     ) -> dict:
         """编辑已有图片并上传到存储。"""
         edit_request = self._normalize_image_edit_request(request_or_prompt)
@@ -104,9 +143,7 @@ class ImageService:
             return {"success": False, "error": source_error or "没有找到可编辑的图片，请先上传或生成图片"}
 
         source_bytes, source_mime_type = self._download_source_image(source_candidate["url"])
-        if not source_bytes:
-            return {"success": False, "error": "源图片读取失败，请稍后重试"}
-        source_metadata = self._inspect_image_bytes(source_bytes, source_mime_type)
+        source_metadata = self._inspect_image_bytes(source_bytes or b"", source_mime_type) if source_bytes else {}
         effective_request, resolved_edit_plan = self._resolve_effective_edit_request(
             edit_request,
             source_metadata,
@@ -116,71 +153,58 @@ class ImageService:
         if not prompt:
             return {"success": False, "error": "缺少图片编辑要求"}
 
-        cfg = self._get_image_model_config()
-        image_api_key = self._resolve_image_api_key(cfg)
-        api_key = self._resolve_native_gemini_api_key(cfg, fallback_key=image_api_key)
+        cfg = self._get_image_model_config(hd=hd)
+        api_key = self._resolve_image_api_key(cfg)
         if not api_key:
             return {"success": False, "error": "API 密钥未配置"}
 
-        payload = self._build_native_gemini_image_edit_payload(
-            effective_request,
-            source_bytes,
-            source_mime_type,
-            source_metadata=source_metadata,
-        )
-        if not payload:
-            return {"success": False, "error": "图片编辑参数无效"}
+        source_url_clean = self._strip_watermark_query(source_candidate["url"])
 
-        model_id = cfg["model"]
-        url = self._build_native_gemini_image_url(self._resolve_native_gemini_api_base(cfg), model_id)
+        print(f"\n[Image] 编辑图片({self.model_label(hd)}): {prompt[:80]}...")
 
-        print(f"\n[Image] 编辑图片: {prompt[:80]}...")
-
-        try:
-            with httpx.Client(timeout=IMAGE_GEN_TIMEOUT) as client:
-                resp = client.post(
-                    url,
-                    headers={"Content-Type": "application/json"},
-                    params={"key": api_key},
-                    json=payload,
-                )
-            if resp.status_code != 200:
-                error_text = self._format_http_error(resp)
-                print(f"[Image] 编辑失败: {error_text}")
-                return {"success": False, "error": f"图片编辑服务不可用：{error_text}"}
-
-            extracted = self._extract_native_gemini_image(resp.json())
-            if not extracted:
-                return {"success": False, "error": "未能生成编辑后的图片，请重试"}
-
-            image_bytes, mime_type = extracted
-            result = self._finalize_image_result(
-                image_bytes=image_bytes,
-                mime_type=mime_type,
-                prompt=prompt,
-                user_id=user_id,
-                session_id=session_id,
+        if self._is_gemini_model(cfg.get("edit_model") or cfg.get("model")):
+            extracted, failure = self._gemini_edit(
+                cfg, api_key, effective_request, prompt,
+                source_url=source_url_clean,
+                source_bytes=source_bytes,
+                source_mime=source_mime_type,
+                hd=hd,
             )
-            if result.get("success"):
-                result["source_image_id"] = source_candidate["assetId"]
-                result["source_image_url"] = source_candidate["url"]
-                result["source_label"] = source_candidate["label"]
-                result["resolved_edit_request"] = effective_request
-                result["resolved_edit_plan"] = resolved_edit_plan
-                if source_metadata.get("width"):
-                    result["source_width"] = source_metadata["width"]
-                if source_metadata.get("height"):
-                    result["source_height"] = source_metadata["height"]
-                if source_metadata.get("aspectRatio"):
-                    result["source_aspect_ratio"] = source_metadata["aspectRatio"]
-                if source_metadata.get("supportedAspectRatio"):
-                    result["source_supported_aspect_ratio"] = source_metadata["supportedAspectRatio"]
-            return result
-        except httpx.TimeoutException:
-            return {"success": False, "error": "图片编辑超时，请重试"}
-        except Exception as exc:
-            print(f"[Image] 编辑异常: {type(exc).__name__}: {exc}")
-            return {"success": False, "error": f"图片编辑失败: {exc}"}
+        else:
+            extracted, failure = self._openai_edit(
+                cfg, api_key, effective_request, prompt,
+                source_url=source_url_clean,
+                source_bytes=source_bytes,
+                source_mime=source_mime_type,
+                hd=hd,
+            )
+        if not extracted:
+            return {"success": False, "error": failure or "未能生成编辑后的图片，请重试"}
+
+        image_bytes, mime_type = extracted
+        result = self._finalize_image_result(
+            image_bytes=image_bytes,
+            mime_type=mime_type,
+            prompt=prompt,
+            user_id=user_id,
+            session_id=session_id,
+        )
+        if result.get("success"):
+            result["model_label"] = self.model_label(hd)
+            result["source_image_id"] = source_candidate["assetId"]
+            result["source_image_url"] = source_candidate["url"]
+            result["source_label"] = source_candidate["label"]
+            result["resolved_edit_request"] = effective_request
+            result["resolved_edit_plan"] = resolved_edit_plan
+            if source_metadata.get("width"):
+                result["source_width"] = source_metadata["width"]
+            if source_metadata.get("height"):
+                result["source_height"] = source_metadata["height"]
+            if source_metadata.get("aspectRatio"):
+                result["source_aspect_ratio"] = source_metadata["aspectRatio"]
+            if source_metadata.get("supportedAspectRatio"):
+                result["source_supported_aspect_ratio"] = source_metadata["supportedAspectRatio"]
+        return result
 
     def build_asset_catalog_message(
         self,
@@ -199,6 +223,7 @@ class ImageService:
         lines = [
             "会话资源清单：当你需要引用已有图片时，必须优先使用下面的 assetId。",
             "如果要编辑现有图片，edit_image 必须优先填写 sourceImageId；只有目标不明确时才退回 sourceScope/sourceHint/sourceIndex，并在必要时先追问用户。",
+            "如果要让 generate_image 参考已有图片的风格、构图或主体特征来创作新画面，把对应 assetId 填进 referenceImageIds 数组（最多 4 张），并尽量在 referenceUsage 里说明每张图的用途。",
             "每个资源条目只代表当前会话内的一项图片资源，assetId 在本会话内稳定可复用。",
         ]
         for candidate in candidates:
@@ -219,73 +244,330 @@ class ImageService:
             )
         return "\n".join(lines)
 
-    def _iter_generation_payloads(self, image_request: dict, prompt: str):
-        cfg = self._get_image_model_config()
-        image_api_key = self._resolve_image_api_key(cfg)
-        native_api_key = self._resolve_native_gemini_api_key(cfg, fallback_key=image_api_key)
-        if not native_api_key and not image_api_key:
-            return
+    def _build_openai_image_url(self, cfg: dict) -> str:
+        base = self._clean_optional_string(cfg.get("api_base")) or self.llm.legacy_api_base
+        stripped = base.rstrip("/")
+        if stripped.endswith("/v1"):
+            stripped = stripped[:-3]
+        return f"{stripped}/v1/images/generations"
 
-        model_id = cfg["model"]
-        native_payload = self._build_native_gemini_image_payload(image_request)
-        if native_api_key and native_payload:
-            yield {
-                "name": "native_gemini",
-                "url": self._build_native_gemini_image_url(self._resolve_native_gemini_api_base(cfg), model_id),
-                "headers": {"Content-Type": "application/json"},
-                "params": {"key": native_api_key},
-                "payload": native_payload,
-            }
+    def _build_openai_image_edit_url(self, cfg: dict) -> str:
+        base = self._clean_optional_string(cfg.get("api_base")) or self.llm.legacy_api_base
+        stripped = base.rstrip("/")
+        if stripped.endswith("/v1"):
+            stripped = stripped[:-3]
+        return f"{stripped}/v1/images/edits"
 
-        chat_base = self._clean_optional_string(cfg.get("api_base"))
-        if image_api_key and chat_base and not self._looks_like_google_native_base(chat_base):
-            chat_url = self.llm._chat_endpoint(chat_base)
-            yield {
-                "name": "structured_chat",
-                "url": chat_url,
-                "headers": {
-                    "Authorization": f"Bearer {image_api_key}",
-                    "Content-Type": "application/json",
-                },
-                "params": None,
-                "payload": self._build_structured_image_chat_payload(model_id, image_request),
-            }
-            yield {
-                "name": "legacy_chat",
-                "url": chat_url,
-                "headers": {
-                    "Authorization": f"Bearer {image_api_key}",
-                    "Content-Type": "application/json",
-                },
-                "params": None,
-                "payload": self._build_legacy_image_chat_payload(model_id, prompt),
-            }
-
-    def _request_image(self, payload_variant: dict) -> tuple[tuple[bytes, str] | None, str | None]:
-        payload = payload_variant.get("payload")
-        if not payload:
-            return None, None
-
+    def _request_openai_image_edit(
+        self,
+        cfg: dict,
+        api_key: str,
+        files: list,
+        data: dict,
+        hd: bool = False,
+    ) -> tuple[tuple[bytes, str] | None, str | None]:
+        url = self._build_openai_image_edit_url(cfg)
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Accept": "application/json",
+        }
+        timeout = IMAGE_GEN_HD_TIMEOUT if hd else IMAGE_GEN_TIMEOUT
         try:
-            with httpx.Client(timeout=IMAGE_GEN_TIMEOUT) as client:
-                resp = client.post(
-                    payload_variant["url"],
-                    headers=payload_variant["headers"],
-                    params=payload_variant.get("params"),
-                    json=payload,
-                )
-            print(f"[Image] {payload_variant['name']}: HTTP {resp.status_code}")
+            with httpx.Client(timeout=timeout) as client:
+                resp = client.post(url, headers=headers, files=files, data=data)
+            print(f"[Image] openai_image_edit: HTTP {resp.status_code}")
             if resp.status_code != 200:
                 error_text = self._format_http_error(resp)
-                print(f"[Image] {payload_variant['name']} 错误: {error_text}")
-                return None, f"{payload_variant['name']} {error_text}"
-
-            if payload_variant["name"] == "native_gemini":
-                return self._extract_native_gemini_image(resp.json()), None
-            return self._extract_chat_image(resp.json()), None
+                print(f"[Image] openai_image_edit 错误: {error_text}")
+                return None, self._translate_openai_error(resp.status_code, error_text)
+            extracted = self._extract_openai_image(resp.json())
+            if not extracted:
+                return None, "上游未返回图片数据"
+            return extracted, None
+        except httpx.TimeoutException:
+            return None, "图片服务超时，请稍后重试"
         except Exception as exc:
-            print(f"[Image] {payload_variant['name']} 异常: {type(exc).__name__}: {exc}")
-            return None, f"{payload_variant['name']} 请求异常: {type(exc).__name__}: {exc}"
+            print(f"[Image] openai_image_edit 异常: {type(exc).__name__}: {exc}")
+            return None, f"图片服务请求异常: {type(exc).__name__}"
+
+    def _request_openai_image(
+        self,
+        cfg: dict,
+        api_key: str,
+        payload: dict,
+        hd: bool = False,
+    ) -> tuple[tuple[bytes, str] | None, str | None]:
+        url = self._build_openai_image_url(cfg)
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        timeout = IMAGE_GEN_HD_TIMEOUT if hd else IMAGE_GEN_TIMEOUT
+        try:
+            with httpx.Client(timeout=timeout) as client:
+                resp = client.post(url, headers=headers, json=payload)
+            print(f"[Image] openai_image: HTTP {resp.status_code}")
+            if resp.status_code != 200:
+                error_text = self._format_http_error(resp)
+                print(f"[Image] openai_image 错误: {error_text}")
+                return None, self._translate_openai_error(resp.status_code, error_text)
+
+            extracted = self._extract_openai_image(resp.json())
+            if not extracted:
+                return None, "上游未返回图片数据"
+            return extracted, None
+        except httpx.TimeoutException:
+            return None, "图片服务超时，请稍后重试"
+        except Exception as exc:
+            print(f"[Image] openai_image 异常: {type(exc).__name__}: {exc}")
+            return None, f"图片服务请求异常: {type(exc).__name__}"
+
+    @staticmethod
+    def _is_gemini_model(model_id) -> bool:
+        if not isinstance(model_id, str):
+            return False
+        return model_id.strip().lower().startswith("gemini")
+
+    def _build_gemini_image_url(self, cfg: dict, model_id: str) -> str:
+        base = self._clean_optional_string(cfg.get("api_base")) or self.llm.legacy_api_base
+        stripped = base.rstrip("/")
+        if stripped.endswith("/v1"):
+            stripped = stripped[:-3]
+        if stripped.endswith("/v1beta"):
+            stripped = stripped[:-7]
+        return f"{stripped}/v1beta/models/{model_id}:generateContent"
+
+    def _gemini_generation_config(self, image_config) -> dict:
+        aspect_ratio = DEFAULT_IMAGE_ASPECT_RATIO
+        if isinstance(image_config, dict):
+            aspect_ratio = self._clean_optional_string(image_config.get("aspectRatio")) or DEFAULT_IMAGE_ASPECT_RATIO
+        return {
+            "responseModalities": ["IMAGE"],
+            "imageConfig": {"aspectRatio": aspect_ratio},
+        }
+
+    def _openai_generate(
+        self,
+        cfg: dict,
+        api_key: str,
+        image_request: dict,
+        prompt: str,
+        reference_sources: list[dict] | None = None,
+        hd: bool = False,
+    ) -> tuple[tuple[bytes, str] | None, str | None]:
+        # gpt-image-2 的 /v1/images/generations 不接受图片输入。
+        # 当传了参考图时，统一走 /v1/images/edits 的 multipart 路径，把所有参考图作为 image 字段一起上传。
+        if reference_sources:
+            return self._openai_generate_with_refs(cfg, api_key, image_request, prompt, reference_sources, hd=hd)
+        payload = self._build_openai_image_payload(cfg, image_request, prompt)
+        if not payload:
+            return None, "缺少绘图描述"
+        return self._request_openai_image(cfg, api_key, payload, hd=hd)
+
+    def _openai_generate_with_refs(
+        self,
+        cfg: dict,
+        api_key: str,
+        image_request: dict,
+        prompt: str,
+        reference_sources: list[dict],
+        hd: bool = False,
+    ) -> tuple[tuple[bytes, str] | None, str | None]:
+        prompt_clean = self._clean_optional_string(prompt)
+        if not prompt_clean:
+            return None, "缺少绘图描述"
+        if len(prompt_clean) > 1000:
+            prompt_clean = prompt_clean[:1000]
+        model_id = (
+            self._clean_optional_string(cfg.get("edit_model"))
+            or self._clean_optional_string(cfg.get("model"))
+            or "gpt-image-2"
+        )
+        size = self._map_openai_size(image_request.get("imageConfig"))
+        quality = self._map_openai_quality(image_request.get("imageConfig"))
+        files = []
+        for idx, ref in enumerate(reference_sources):
+            mime = ref.get("mime") or "image/png"
+            ext = "png"
+            if "/" in mime:
+                suffix = mime.split("/", 1)[1].lower().split(";", 1)[0].strip()
+                if suffix in {"png", "jpeg", "jpg", "webp"}:
+                    ext = "jpg" if suffix == "jpeg" else suffix
+            files.append(("image", (f"ref{idx + 1}.{ext}", ref["bytes"], mime)))
+        data = {
+            "model": model_id,
+            "prompt": prompt_clean,
+            "n": "1",
+            "size": size,
+        }
+        if not model_id.startswith("gemini"):
+            data["quality"] = quality
+        return self._request_openai_image_edit(cfg, api_key, files, data, hd=hd)
+
+    def _openai_edit(
+        self,
+        cfg: dict,
+        api_key: str,
+        edit_request: dict,
+        prompt: str,
+        source_url: str | None = None,
+        source_bytes: bytes | None = None,
+        source_mime: str | None = None,
+        hd: bool = False,
+    ) -> tuple[tuple[bytes, str] | None, str | None]:
+        if not source_bytes:
+            if not self._clean_optional_string(source_url):
+                return None, "缺少源图地址"
+            source_bytes, fetched_mime = self._download_source_image(source_url)
+            if not source_bytes:
+                return None, "源图下载失败"
+            source_mime = source_mime or fetched_mime
+        prompt_clean = self._clean_optional_string(prompt)
+        if not prompt_clean:
+            return None, "缺少绘图描述"
+        if len(prompt_clean) > 1000:
+            prompt_clean = prompt_clean[:1000]
+        model_id = self._clean_optional_string(cfg.get("edit_model")) or "gpt-image-2"
+        size = self._map_openai_size(edit_request.get("imageConfig"))
+        quality = self._map_openai_quality(edit_request.get("imageConfig"))
+        mime = source_mime or "image/png"
+        ext = "png"
+        if "/" in mime:
+            suffix = mime.split("/", 1)[1].lower().split(";", 1)[0].strip()
+            if suffix in {"png", "jpeg", "jpg", "webp"}:
+                ext = "jpg" if suffix == "jpeg" else suffix
+        files = [("image", (f"source.{ext}", source_bytes, mime))]
+        data = {
+            "model": model_id,
+            "prompt": prompt_clean,
+            "n": "1",
+            "size": size,
+        }
+        if not model_id.startswith("gemini"):
+            data["quality"] = quality
+        return self._request_openai_image_edit(cfg, api_key, files, data, hd=hd)
+
+    def _gemini_generate(
+        self,
+        cfg: dict,
+        api_key: str,
+        image_request: dict,
+        prompt: str,
+        reference_sources: list[dict] | None = None,
+        hd: bool = False,
+    ) -> tuple[tuple[bytes, str] | None, str | None]:
+        model_id = self._clean_optional_string(cfg.get("model")) or "gemini-3-pro-image-preview"
+        parts: list[dict] = [{"text": prompt[:4000]}]
+        for ref in reference_sources or []:
+            mime = ref.get("mime") or "image/png"
+            url = self._clean_optional_string(ref.get("url"))
+            if url:
+                parts.append({"file_data": {"mime_type": mime, "file_uri": url}})
+            elif ref.get("bytes"):
+                b64 = base64.b64encode(ref["bytes"]).decode("utf-8")
+                parts.append({"inline_data": {"mime_type": mime, "data": b64}})
+        body = {
+            "contents": [{"parts": parts}],
+            "generationConfig": self._gemini_generation_config(image_request.get("imageConfig")),
+        }
+        return self._post_gemini_generate(cfg, api_key, model_id, body)
+
+    def _gemini_edit(
+        self,
+        cfg: dict,
+        api_key: str,
+        edit_request: dict,
+        prompt: str,
+        source_url: str | None = None,
+        source_bytes: bytes | None = None,
+        source_mime: str | None = None,
+        hd: bool = False,
+    ) -> tuple[tuple[bytes, str] | None, str | None]:
+        model_id = self._clean_optional_string(cfg.get("edit_model")) or self._clean_optional_string(cfg.get("model")) or "gemini-3-pro-image-preview"
+        mime = source_mime or "image/png"
+        if self._clean_optional_string(source_url):
+            image_part = {"file_data": {"mime_type": mime, "file_uri": source_url.strip()}}
+        elif source_bytes:
+            b64 = base64.b64encode(source_bytes).decode("utf-8")
+            image_part = {"inline_data": {"mime_type": mime, "data": b64}}
+        else:
+            return None, "缺少源图数据"
+        body = {
+            "contents": [{
+                "parts": [
+                    {"text": prompt[:4000]},
+                    image_part,
+                ],
+            }],
+            "generationConfig": self._gemini_generation_config(edit_request.get("imageConfig")),
+        }
+        return self._post_gemini_generate(cfg, api_key, model_id, body)
+
+    def _post_gemini_generate(
+        self,
+        cfg: dict,
+        api_key: str,
+        model_id: str,
+        body: dict,
+    ) -> tuple[tuple[bytes, str] | None, str | None]:
+        url = self._build_gemini_image_url(cfg, model_id)
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        params = {"key": api_key}
+        try:
+            with httpx.Client(timeout=IMAGE_GEN_TIMEOUT) as client:
+                resp = client.post(url, headers=headers, params=params, json=body)
+            print(f"[Image] gemini_image: HTTP {resp.status_code}")
+            if resp.status_code != 200:
+                error_text = self._format_http_error(resp)
+                print(f"[Image] gemini_image 错误: {error_text}")
+                return None, self._translate_openai_error(resp.status_code, error_text)
+            extracted = self._extract_gemini_image(resp.json())
+            if not extracted:
+                return None, "上游未返回图片数据"
+            return extracted, None
+        except httpx.TimeoutException:
+            return None, "图片服务超时，请稍后重试"
+        except Exception as exc:
+            print(f"[Image] gemini_image 异常: {type(exc).__name__}: {exc}")
+            return None, f"图片服务请求异常: {type(exc).__name__}"
+
+    def _extract_gemini_image(self, data: dict) -> tuple[bytes, str] | None:
+        candidates = data.get("candidates") or []
+        for cand in candidates:
+            content = cand.get("content") or {}
+            for part in content.get("parts") or []:
+                inline = part.get("inline_data") or part.get("inlineData")
+                if not isinstance(inline, dict):
+                    continue
+                b64data = self._clean_optional_string(inline.get("data"))
+                if not b64data:
+                    continue
+                try:
+                    image_bytes = base64.b64decode(b64data)
+                except Exception:
+                    continue
+                mime = self._clean_optional_string(inline.get("mime_type") or inline.get("mimeType")) or "image/png"
+                return image_bytes, mime
+        return None
+
+    def _translate_openai_error(self, status_code: int, error_text: str) -> str:
+        body_lower = error_text.lower()
+        if status_code == 429:
+            return "图片生成频次受限，请稍后重试"
+        if status_code in (401, 403):
+            if "verified" in body_lower or "organization" in body_lower:
+                return "上游账号未完成组织验证"
+            return "图片服务鉴权失败"
+        if status_code == 400 and ("moderation" in body_lower or "safety" in body_lower or "policy" in body_lower):
+            return "图片生成请求被内容策略拒绝"
+        if status_code >= 500:
+            return f"图片服务暂时不可用（HTTP {status_code}）"
+        return f"图片服务不可用：{error_text}"
 
     def _finalize_image_result(
         self,
@@ -303,10 +585,16 @@ class ImageService:
             content_type=mime_type or "image/png",
         )
         if result:
-            watermark_url = f"{result['url']}?mark=public/watermark.svg&mark-pos=0.95,0.95&mark-pct=0.15&mark-alpha=1"
+            # 水印按图片实际尺寸的比例贴（mark-pct），由前端容器负责缩放整张图
+            watermark_url = (
+                f"{result['url']}?mark=public/watermark2.svg"
+                f"&mark-pos=0.97,0.97&mark-pct=0.15&mark-alpha=0.4"
+            )
+            blurred_url = f"{watermark_url}&blur=30"
             return {
                 "success": True,
                 "image": watermark_url,
+                "blurred_image": blurred_url,
                 "s3_key": result["s3_key"],
                 "image_id": result["id"],
                 "prompt": prompt,
@@ -366,6 +654,22 @@ class ImageService:
 
         if prompt and prompt != subject:
             request["prompt"] = prompt
+
+        ref_ids_raw = args.get("referenceImageIds")
+        if isinstance(ref_ids_raw, str):
+            ref_ids_raw = [ref_ids_raw]
+        if isinstance(ref_ids_raw, list):
+            cleaned_ids: list[str] = []
+            for item in ref_ids_raw:
+                cleaned = self._clean_optional_string(item)
+                if cleaned and cleaned not in cleaned_ids:
+                    cleaned_ids.append(cleaned)
+            if cleaned_ids:
+                request["referenceImageIds"] = cleaned_ids[:4]
+
+        ref_usage = self._clean_optional_string(args.get("referenceUsage"))
+        if ref_usage:
+            request["referenceUsage"] = ref_usage
 
         return request
 
@@ -475,6 +779,17 @@ class ImageService:
             if image_size:
                 lines.append(f"Image size: {image_size}")
 
+        ref_ids = image_request.get("referenceImageIds")
+        if isinstance(ref_ids, list) and ref_ids:
+            lines.append(
+                f"Reference images provided: {len(ref_ids)}. "
+                "Use them only as references for style/composition/subject traits. "
+                "Do NOT reproduce or copy them verbatim — compose a new image."
+            )
+            ref_usage = self._clean_optional_string(image_request.get("referenceUsage"))
+            if ref_usage:
+                lines.append(f"Reference usage: {ref_usage}")
+
         return "\n".join(lines)
 
     def _build_image_edit_prompt(self, edit_request: dict, source_metadata: dict | None = None) -> str:
@@ -516,135 +831,119 @@ class ImageService:
 
         return "\n".join(lines)
 
-    def _build_native_gemini_image_url(self, base_url: str, model_id: str) -> str:
-        stripped = base_url.rstrip("/")
-        if stripped.endswith("/v1"):
-            stripped = stripped[:-3]
-        return f"{stripped}/v1beta/models/{model_id}:generateContent"
-
-    def _build_native_gemini_image_payload(self, image_request: dict) -> dict | None:
-        prompt = self._build_image_prompt(image_request)
-        if not prompt:
-            return None
-
-        generation_config = {"responseModalities": ["TEXT", "IMAGE"]}
-        raw_image_config = image_request.get("imageConfig")
-        if isinstance(raw_image_config, dict):
-            image_config = {}
-            aspect_ratio = self._clean_optional_string(raw_image_config.get("aspectRatio"))
-            image_size = self._clean_optional_string(raw_image_config.get("imageSize"))
-            if aspect_ratio:
-                image_config["aspectRatio"] = aspect_ratio
-            if image_size:
-                image_config["imageSize"] = image_size
-            if image_config:
-                generation_config["imageConfig"] = image_config
-
-        return {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [{"text": prompt}],
-                }
-            ],
-            "generationConfig": generation_config,
-        }
-
-    def _build_native_gemini_image_edit_payload(
-        self,
-        edit_request: dict,
-        source_bytes: bytes,
-        source_mime_type: str,
-        source_metadata: dict | None = None,
-    ) -> dict | None:
-        prompt = self._build_image_edit_prompt(edit_request, source_metadata=source_metadata)
-        if not prompt or not source_bytes:
-            return None
-
-        generation_config = {"responseModalities": ["TEXT", "IMAGE"]}
-        raw_image_config = edit_request.get("imageConfig")
-        if isinstance(raw_image_config, dict) and raw_image_config:
-            generation_config["imageConfig"] = raw_image_config
-
-        return {
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [
-                        {
-                            "inline_data": {
-                                "mime_type": source_mime_type or "image/png",
-                                "data": base64.b64encode(source_bytes).decode("utf-8"),
-                            }
-                        },
-                        {"text": prompt},
-                    ],
-                }
-            ],
-            "generationConfig": generation_config,
-        }
-
-    def _build_structured_image_chat_payload(self, model_id: str, image_request: dict) -> dict | None:
-        prompt = self._build_image_prompt(image_request)
-        if not prompt:
-            return None
-
-        payload = {
-            "model": model_id,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": False,
-        }
-        native_payload = self._build_native_gemini_image_payload(image_request)
-        if native_payload and native_payload.get("generationConfig"):
-            payload["generationConfig"] = native_payload["generationConfig"]
-        return payload
-
-    def _build_legacy_image_chat_payload(self, model_id: str, prompt: str) -> dict | None:
+    def _build_openai_image_payload(self, cfg: dict, image_request: dict, prompt: str) -> dict | None:
         prompt = self._clean_optional_string(prompt)
         if not prompt:
             return None
-        return {
+        # 上游限制 1000 字符
+        if len(prompt) > 1000:
+            prompt = prompt[:1000]
+
+        size = self._map_openai_size(image_request.get("imageConfig"))
+        quality = self._map_openai_quality(image_request.get("imageConfig"))
+        model_id = self._clean_optional_string(cfg.get("model")) or "gpt-image-2"
+
+        payload: dict = {
             "model": model_id,
-            "messages": [{"role": "user", "content": prompt}],
-            "stream": False,
+            "prompt": prompt,
+            "n": 1,
+            "size": size,
         }
+        if not model_id.startswith("gemini"):
+            payload["quality"] = quality
+            payload["format"] = "png"
+        return payload
 
-    def _extract_native_gemini_image(self, data: dict) -> tuple[bytes, str] | None:
-        candidates = data.get("candidates") or []
-        if not candidates:
+    def _build_openai_image_edit_payload(
+        self,
+        cfg: dict,
+        edit_request: dict,
+        prompt: str,
+        image_urls: list[str],
+    ) -> dict | None:
+        prompt = self._clean_optional_string(prompt)
+        if not prompt or not image_urls:
             return None
+        if len(prompt) > 1000:
+            prompt = prompt[:1000]
 
-        parts = (candidates[0].get("content") or {}).get("parts") or []
-        for part in parts:
-            inline_data = part.get("inlineData")
-            if isinstance(inline_data, dict):
-                mime_type = self._clean_optional_string(inline_data.get("mimeType")) or "image/png"
-                b64data = self._clean_optional_string(inline_data.get("data"))
-                if not b64data:
-                    continue
-                return base64.b64decode(b64data), mime_type
+        size = self._map_openai_size(edit_request.get("imageConfig"))
+        quality = self._map_openai_quality(edit_request.get("imageConfig"))
+        model_id = self._clean_optional_string(cfg.get("edit_model")) or "gpt-image-2"
+
+        payload: dict = {
+            "model": model_id,
+            "prompt": prompt,
+            "n": 1,
+            "size": size,
+            "image": image_urls[:5],
+        }
+        if not model_id.startswith("gemini"):
+            payload["quality"] = quality
+        return payload
+
+    def _map_openai_size(self, image_config) -> str:
+        if not isinstance(image_config, dict):
+            return "1024x1024"
+        aspect_ratio = self._clean_optional_string(image_config.get("aspectRatio")) or DEFAULT_IMAGE_ASPECT_RATIO
+        image_size = self._clean_optional_string(image_config.get("imageSize")) or DEFAULT_IMAGE_SIZE
+
+        # 代理 (vectorengine) 支持的固定枚举尺寸
+        tier_map = {
+            "0.5K": {
+                "1:1": "1024x1024",
+                "16:9": "1536x1024", "3:2": "1536x1024", "4:3": "1536x1024",
+                "9:16": "1024x1536", "2:3": "1024x1536", "3:4": "1024x1536",
+            },
+            "1K": {
+                "1:1": "1024x1024",
+                "16:9": "1536x1024", "3:2": "1536x1024", "4:3": "1536x1024",
+                "9:16": "1024x1536", "2:3": "1024x1536", "3:4": "1024x1536",
+            },
+            "2K": {
+                "1:1": "2048x2048",
+                "16:9": "2048x1152", "3:2": "2048x1152", "4:3": "2048x1152",
+                "9:16": "1024x1536", "2:3": "1024x1536", "3:4": "1024x1536",
+            },
+            "4K": {
+                "1:1": "2048x2048",
+                "16:9": "3840x2160", "3:2": "3840x2160", "4:3": "3840x2160",
+                "9:16": "2160x3840", "2:3": "2160x3840", "3:4": "2160x3840",
+            },
+        }
+        return tier_map.get(image_size, tier_map["2K"]).get(aspect_ratio, "1024x1024")
+
+    def _map_openai_quality(self, image_config) -> str:
+        if not isinstance(image_config, dict):
+            return "high"
+        image_size = self._clean_optional_string(image_config.get("imageSize")) or DEFAULT_IMAGE_SIZE
+        return {"0.5K": "low", "1K": "medium", "2K": "high", "4K": "high"}.get(image_size, "high")
+
+    def _extract_openai_image(self, data: dict) -> tuple[bytes, str] | None:
+        items = data.get("data") or []
+        if not items:
+            return None
+        item = items[0]
+        b64data = self._clean_optional_string(item.get("b64_json"))
+        if b64data:
+            try:
+                return base64.b64decode(b64data), "image/png"
+            except Exception:
+                return None
+        url = self._clean_optional_string(item.get("url"))
+        if url:
+            image_bytes, mime_type = self._download_source_image(url)
+            if image_bytes:
+                return image_bytes, mime_type or "image/png"
         return None
 
-    def _extract_chat_image(self, data: dict) -> tuple[bytes, str] | None:
-        choices = data.get("choices") or []
-        if not choices:
-            return None
-
-        message = choices[0].get("message") or {}
-        images = message.get("images") or []
-        for image in images:
-            image_url = ((image.get("image_url") or {}).get("url") or "").strip()
-            if image_url.startswith("data:image/"):
-                header, b64data = image_url.split(",", 1)
-                mime_type = header.split(";")[0].split(":", 1)[1]
-                return base64.b64decode(b64data), mime_type
-
-        content = message.get("content") or ""
-        if content:
-            match = re.search(r"data:image/([a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=]+)", content)
-            if match:
-                return base64.b64decode(match.group(2)), f"image/{match.group(1)}"
-        return None
+    def _strip_watermark_query(self, url: str) -> str:
+        clean = self._clean_optional_string(url)
+        if not clean:
+            return clean
+        if "?mark=" in clean:
+            return clean.split("?", 1)[0]
+        return clean
 
     def _collect_edit_source_candidates(
         self,
@@ -796,6 +1095,41 @@ class ImageService:
             )
 
         return candidates
+
+    def _resolve_reference_sources(
+        self,
+        reference_image_ids: list[str],
+        session_id: str = None,
+        current_user_image_urls: list[str] = None,
+        current_user_message_id: str = None,
+    ) -> tuple[list[dict], str | None]:
+        if not reference_image_ids:
+            return [], None
+        candidates = self._collect_edit_source_candidates(
+            session_id,
+            current_user_image_urls or [],
+            current_user_message_id=current_user_message_id,
+        )
+        if not candidates:
+            return [], "没有找到可作为参考的图片"
+        by_id = {c["assetId"]: c for c in candidates}
+        resolved: list[dict] = []
+        for asset_id in reference_image_ids[:4]:
+            candidate = by_id.get(asset_id)
+            if not candidate:
+                return [], f"找不到参考图 {asset_id}，请重新选择"
+            url_clean = self._strip_watermark_query(candidate["url"])
+            ref_bytes, ref_mime = self._download_source_image(url_clean)
+            if not ref_bytes:
+                return [], f"参考图下载失败 ({asset_id})"
+            resolved.append({
+                "assetId": candidate["assetId"],
+                "url": url_clean,
+                "bytes": ref_bytes,
+                "mime": ref_mime or "image/png",
+                "label": candidate.get("label"),
+            })
+        return resolved, None
 
     def _resolve_edit_source_candidate(
         self,
@@ -1069,14 +1403,6 @@ class ImageService:
             "1024x1536": "2:3",
         }.get(self._clean_optional_string(size), "")
 
-    def _resolve_native_gemini_api_base(self, cfg: dict) -> str:
-        return (
-            self._clean_optional_string(cfg.get("native_api_base"))
-            or self._clean_optional_string(os.environ.get("GEMINI_API_BASE"))
-            or self._clean_optional_string(cfg.get("api_base"))
-            or self.llm.legacy_api_base
-        )
-
     def _resolve_image_api_key(self, cfg: dict) -> str:
         env_name = self._clean_optional_string(cfg.get("image_api_key_env"))
         if env_name and os.environ.get(env_name):
@@ -1096,37 +1422,11 @@ class ImageService:
         fallback_key = self.llm.get_api_key(cfg)
         return self._clean_optional_string(fallback_key)
 
-    def _resolve_native_gemini_api_key(self, cfg: dict, fallback_key: str | None = None) -> str:
-        env_name = self._clean_optional_string(cfg.get("native_api_key_env"))
-        if env_name and os.environ.get(env_name):
-            return self._clean_optional_string(os.environ.get(env_name))
-
-        explicit_key = self._clean_optional_string(cfg.get("native_api_key"))
-        if explicit_key:
-            return explicit_key
-
-        env_key = self._clean_optional_string(os.environ.get("GEMINI_API_KEY"))
-        if env_key:
-            return env_key
-
-        return self._clean_optional_string(fallback_key)
-
-    def _looks_like_google_native_base(self, base_url: str) -> bool:
-        clean = self._clean_optional_string(base_url).lower()
-        return "googleapis.com" in clean or "generativelanguage" in clean
-
     def _format_http_error(self, response: httpx.Response) -> str:
         body = response.text[:300].replace("\n", " ").strip()
         if body:
             return f"HTTP {response.status_code} - {body}"
         return f"HTTP {response.status_code}"
-
-    def _build_image_failure_message(self, failures: list[str]) -> str:
-        if not failures:
-            return "未能生成图片，请重试"
-        if all("HTTP 503" in item for item in failures):
-            return "图片服务暂时不可用（上游返回 503），请稍后重试"
-        return failures[-1]
 
     def _clean_optional_string(self, value) -> str:
         if not isinstance(value, str):

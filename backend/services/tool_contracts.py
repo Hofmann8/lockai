@@ -52,7 +52,10 @@ def _build_generate_image_tool() -> dict[str, Any]:
         "function": {
             "name": "generate_image",
             "description": (
-                "根据描述生成图片。优先把需求拆成结构化字段，不要把所有信息都压成一个长 prompt。"
+                "根据描述生成新图片。优先把需求拆成结构化字段，不要把所有信息都压成一个长 prompt。"
+                "若需要让生成结果参考某些已有图片（例如保留某种风格、构图、人物或物体特征，但要重新创作画面），"
+                "可通过 referenceImageIds 传入会话资源清单中的 assetId（最多 4 张）；"
+                "若用户的意图是在原图上做修改（保留原画面，只改局部或属性），应改用 edit_image 而不是 generate_image。"
                 f"已知 imageConfig.aspectRatio 支持 {', '.join(IMAGE_ASPECT_RATIOS)}；"
                 f"imageConfig.imageSize 支持 {' / '.join(IMAGE_SIZES)}；"
                 f"默认 aspectRatio={DEFAULT_IMAGE_ASPECT_RATIO}、imageSize={DEFAULT_IMAGE_SIZE}。"
@@ -72,6 +75,15 @@ def _build_generate_image_tool() -> dict[str, Any]:
                     "textOverlay": {"type": "string", "description": "画面中必须出现的文字；没有则不要填写"},
                     "negativePrompt": {"type": "string", "description": "明确不要出现的内容、缺陷或风格"},
                     "prompt": {"type": "string", "description": "仅用于无法拆成结构化字段的额外补充"},
+                    "referenceImageIds": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "参考图的 assetId 数组，来自会话资源清单；最多 4 张。仅用于让模型借鉴风格/构图/主体特征来创作新画面，不会保留原图内容。",
+                    },
+                    "referenceUsage": {
+                        "type": "string",
+                        "description": "说明每张参考图的作用，例如 '第一张提供主体外观，第二张提供光照风格'。仅在传了 referenceImageIds 时填写。",
+                    },
                     "imageConfig": {
                         "type": "object",
                         "properties": {
@@ -166,56 +178,6 @@ CHAT_TOOLS = build_chat_tools()
 SEARCH_ONLY_TOOLS = [CHAT_TOOLS[0]]
 
 
-def convert_openai_schema_to_gemini_schema(schema: Any) -> Any:
-    type_map = {
-        "object": "OBJECT",
-        "array": "ARRAY",
-        "string": "STRING",
-        "integer": "INTEGER",
-        "number": "NUMBER",
-        "boolean": "BOOLEAN",
-    }
-    if isinstance(schema, dict):
-        converted: dict[str, Any] = {}
-        description_suffixes: list[str] = []
-        for key, value in schema.items():
-            if key == "type" and isinstance(value, str):
-                converted[key] = type_map.get(value.lower(), value)
-                continue
-            if key == "enum" and isinstance(value, list):
-                options = [str(item) for item in value if item is not None and str(item).strip()]
-                if options:
-                    description_suffixes.append(f"可选值: {' / '.join(options)}")
-                continue
-            if key == "additionalProperties":
-                continue
-            converted[key] = convert_openai_schema_to_gemini_schema(value)
-        if description_suffixes:
-            base_description = str(converted.get("description") or "").strip()
-            suffix = "；".join(description_suffixes)
-            converted["description"] = f"{base_description}；{suffix}" if base_description else suffix
-        return converted
-    if isinstance(schema, list):
-        return [convert_openai_schema_to_gemini_schema(item) for item in schema]
-    return schema
-
-
-def build_gemini_function_declarations(tools: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
-    declarations: list[dict[str, Any]] = []
-    for tool in tools or CHAT_TOOLS:
-        fn = tool.get("function", {})
-        declarations.append({
-            "name": fn.get("name"),
-            "description": fn.get("description", ""),
-            "parameters": convert_openai_schema_to_gemini_schema(fn.get("parameters", {})),
-        })
-    return declarations
-
-
-def build_gemini_tools(tools: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
-    return [{"functionDeclarations": build_gemini_function_declarations(tools)}]
-
-
 def build_anthropic_tools(tools: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     anthropic_tools: list[dict[str, Any]] = []
     for tool in tools or CHAT_TOOLS:
@@ -250,6 +212,12 @@ def build_tool_calling_instruction() -> str:
 4. 只有用户明确提到宽高比或清晰度时，才填写 `imageConfig`
 5. 如果用户明确要求更高清、更高分辨率、清晰度越高越好、最高质量，应优先使用 `imageConfig.imageSize="4K"`
 6. 不要把已经结构化表达过的信息再重复塞进 `prompt`
+7. 参考图与编辑的判断：
+   - 用户要求"在这张图上改/重绘/扩图/替换/加东西" → 用 `edit_image`，目标是保留原画面
+   - 用户要求"参考这张图的风格/构图/主体来画一张新的" → 用 `generate_image` + `referenceImageIds`，目标是创作新画面
+   - 例："画一只像这张照片里的狗一样可爱的橘猫" → generate_image + referenceImageIds（主体已变）
+   - 例："把这张图里的天空改成日落" → edit_image（保留原画面，只改局部）
+8. 传 `referenceImageIds` 时优先从会话资源清单选 assetId，最多 4 张，可在 `referenceUsage` 里说明每张图的作用
 
 `edit_image` 使用原则：
 1. `instruction` 必填，只写要对原图做什么修改

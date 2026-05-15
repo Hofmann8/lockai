@@ -55,23 +55,40 @@ function appendAutoClosedMarker(text: string, marker: string, markerIndex: numbe
 }
 
 /**
- * 修复 emphasis 标记（** * ~~）紧邻 CJK 标点时 micromark 无法识别 flanking 的问题。
- * 在标记与相邻的 Unicode 标点/CJK 字符之间插入零宽空格，使解析器正确识别 delimiter。
+ * 修复 emphasis 标记（** * ~~）紧邻 Unicode 标点时 micromark 无法识别 flanking 的问题。
+ * 在标记与相邻的 Unicode 标点之间插入零宽空格，使解析器正确识别 delimiter。
+ *
+ * 使用 Unicode property escape \p{P} 匹配所有 Unicode 标点（包括 CJK、全角、ASCII 括号等），
+ * 避免手动维护字符范围遗漏。
  */
-const CJK_PUNCT =
-  '\u2018\u2019\u201C\u201D' +                       // ''""
-  '\u3001\u3002\u3008-\u3011\u3014-\u301B' +         // 、。〈〉《》「」『』【】〔〕〖〗〘〙〚〛
-  '\uFF01-\uFF0F\uFF1A-\uFF20\uFF3B-\uFF40\uFF5B-\uFF65' + // ！＂…全角标点
-  '\uFE30-\uFE4F';                                   // CJK 兼容标点
 const EMPHASIS_FLANKING_RE = new RegExp(
-  // group 1: closing punctuation directly before opening marker
-  `([${CJK_PUNCT}])(\\*{1,2}|~~)(?=[^\\s*~])` +
+  // 标点紧跟在 opening marker 前面
+  `(\\p{P})(\\*{1,3}|~~)(?=[^\\s*~])` +
   '|' +
-  // group 3: closing marker directly followed by opening punctuation
-  `(?<=[^\\s*~])(\\*{1,2}|~~)([${CJK_PUNCT}])`,
+  // closing marker 紧跟标点
+  `(?<=[^\\s*~])(\\*{1,3}|~~)(\\p{P})`,
   'gu',
 );
 const ZWS = '\u200B';
+
+/**
+ * 把 LaTeX 风格的 \( ... \) / \[ ... \] 行内/块公式转成 remark-math 能识别的
+ * $...$ / $$...$$。代码块内的内容跳过，避免破坏代码。
+ */
+export function normalizeLatexDelimiters(text: string): string {
+  if (!text) return text;
+  // 切分 fenced code (```...```) 与 inline code (`...`)，仅对非代码片段做替换
+  const segments = text.split(/(```[\s\S]*?```|`[^`\n]*`)/g);
+  for (let i = 0; i < segments.length; i++) {
+    const seg = segments[i];
+    if (i % 2 === 1) continue; // 代码段保留
+    let s = seg;
+    s = s.replace(/\\\[([\s\S]+?)\\\]/g, (_, body) => `\n$$${body}$$\n`);
+    s = s.replace(/\\\(([\s\S]+?)\\\)/g, (_, body) => `$${body}$`);
+    segments[i] = s;
+  }
+  return segments.join('');
+}
 
 export function fixEmphasisFlanking(text: string): string {
   return text.replace(EMPHASIS_FLANKING_RE, (...m) => {

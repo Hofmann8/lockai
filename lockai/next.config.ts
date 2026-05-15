@@ -4,6 +4,7 @@ const nextConfig: NextConfig = {
   output: 'standalone',
   serverExternalPackages: ['pdfjs-dist'],
   images: {
+    unoptimized: process.env.NODE_ENV === 'development',
     remotePatterns: [
       {
         protocol: 'https',

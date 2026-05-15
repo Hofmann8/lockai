@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useRef, useCallback, useEffect, type ChangeEvent, type ClipboardEvent, type KeyboardEvent } from 'react';
-import { Send, Square, ChevronDown, Brain, Zap, ImagePlus, X, Mic } from 'lucide-react';
+import { Send, Square, ChevronDown, Brain, BrainCog, Zap, ImagePlus, X, Mic } from 'lucide-react';
 import { compressImage, ACCEPTED_IMAGE_TYPES } from '@/lib/image';
 import {
   cancelRealtimeAsrSession,
@@ -11,7 +11,7 @@ import {
   pushRealtimeAsrAudio,
 } from '@/lib/api';
 import { isLiveVoiceInputSupported, startLiveVoiceStream, type LiveVoiceStreamSession } from '@/lib/audio';
-import type { ChatModel } from '@/types';
+import type { ChatModel, ThinkingLevel } from '@/types';
 
 interface MessageInputProps {
   onSend: (message: string, images?: string[]) => void | Promise<void>;
@@ -21,17 +21,20 @@ interface MessageInputProps {
   models: ChatModel[];
   selectedModelId: string;
   onModelChange: (modelId: string) => void;
-  thinkingEnabled: boolean;
+  thinkingLevel: ThinkingLevel;
+  effectiveThinking: boolean;
+  supportsReasoningEffort: boolean;
   thinkingLocked: boolean;
-  onThinkingToggle: () => void;
+  thinkingLockReason?: string;
+  onReasoningModeToggle: () => void;
   defaultValue?: string;
   defaultImages?: string[];
 }
 
 const MODEL_NAME_FALLBACKS: Record<string, string> = {
-  campbell: 'Campbell 1.5',
-  scooby: 'Scooby 1.7',
-  leo: 'Leo 1.7',
+  campbell: 'Campbell 2.0',
+  scooby: 'Scooby 2.0',
+  leo: 'Leo 2.0',
 };
 
 export function MessageInput({
@@ -42,9 +45,12 @@ export function MessageInput({
   models,
   selectedModelId,
   onModelChange,
-  thinkingEnabled,
+  thinkingLevel,
+  effectiveThinking,
+  supportsReasoningEffort,
   thinkingLocked,
-  onThinkingToggle,
+  thinkingLockReason,
+  onReasoningModeToggle,
   defaultValue,
   defaultImages,
 }: MessageInputProps) {
@@ -64,6 +70,20 @@ export function MessageInput({
   const isVoiceBusy = isRecording;
   const hasSendableContent = value.trim().length > 0 || pendingImages.length > 0;
   const selectedModel = models.find((model) => model.id === selectedModelId);
+  const displayLevel: ThinkingLevel = effectiveThinking
+    ? (supportsReasoningEffort ? thinkingLevel === 'deep' ? 'deep' : 'standard' : 'deep')
+    : 'fast';
+  const reasoningLabel = displayLevel === 'deep'
+    ? '深度思考'
+    : displayLevel === 'standard'
+      ? '标准思考'
+      : '快速思考';
+  const reasoningIcon = displayLevel === 'deep'
+    ? <BrainCog className="h-4 w-4" />
+    : displayLevel === 'standard'
+      ? <Brain className="h-4 w-4" />
+      : <Zap className="h-4 w-4" />;
+  const reasoningButtonDisabled = thinkingLocked || isVoiceBusy;
   const selectedModelLabel = selectedModel?.name
     || MODEL_NAME_FALLBACKS[selectedModelId]
     || MODEL_NAME_FALLBACKS.campbell;
@@ -378,19 +398,19 @@ export function MessageInput({
           </div>
 
           <button
-            onClick={thinkingLocked ? undefined : onThinkingToggle}
-            disabled={thinkingLocked || isVoiceBusy}
-            title={thinkingLocked ? '该模型不支持关闭思考' : undefined}
+            onClick={reasoningButtonDisabled ? undefined : onReasoningModeToggle}
+            disabled={reasoningButtonDisabled}
+            title={thinkingLocked ? (thinkingLockReason || '该模型不支持关闭思考') : undefined}
             className={`flex items-center gap-1.5 rounded-lg px-3 py-1.5 text-sm transition-colors ${
-              thinkingLocked
+              reasoningButtonDisabled
                 ? 'cursor-not-allowed text-primary/60 opacity-50'
-                : thinkingEnabled
+                : effectiveThinking
                   ? 'cursor-pointer bg-primary/10 text-primary'
                   : 'cursor-pointer text-muted-foreground hover:bg-muted hover:text-foreground'
             }`}
           >
-            {thinkingEnabled ? <Brain className="h-4 w-4" /> : <Zap className="h-4 w-4" />}
-            <span>{thinkingLocked ? '深度思考' : thinkingEnabled ? '深度思考' : '快速思考'}</span>
+            {reasoningIcon}
+            <span>{reasoningLabel}</span>
           </button>
 
           <button

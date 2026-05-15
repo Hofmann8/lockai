@@ -83,6 +83,15 @@ def get_models():
     return jsonify({"models": ai_service.available_models()})
 
 
+@app.route("/api/usage", methods=["GET"])
+def get_usage():
+    """获取 Campbell 配额用量"""
+    user_id = request.args.get("user_id")
+    if not user_id:
+        return jsonify({"error": "缺少 user_id"}), 400
+    return jsonify(ai_service.usage.get_summary(user_id))
+
+
 # ============ Session APIs ============
 
 @app.route("/api/sessions", methods=["GET"])
@@ -464,8 +473,10 @@ def chat():
     session_id = data.get("session_id")
     images = data.get("images") or []
     thinking = data.get("thinking")
+    reasoning_effort = data.get("reasoning_effort")
     current_message_id = data.get("current_message_id")
-    
+    image_quality = data.get("image_quality")
+
     result = ""
     for chunk in ai_service.chat_stream(
         message,
@@ -475,7 +486,9 @@ def chat():
         session_id=session_id,
         images=images,
         thinking=thinking,
+        reasoning_effort=reasoning_effort,
         current_message_id=current_message_id,
+        image_quality=image_quality,
     ):
         if chunk["type"] == "error":
             return jsonify({"error": chunk["message"]}), 500
@@ -503,8 +516,10 @@ def chat_stream():
     session_id = data.get("session_id")
     images = data.get("images")  # S3 公开 URL 列表
     thinking = data.get("thinking")
+    reasoning_effort = data.get("reasoning_effort")
     current_message_id = data.get("current_message_id")
-    
+    image_quality = data.get("image_quality")
+
     def generate():
         for chunk in ai_service.chat_stream(
             message,
@@ -514,7 +529,9 @@ def chat_stream():
             session_id=session_id,
             images=images,
             thinking=thinking,
+            reasoning_effort=reasoning_effort,
             current_message_id=current_message_id,
+            image_quality=image_quality,
         ):
             yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
         yield "data: [DONE]\n\n"

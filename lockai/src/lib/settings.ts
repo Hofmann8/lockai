@@ -1,6 +1,11 @@
+import type { ThinkingLevel } from '@/types';
+
+export type ImageQuality = 'standard' | 'hd';
+
 export interface ChatSettings {
   selectedModelId: string | null;
-  thinkingEnabled: boolean;
+  thinkingLevel: ThinkingLevel;
+  imageQuality: ImageQuality;
 }
 
 const SETTINGS_KEY = 'lockai_settings';
@@ -8,15 +13,29 @@ const SETTINGS_CHANGE_EVENT = 'lockai_settings_change';
 
 const defaultSettings: ChatSettings = {
   selectedModelId: 'campbell',
-  thinkingEnabled: true,
+  thinkingLevel: 'standard',
+  imageQuality: 'standard',
 };
+
+function normalizeSettings(raw: Record<string, unknown>): ChatSettings {
+  const merged: ChatSettings = { ...defaultSettings, ...(raw as Partial<ChatSettings>) };
+  // 兼容旧版 thinkingEnabled: boolean
+  if (!['fast', 'standard', 'deep'].includes(merged.thinkingLevel as string)) {
+    const legacy = (raw as { thinkingEnabled?: boolean }).thinkingEnabled;
+    merged.thinkingLevel = legacy === false ? 'fast' : 'standard';
+  }
+  if (!['standard', 'hd'].includes(merged.imageQuality as string)) {
+    merged.imageQuality = 'standard';
+  }
+  return merged;
+}
 
 export function getSettings(): ChatSettings {
   if (typeof window === 'undefined') return defaultSettings;
   const stored = localStorage.getItem(SETTINGS_KEY);
   if (!stored) return defaultSettings;
   try {
-    return { ...defaultSettings, ...JSON.parse(stored) };
+    return normalizeSettings(JSON.parse(stored));
   } catch {
     return defaultSettings;
   }

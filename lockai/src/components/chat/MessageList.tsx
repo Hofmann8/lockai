@@ -11,6 +11,8 @@ import { useAutoScroll } from '@/lib/hooks/useAutoScroll';
 interface MessageListProps {
   messages: ChatMessage[];
   isLoading: boolean;
+  streamingMessageId?: string | null;
+  streamingContentOverride?: string;
   waitingSeconds?: number;
   searchSeconds?: number;
   imageGenSeconds?: number;
@@ -22,6 +24,8 @@ interface MessageListProps {
 export function MessageList({
   messages,
   isLoading,
+  streamingMessageId,
+  streamingContentOverride,
   waitingSeconds = 0,
   searchSeconds = 0,
   imageGenSeconds = 0,
@@ -35,7 +39,7 @@ export function MessageList({
 
   useAutoScroll(
     containerRef,
-    [messages.length, lastMessage?.id, lastMessage?.content, isLoading],
+    [messages.length, lastMessage?.id, streamingContentOverride ?? lastMessage?.content, isLoading],
     scrollBehavior,
   );
 
@@ -46,6 +50,7 @@ export function MessageList({
       <Message
         key={message.id}
         message={message}
+        contentOverride={isActiveAssistant && message.id === streamingMessageId ? streamingContentOverride : undefined}
         onRecall={onRecall}
         isStreaming={isActiveAssistant}
         waitingSeconds={isActiveAssistant ? waitingSeconds : 0}
@@ -59,6 +64,8 @@ export function MessageList({
     messages,
     isLoading,
     lastIndex,
+    streamingMessageId,
+    streamingContentOverride,
     onRecall,
     waitingSeconds,
     searchSeconds,

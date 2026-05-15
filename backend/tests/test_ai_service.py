@@ -18,7 +18,7 @@ class _DummyProviderRuntime:
 
     def build_state(self, **kwargs):
         self.build_state_kwargs = kwargs
-        return {"kind": "gemini-native"}
+        return {"kind": "anthropic-native"}
 
     def request_turn(self, runtime):
         return {
@@ -30,6 +30,13 @@ class _DummyProviderRuntime:
 class _DummyLLM:
     def __init__(self, provider_runtime):
         self.provider_runtime = provider_runtime
+
+    def get_model_config(self, model_id):
+        return {
+            "id": model_id,
+            "thinking_mode": "never",
+            "provider": "openai-compatible",
+        }
 
 
 class _DummyImageService:
@@ -64,6 +71,7 @@ def test_chat_with_complete_forwards_thinking_toggle():
             llm_messages=[{"role": "user", "content": "你好"}],
             model_id="campbell",
             effective_thinking=False,
+            reasoning_effort=None,
             assistant_message_id="assistant-1",
             user_id="u1",
             session_id="s1",
@@ -108,4 +116,8 @@ def test_execute_tool_call_image_result_marks_image_as_already_shown():
     assert payload["tool"] == "generate_image"
     assert payload["url"] == "https://example.com/generated.png"
     assert "already shown to the user" in payload["message"]
+    assert "assistantInstruction" in payload
+    assert "图片已生成完成" in payload["assistantInstruction"]
     assert "image_url" not in payload
+
+

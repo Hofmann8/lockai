@@ -185,6 +185,57 @@ class GeneratedImage(db.Model):
         }
 
 
+class CallingOutUsage(db.Model):
+    """CallingOut 月度用量记录"""
+    __tablename__ = 'calling_out_usages'
+
+    id = db.Column(db.String(36), primary_key=True)
+    user_id = db.Column(db.String(36), nullable=False, index=True)
+    period_key = db.Column(db.String(7), nullable=False, index=True)  # YYYY-MM
+    source_model_id = db.Column(db.String(100), nullable=False, default='campbell')
+    target_model_id = db.Column(db.String(100), nullable=False, default='campbell_calling_out')
+    session_id = db.Column(db.String(36), nullable=True, index=True)
+    message_id = db.Column(db.String(36), nullable=True, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, index=True)
+
+    def to_dict(self):
+        return {
+            'id': self.id,
+            'user_id': self.user_id,
+            'period_key': self.period_key,
+            'source_model_id': self.source_model_id,
+            'target_model_id': self.target_model_id,
+            'session_id': self.session_id,
+            'message_id': self.message_id,
+            'created_at': _serialize_utc(self.created_at),
+        }
+
+
+class CampbellUsage(db.Model):
+    """Campbell 配额日度用量（按北京时间日聚合）"""
+    __tablename__ = 'campbell_usages'
+
+    id = db.Column(db.Integer, primary_key=True)
+    user_id = db.Column(db.String(36), nullable=False, index=True)
+    day = db.Column(db.String(10), nullable=False, index=True)  # YYYY-MM-DD (Asia/Shanghai)
+    chat_calls = db.Column(db.Integer, nullable=False, default=0)
+    image_calls = db.Column(db.Integer, nullable=False, default=0)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    __table_args__ = (
+        db.UniqueConstraint('user_id', 'day', name='uq_campbell_usages_user_day'),
+    )
+
+    def to_dict(self):
+        return {
+            'user_id': self.user_id,
+            'day': self.day,
+            'chat_calls': self.chat_calls,
+            'image_calls': self.image_calls,
+            'credits': self.chat_calls + 5 * self.image_calls,
+        }
+
+
 class PaperRecord(db.Model):
     """论文记录（持久化）"""
     __tablename__ = 'paper_records'

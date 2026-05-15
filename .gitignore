@@ -161,11 +161,13 @@ temp/
 # Deploy artifacts
 *.zip
 lockai-deploy.zip
+dist/
 
 # ============================================
 # Test & Debug Artifacts
 # ============================================
 backend/tests/_tmp_runtime/
+backend/tests/_tmp_runtime_local/
 backend/scripts/backend/tmp/
 
 # ============================================

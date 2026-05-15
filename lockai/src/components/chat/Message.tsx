@@ -1,8 +1,9 @@
 'use client';
 
 import { memo, useCallback, useEffect, useMemo, useState, type CSSProperties } from 'react';
+import { createPortal } from 'react-dom';
 import ReactMarkdown from 'react-markdown';
-import { User, Copy, Check, Undo2, X, Loader2 } from 'lucide-react';
+import { User, Copy, Check, Undo2, X, Loader2, Maximize2, Download } from 'lucide-react';
 import Image from 'next/image';
 import { useTheme } from '@/lib/theme';
 import { Prism as SyntaxHighlighter } from 'react-syntax-highlighter';
@@ -10,13 +11,15 @@ import { oneDark, oneLight } from 'react-syntax-highlighter/dist/esm/styles/pris
 import remarkMath from 'remark-math';
 import remarkGfm from 'remark-gfm';
 import rehypeKatex from 'rehype-katex';
+import rehypeRaw from 'rehype-raw';
 import 'katex/dist/katex.min.css';
 
-import { fixIncompleteMarkdown, fixEmphasisFlanking } from '@/lib/markdown';
+import { fixIncompleteMarkdown, fixEmphasisFlanking, normalizeLatexDelimiters } from '@/lib/markdown';
 import type { ChatMessage, ToolTrace } from '@/types';
 
 interface MessageProps {
   message: ChatMessage;
+  contentOverride?: string;
   onRecall?: (message: ChatMessage) => void;
   isStreaming?: boolean;
   waitingSeconds?: number;
@@ -109,14 +112,14 @@ function MarkdownBlock({
   showCursor?: boolean;
   hiddenImageUrls?: string[];
 }) {
-  const source = isUser ? content : fixEmphasisFlanking(fixIncompleteMarkdown(content));
+  const source = isUser ? content : fixEmphasisFlanking(fixIncompleteMarkdown(normalizeLatexDelimiters(content)));
   const hiddenImageSet = useMemo(() => new Set(hiddenImageUrls ?? []), [hiddenImageUrls]);
 
   return (
-    <div className={`prose prose-sm max-w-none ${isUser ? 'prose-invert' : 'dark:prose-invert'}`}>
+    <div className={`prose prose-sm max-w-none ${isUser ? 'prose-invert' : 'dark:prose-invert'}`} style={{ overflowWrap: 'anywhere' }}>
       <ReactMarkdown
         remarkPlugins={[remarkMath, remarkGfm]}
-        rehypePlugins={[rehypeKatex]}
+        rehypePlugins={[rehypeRaw, rehypeKatex]}
         components={{
           h1: ({ children }) => <h1 className="text-2xl font-bold mb-3 mt-4 first:mt-0">{children}</h1>,
           h2: ({ children }) => <h2 className="text-xl font-bold mb-2 mt-3 first:mt-0">{children}</h2>,
@@ -174,8 +177,8 @@ function MarkdownBlock({
           thead: ({ children }) => <thead className={`${isUser ? 'bg-primary-foreground/10' : 'bg-muted'}`}>{children}</thead>,
           tbody: ({ children }) => <tbody>{children}</tbody>,
           tr: ({ children }) => <tr className={`border-b last:border-b-0 ${isUser ? 'border-primary-foreground/20' : 'border-border'}`}>{children}</tr>,
-          th: ({ children }) => <th className="px-3 py-2 text-left font-semibold">{children}</th>,
-          td: ({ children }) => <td className="px-3 py-2">{children}</td>,
+          th: ({ children, style }) => <th className="px-3 py-2 font-semibold" style={style}>{children}</th>,
+          td: ({ children, style }) => <td className="px-3 py-2" style={style}>{children}</td>,
           img: ({ src, alt }) => {
             const imageSrc = typeof src === 'string' ? src : '';
             if (!imageSrc || hiddenImageSet.has(imageSrc)) {
@@ -189,6 +192,21 @@ function MarkdownBlock({
               />
             );
           },
+          sup: ({ children }) => <sup className="text-xs">{children}</sup>,
+          sub: ({ children }) => <sub className="text-xs">{children}</sub>,
+          kbd: ({ children }) => (
+            <kbd className={`px-1.5 py-0.5 rounded text-xs font-mono ${isUser ? 'bg-primary-foreground/20' : 'bg-muted border border-border shadow-sm'}`}>
+              {children}
+            </kbd>
+          ),
+          details: ({ children }) => (
+            <details className={`my-2 rounded-lg border p-3 open:pb-3 ${isUser ? 'border-primary-foreground/20' : 'border-border'}`}>
+              {children}
+            </details>
+          ),
+          summary: ({ children }) => (
+            <summary className="cursor-pointer font-medium select-none">{children}</summary>
+          ),
         }}
       >
         {source}
@@ -340,17 +358,20 @@ function resolveAspectRatioStyle(label: string): CSSProperties | undefined {
 
 function ToolImagePreview({
   url,
+  blurredUrl,
   alt,
   shouldBlur,
   aspectRatioStyle,
   placeholderLabel,
 }: {
   url?: string;
+  blurredUrl?: string;
   alt: string;
   shouldBlur: boolean;
   aspectRatioStyle?: CSSProperties;
   placeholderLabel: string;
 }) {
+  const effectiveUrl = shouldBlur && blurredUrl ? blurredUrl : url;
   const [loaded, setLoaded] = useState(false);
   const [measuredAspectRatioStyle, setMeasuredAspectRatioStyle] = useState<CSSProperties | undefined>(aspectRatioStyle);
   const aspectRatioKey = aspectRatioStyle?.aspectRatio ? String(aspectRatioStyle.aspectRatio) : '';
@@ -358,7 +379,7 @@ function ToolImagePreview({
   useEffect(() => {
     setLoaded(false);
     setMeasuredAspectRatioStyle(aspectRatioKey ? { aspectRatio: aspectRatioKey } : undefined);
-  }, [aspectRatioKey, url]);
+  }, [aspectRatioKey, effectiveUrl]);
 
   const handleLoad = useCallback((event: React.SyntheticEvent<HTMLImageElement>) => {
     if (!aspectRatioKey && event.currentTarget.naturalWidth > 0 && event.currentTarget.naturalHeight > 0) {
@@ -380,42 +401,137 @@ function ToolImagePreview({
   const frameStyle = measuredAspectRatioStyle;
   const hasLockedRatio = Boolean(frameStyle?.aspectRatio);
   const imageClassName = hasLockedRatio
-    ? `absolute inset-0 h-full w-full object-contain transition-all duration-700 ease-out ${loaded ? 'opacity-100' : 'opacity-0'} ${shouldBlur ? 'scale-[1.02] blur-xl saturate-75' : 'scale-100 blur-0'}`
-    : `block h-auto max-h-[420px] w-full object-contain transition-all duration-700 ease-out ${loaded ? 'opacity-100' : 'opacity-0'} ${shouldBlur ? 'scale-[1.02] blur-xl saturate-75' : 'scale-100 blur-0'}`;
+    ? `absolute inset-0 h-full w-full object-contain transition-opacity duration-700 ease-out ${loaded ? 'opacity-100' : 'opacity-0'}`
+    : `block h-auto max-h-[420px] w-full object-contain transition-opacity duration-700 ease-out ${loaded ? 'opacity-100' : 'opacity-0'}`;
+
+  const [previewOpen, setPreviewOpen] = useState(false);
+  const [downloading, setDownloading] = useState(false);
+
+  const canInteract = Boolean(effectiveUrl) && loaded && !shouldBlur;
+
+  const handleDownload = useCallback(async () => {
+    if (!effectiveUrl || downloading) return;
+    setDownloading(true);
+    try {
+      const res = await fetch(effectiveUrl, { mode: 'cors' });
+      const blob = await res.blob();
+      const blobUrl = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = blobUrl;
+      const ext = (blob.type.split('/')[1] || 'png').split(';')[0];
+      a.download = `lockai-${Date.now()}.${ext}`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(blobUrl);
+    } catch {
+      window.open(effectiveUrl, '_blank');
+    } finally {
+      setDownloading(false);
+    }
+  }, [effectiveUrl, downloading]);
 
   return (
-    <div className="relative mt-3 w-full max-w-[420px] overflow-hidden rounded-2xl border border-border/70 bg-background/60">
-      <div className={`relative w-full ${hasLockedRatio ? '' : 'min-h-[220px]'}`} style={frameStyle}>
-        {url ? (
-          <>
-            <img
-              ref={attachImageRef}
-              src={url}
-              alt={alt}
-              onLoad={handleLoad}
-              className={imageClassName}
-            />
-            {(!loaded || shouldBlur) && (
-              <div className="absolute inset-0 overflow-hidden bg-muted/70">
-                <div className="absolute inset-0 bg-linear-to-r from-transparent via-white/15 to-transparent animate-[shimmer_2s_ease-in-out_infinite]" style={{ backgroundSize: '200% 100%' }} />
-              </div>
-            )}
-            {shouldBlur && (
-              <div className="absolute inset-x-3 bottom-3 rounded-xl bg-black/45 px-3 py-2 text-xs text-white backdrop-blur-sm">
+    <>
+      <div className="group relative mt-3 w-full max-w-[420px] overflow-hidden rounded-2xl border border-border/70 bg-background/60">
+        <div className={`relative w-full ${hasLockedRatio ? '' : 'min-h-[220px]'}`} style={frameStyle}>
+          {effectiveUrl ? (
+            <>
+              <img
+                ref={attachImageRef}
+                src={effectiveUrl}
+                alt={alt}
+                onLoad={handleLoad}
+                className={imageClassName}
+              />
+              {(!loaded || shouldBlur) && (
+                <div className="absolute inset-0 overflow-hidden bg-muted/70">
+                  <div className="absolute inset-0 bg-linear-to-r from-transparent via-white/15 to-transparent animate-[shimmer_2s_ease-in-out_infinite]" style={{ backgroundSize: '200% 100%' }} />
+                </div>
+              )}
+              {shouldBlur && (
+                <div className="absolute inset-x-3 bottom-3 rounded-xl bg-black/45 px-3 py-2 text-xs text-white backdrop-blur-sm">
+                  {placeholderLabel}
+                </div>
+              )}
+              {canInteract && (
+                <div className="pointer-events-none absolute inset-0 flex items-end justify-end gap-2 bg-linear-to-t from-black/45 via-black/0 to-transparent p-2 opacity-0 transition-opacity duration-200 group-hover:opacity-100">
+                  <button
+                    type="button"
+                    onClick={() => setPreviewOpen(true)}
+                    title="放大预览"
+                    className="pointer-events-auto flex h-8 w-8 items-center justify-center rounded-full bg-black/55 text-white backdrop-blur-sm transition hover:bg-black/75 cursor-pointer"
+                  >
+                    <Maximize2 className="h-4 w-4" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleDownload}
+                    disabled={downloading}
+                    title="下载（含水印）"
+                    className="pointer-events-auto flex h-8 w-8 items-center justify-center rounded-full bg-black/55 text-white backdrop-blur-sm transition hover:bg-black/75 disabled:opacity-60 cursor-pointer"
+                  >
+                    {downloading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+                  </button>
+                </div>
+              )}
+            </>
+          ) : (
+            <div className="absolute inset-0 overflow-hidden bg-muted/70">
+              <div className="absolute inset-0 bg-linear-to-r from-transparent via-white/15 to-transparent animate-[shimmer_2s_ease-in-out_infinite]" style={{ backgroundSize: '200% 100%' }} />
+              <div className="absolute inset-x-3 bottom-3 rounded-xl bg-background/80 px-3 py-2 text-xs text-muted-foreground">
                 {placeholderLabel}
               </div>
-            )}
-          </>
-        ) : (
-          <div className="absolute inset-0 overflow-hidden bg-muted/70">
-            <div className="absolute inset-0 bg-linear-to-r from-transparent via-white/15 to-transparent animate-[shimmer_2s_ease-in-out_infinite]" style={{ backgroundSize: '200% 100%' }} />
-            <div className="absolute inset-x-3 bottom-3 rounded-xl bg-background/80 px-3 py-2 text-xs text-muted-foreground">
-              {placeholderLabel}
+            </div>
+          )}
+        </div>
+      </div>
+      {previewOpen && effectiveUrl && typeof document !== 'undefined' && createPortal(
+        <div
+          className="fixed inset-0 z-[200] flex items-center justify-center bg-black/60 backdrop-blur-sm p-6 animate-fade-in"
+          onClick={() => setPreviewOpen(false)}
+        >
+          <div
+            className="relative flex max-h-[90vh] max-w-[min(960px,92vw)] flex-col overflow-hidden rounded-2xl border border-border bg-card shadow-2xl animate-scale-in"
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-2.5">
+              <div className="min-w-0 flex-1">
+                <div className="truncate text-sm font-medium text-foreground">图片预览</div>
+                <div className="truncate text-[11px] text-muted-foreground">{alt || '生成图片'}</div>
+              </div>
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={handleDownload}
+                  disabled={downloading}
+                  title="下载（含水印）"
+                  className="flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground transition-colors disabled:opacity-60 cursor-pointer"
+                >
+                  {downloading ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPreviewOpen(false)}
+                  title="关闭"
+                  className="flex h-8 w-8 items-center justify-center rounded-lg text-muted-foreground hover:bg-muted hover:text-foreground transition-colors cursor-pointer"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            </div>
+            <div className="flex min-h-0 flex-1 items-center justify-center bg-muted/30 p-3">
+              <img
+                src={effectiveUrl}
+                alt={alt}
+                className="max-h-full max-w-full rounded-lg object-contain"
+              />
             </div>
           </div>
-        )}
-      </div>
-    </div>
+        </div>,
+        document.body,
+      )}
+    </>
   );
 }
 
@@ -538,6 +654,11 @@ function ImageToolCard({
         {running ? <Loader2 className="w-4 h-4 animate-spin text-primary" /> : <Check className={`w-4 h-4 ${trace.success ? 'text-primary' : 'text-destructive'}`} />}
         <span>{title}</span>
         {seconds > 0 && <span className="text-xs text-muted-foreground tabular-nums">{seconds}s</span>}
+        {trace.modelLabel && (
+          <span className="ml-auto text-[10px] font-medium px-1.5 py-0.5 rounded-md bg-primary/10 text-primary border border-primary/20">
+            {trace.modelLabel}
+          </span>
+        )}
       </div>
       <div className="mt-2 pl-0.5">
         <div className="text-sm font-medium text-foreground line-clamp-2">{subject}</div>
@@ -567,6 +688,7 @@ function ImageToolCard({
         )}
         <ToolImagePreview
           url={trace.url}
+          blurredUrl={trace.blurredUrl}
           alt={subject || trace.prompt || '生成图片'}
           shouldBlur={Boolean(trace.url && settling)}
           aspectRatioStyle={aspectRatioStyle}
@@ -579,6 +701,7 @@ function ImageToolCard({
 
 function MessageComponent({
   message,
+  contentOverride,
   onRecall,
   isStreaming = false,
   waitingSeconds = 0,
@@ -588,6 +711,7 @@ function MessageComponent({
   thinkingEnabled = true,
 }: MessageProps) {
   const isUser = message.role === 'user';
+  const renderedContent = contentOverride ?? message.content;
   const { resolvedTheme } = useTheme();
   const [copied, setCopied] = useState(false);
   const [showRecallConfirm, setShowRecallConfirm] = useState(false);
@@ -600,14 +724,14 @@ function MessageComponent({
   );
 
   const handleCopyMessage = async () => {
-    await navigator.clipboard.writeText(message.content);
+    await navigator.clipboard.writeText(renderedContent);
     setCopied(true);
     setTimeout(() => setCopied(false), 2000);
   };
 
   const assistantParts = useMemo(() => {
     const parts: Array<{ type: 'text'; value: string } | { type: 'tool'; traceIdx: number }> = [];
-    const content = message.content || '';
+    const content = renderedContent || '';
     const markerRe = /<!--tool:(\d+)-->/g;
     let lastIndex = 0;
     let matched = false;
@@ -636,11 +760,11 @@ function MessageComponent({
     }
 
     return parts;
-  }, [message.content, toolTrace]);
+  }, [renderedContent, toolTrace]);
 
   const waitingMessage = thinkingEnabled ? '正在思考' : '正在组织回答';
 
-  const isWaitingOnly = !isUser && isStreaming && !message.content.trim() && toolTrace.length === 0;
+  const isWaitingOnly = !isUser && isStreaming && !renderedContent.trim() && toolTrace.length === 0;
   const hasRunningTool = toolTrace.some((trace) => trace.status === 'running');
   const toolPartIndicesWithTextAfter = useMemo(() => {
     const indices = new Set<number>();
@@ -665,9 +789,9 @@ function MessageComponent({
       return trace.success === false ? '搜索已结束，正在整理现有内容' : '搜索完成，正在组织结果';
     }
     if (trace.mode === 'edit') {
-      return trace.success === false ? '修改已结束，正在整理说明' : '修改完成，正在补充细节';
+      return trace.success === false ? '修改已结束，正在整理说明' : '图片已大致构建完成，正在补充细节，这可能需要一定时间';
     }
-    return trace.success === false ? '生成已结束，正在整理说明' : '构图完成，正在补充细节';
+    return trace.success === false ? '生成已结束，正在整理说明' : '图片已大致构建完成，正在补充细节，这可能需要一定时间';
   };
 
   return (
@@ -686,7 +810,7 @@ function MessageComponent({
         {isUser ? (
           <>
             <div className="rounded-2xl px-4 py-3 bg-primary text-primary-foreground transition-shadow duration-200 hover:shadow-md">
-              <div className="prose prose-sm max-w-none prose-invert">
+              <div className="prose prose-sm max-w-none prose-invert" style={{ overflowWrap: 'anywhere' }}>
                 {message.images && message.images.length > 0 && (
                   <div className={`flex gap-2 flex-wrap ${message.content && message.content !== '(图片)' ? 'mb-2' : ''}`}>
                     {message.images.map((img, i) => (
@@ -701,7 +825,7 @@ function MessageComponent({
                   </div>
                 )}
                 {(!message.images || message.content !== '(图片)') && (
-                  <MarkdownBlock content={message.content} isUser />
+                  <MarkdownBlock content={renderedContent} isUser />
                 )}
               </div>
             </div>
@@ -785,7 +909,7 @@ function MessageComponent({
                         <SearchToolCard
                           key={`tool-${part.traceIdx}`}
                           trace={trace}
-                          seconds={trace.status === 'running' ? searchSeconds : isSettlingTool ? toolFollowupSeconds : 0}
+                          seconds={trace.status === 'running' ? searchSeconds : trace.durationSeconds ?? 0}
                           followupLabel={isSettlingTool ? getToolFollowupLabel(trace) : undefined}
                         />
                       );
@@ -794,7 +918,13 @@ function MessageComponent({
                       <ImageToolCard
                         key={`tool-${part.traceIdx}`}
                         trace={trace}
-                        seconds={trace.status === 'running' ? imageGenSeconds : isSettlingTool ? toolFollowupSeconds : 0}
+                        seconds={
+                          trace.status === 'running'
+                            ? imageGenSeconds
+                            : isSettlingTool
+                              ? (trace.durationSeconds ?? 0) + toolFollowupSeconds
+                              : trace.durationSeconds ?? 0
+                        }
                         followupLabel={isSettlingTool ? getToolFollowupLabel(trace) : undefined}
                         settling={isSettlingTool}
                       />
@@ -803,9 +933,9 @@ function MessageComponent({
                 ) : (
                   <div className="py-1">
                     <MarkdownBlock
-                      content={message.content}
+                      content={renderedContent}
                       isUser={false}
-                      showCursor={isStreaming && !!message.content.trim()}
+                      showCursor={isStreaming && !!renderedContent.trim()}
                       hiddenImageUrls={hiddenToolImageUrls}
                     />
                   </div>
@@ -822,6 +952,7 @@ function MessageComponent({
 function areMessagePropsEqual(prev: MessageProps, next: MessageProps) {
   return (
     prev.message === next.message &&
+    prev.contentOverride === next.contentOverride &&
     prev.onRecall === next.onRecall &&
     prev.isStreaming === next.isStreaming &&
     prev.waitingSeconds === next.waitingSeconds &&

@@ -12,9 +12,15 @@ import uuid
 from datetime import datetime
 from typing import Any, Generator
 
-from models import db, ChatMessage, ChatSession, GeneratedImage, sanitize_assistant_content, strip_assistant_reasoning
+from models import (
+    db,
+    ChatMessage,
+    ChatSession,
+    GeneratedImage,
+    sanitize_assistant_content,
+    strip_assistant_reasoning,
+)
 
-from .campbell import CampbellService
 from .image import ImageService
 from .llm import LLMService
 from .prompts import get_system_prompt
@@ -37,8 +43,9 @@ class AIService:
         self.storage = StorageService()
         self.search = SearchService(self.llm)
         self.image = ImageService(self.llm, self.storage)
-        self.campbell = CampbellService(self.llm, self.search, self.image)
         self.title = TitleService(self.llm)
+        from .usage import UsageService
+        self.usage = UsageService()
         self.max_tool_rounds = max(1, int(self._safe_env("CHAT_TOOL_MAX_ROUNDS", "6")))
 
     @property
@@ -48,6 +55,7 @@ class AIService:
     def available_models(self) -> list[dict[str, Any]]:
         result = []
         for cfg in self.llm.get_chat_models():
+            transport = str(cfg.get("transport") or cfg.get("provider") or "").lower()
             result.append({
                 "id": cfg["id"],
                 "name": cfg.get("name", cfg["id"]),
@@ -57,6 +65,7 @@ class AIService:
                 "thinking_mode": cfg.get("thinking_mode", "never"),
                 "default_thinking": cfg.get("default_thinking", False),
                 "tags": cfg.get("tags", []),
+                "supports_reasoning_effort": transport.startswith("deepseek") or transport.startswith("anthropic"),
             })
         return result
 
@@ -78,21 +87,34 @@ class AIService:
         session_id: str | None = None,
         images: list | None = None,
         thinking: bool | None = None,
+        reasoning_effort: str | None = None,
         current_message_id: str | None = None,
+        image_quality: str | None = None,
     ) -> Generator[dict[str, Any], None, None]:
-        model_id = self.normalize_chat_model_id(model_id)
-        cfg = self.llm.get_model_config(model_id)
+        requested_model_id = self.normalize_chat_model_id(model_id)
+        runtime_model_id = requested_model_id
         session = ChatSession.query.get(session_id) if session_id else None
         if session_id and not session:
             yield {"type": "error", "message": "会话不存在"}
             return
-        if session and session.model_id != model_id:
-            session.model_id = model_id
+        if session and session.model_id != requested_model_id:
+            session.model_id = requested_model_id
             session.updated_at = datetime.utcnow()
             db.session.commit()
 
+        cfg = self.llm.get_model_config(runtime_model_id)
+
         effective_thinking = self._resolve_thinking(cfg, thinking)
+        hd_image = str(image_quality or "").strip().lower() == "hd"
         assistant_message_id = str(uuid.uuid4())
+
+        if self._is_billable_chat(cfg) and user_id:
+            ok, scope, quota_msg = self.usage.check(user_id, self.usage.CHAT_COST)
+            if not ok:
+                yield {"type": "message_start", "message_id": assistant_message_id}
+                yield {"type": "error", "code": f"quota_{scope}", "message": quota_msg}
+                return
+
         yield {"type": "message_start", "message_id": assistant_message_id}
 
         content_parts: list[str] = []
@@ -100,18 +122,20 @@ class AIService:
         llm_messages = self._build_messages(
             message=message,
             history=history or [],
-            model_id=model_id,
+            model_id=runtime_model_id,
             session_id=session_id,
             images=images or [],
             current_user_message_id=current_message_id,
         )
+        llm_messages = self._preprocess_vision_if_blind(llm_messages, cfg)
 
         try:
             if self._should_stream_chat(cfg):
                 completed = yield from self._chat_with_stream(
                     llm_messages=llm_messages,
-                    model_id=model_id,
+                    model_id=runtime_model_id,
                     effective_thinking=effective_thinking,
+                    reasoning_effort=reasoning_effort,
                     assistant_message_id=assistant_message_id,
                     user_id=user_id,
                     session_id=session_id,
@@ -119,12 +143,14 @@ class AIService:
                     current_user_message_id=current_message_id,
                     tool_trace=tool_trace,
                     content_parts=content_parts,
+                    hd_image=hd_image,
                 )
             else:
                 completed = yield from self._chat_with_complete(
                     llm_messages=llm_messages,
-                    model_id=model_id,
+                    model_id=runtime_model_id,
                     effective_thinking=effective_thinking,
+                    reasoning_effort=reasoning_effort,
                     assistant_message_id=assistant_message_id,
                     user_id=user_id,
                     session_id=session_id,
@@ -132,6 +158,7 @@ class AIService:
                     current_user_message_id=current_message_id,
                     tool_trace=tool_trace,
                     content_parts=content_parts,
+                    hd_image=hd_image,
                 )
             if completed is False:
                 return
@@ -158,12 +185,15 @@ class AIService:
             yield {"type": "error", "message": f"聊天失败: {exc}"}
 
     def _should_stream_chat(self, cfg: dict[str, Any]) -> bool:
-        return self.llm.resolve_chat_transport(cfg).startswith("qwen")
+        transport = str(cfg.get("transport") or cfg.get("provider") or "").strip().lower()
+        if transport.startswith("anthropic"):
+            return False
+        return True
 
-    def _should_use_native_gemini_tools(self, cfg: dict[str, Any]) -> bool:
-        provider = str(cfg.get("provider") or "").strip().lower()
-        model_name = str(cfg.get("model") or "").strip().lower()
-        return provider.startswith("gemini") or (provider == "openai-compatible" and "gemini" in model_name)
+    def _is_billable_chat(self, cfg: dict[str, Any]) -> bool:
+        """Campbell（anthropic-native）走计费；其他模型免费。"""
+        transport = str(cfg.get("transport") or cfg.get("provider") or "").strip().lower()
+        return transport.startswith("anthropic")
 
     def _chat_with_stream(
         self,
@@ -171,6 +201,7 @@ class AIService:
         llm_messages: list[dict[str, Any]],
         model_id: str,
         effective_thinking: bool,
+        reasoning_effort: str | None,
         assistant_message_id: str,
         user_id: str | None,
         session_id: str | None,
@@ -178,6 +209,7 @@ class AIService:
         current_user_message_id: str | None,
         tool_trace: list[dict[str, Any]],
         content_parts: list[str],
+        hd_image: bool = False,
     ) -> Generator[dict[str, Any], None, None]:
         for _round in range(self.max_tool_rounds):
             round_content = ""
@@ -189,6 +221,7 @@ class AIService:
                 model=model_id,
                 tools=TOOLS,
                 enable_thinking=effective_thinking,
+                reasoning_effort=reasoning_effort,
             ):
                 if chunk.get("type") == "error":
                     yield {"type": "error", "message": chunk.get("content", "请求失败")}
@@ -252,6 +285,7 @@ class AIService:
                     current_user_message_id=current_user_message_id,
                     llm_messages=llm_messages,
                     content_parts=content_parts,
+                    hd_image=hd_image,
                 )
 
         limit_text = "\n\n工具调用轮数已达上限。"
@@ -265,6 +299,7 @@ class AIService:
         llm_messages: list[dict[str, Any]],
         model_id: str,
         effective_thinking: bool,
+        reasoning_effort: str | None,
         assistant_message_id: str,
         user_id: str | None,
         session_id: str | None,
@@ -272,12 +307,14 @@ class AIService:
         current_user_message_id: str | None,
         tool_trace: list[dict[str, Any]],
         content_parts: list[str],
+        hd_image: bool = False,
     ) -> Generator[dict[str, Any], None, None]:
         runtime = self.llm.provider_runtime.build_state(
             messages=llm_messages,
             model_id=model_id,
             tools=TOOLS,
             enable_thinking=effective_thinking,
+            reasoning_effort=reasoning_effort,
         )
         if not runtime:
             yield {"type": "error", "message": "API 密钥未配置"}
@@ -286,10 +323,22 @@ class AIService:
         print(f"[Chat] runtime transport: {runtime.get('kind')} model={model_id}")
 
         for _round in range(self.max_tool_rounds):
+            if _round > 0 and user_id:
+                ok, scope, quota_msg = self.usage.check(user_id, self.usage.CHAT_COST)
+                if not ok:
+                    yield {"type": "error", "code": f"quota_{scope}", "message": quota_msg}
+                    return False
+
             response = self.llm.provider_runtime.request_turn(runtime)
             if response is None:
                 yield {"type": "error", "message": "请求失败"}
                 return False
+
+            if user_id:
+                try:
+                    self.usage.record_chat_call(user_id)
+                except Exception as exc:
+                    print(f"[Usage] record_chat_call failed: {type(exc).__name__}: {exc}")
 
             content_text = strip_assistant_reasoning(response.get("content") or "")
             parsed_calls = response.get("tool_calls") or []
@@ -322,6 +371,7 @@ class AIService:
                     current_user_images=current_user_images,
                     current_user_message_id=current_user_message_id,
                     content_parts=content_parts,
+                    hd_image=hd_image,
                 )
                 tool_results.append({
                     "id": call["id"],
@@ -336,150 +386,6 @@ class AIService:
         yield {"type": "content_delta", "delta": limit_text}
         return True
 
-    def _chat_with_campbell_native(
-        self,
-        *,
-        llm_messages: list[dict[str, Any]],
-        model_id: str,
-        assistant_message_id: str,
-        user_id: str | None,
-        session_id: str | None,
-        current_user_images: list[str],
-        current_user_message_id: str | None,
-        tool_trace: list[dict[str, Any]],
-        content_parts: list[str],
-    ) -> Generator[dict[str, Any], None, None]:
-        for event in self.campbell.chat_stream(
-            llm_messages,
-            model_id=model_id,
-            user_id=user_id,
-            session_id=session_id,
-            current_user_images=current_user_images,
-            current_user_message_id=current_user_message_id,
-            assistant_message_id=assistant_message_id,
-        ):
-            event_type = str(event.get("type") or "")
-            if event_type == "error":
-                yield {"type": "error", "message": event.get("message") or "请求失败"}
-                return False
-
-            if event_type == "content_delta":
-                delta = str(event.get("delta") or "")
-                if delta:
-                    content_parts.append(delta)
-                    yield {"type": "content_delta", "delta": delta}
-                continue
-
-            if event_type == "search_start":
-                query = str(event.get("query") or "").strip()
-                tool_trace.append({
-                    "kind": "search",
-                    "query": query,
-                    "status": "running",
-                })
-                content_parts.append(f"<!--tool:{len(tool_trace) - 1}-->")
-                yield {
-                    "type": "search_start",
-                    "message_id": assistant_message_id,
-                    "query": query,
-                }
-                continue
-
-            if event_type == "search_end":
-                query = str(event.get("query") or "").strip()
-                success = bool(event.get("success"))
-                for item in reversed(tool_trace):
-                    if item.get("kind") == "search" and item.get("status") == "running":
-                        item["status"] = "done"
-                        item["success"] = success
-                        item["query"] = query or item.get("query", "")
-                        break
-                yield {
-                    "type": "search_end",
-                    "message_id": assistant_message_id,
-                    "query": query,
-                    "success": success,
-                }
-                continue
-
-            if event_type == "image_gen_start":
-                trace = {
-                    "kind": "image_gen",
-                    "assetId": event.get("assetId"),
-                    "mode": event.get("mode"),
-                    "prompt": event.get("prompt") or "",
-                    "status": "running",
-                }
-                if event.get("request"):
-                    trace["request"] = event["request"]
-                if event.get("editRequest"):
-                    trace["editRequest"] = event["editRequest"]
-                tool_trace.append(trace)
-                content_parts.append(f"<!--tool:{len(tool_trace) - 1}-->")
-                yield {
-                    "type": "image_gen_start",
-                    "message_id": assistant_message_id,
-                    "prompt": event.get("prompt") or "",
-                    "mode": event.get("mode"),
-                    "assetId": event.get("assetId"),
-                    "request": event.get("request"),
-                    "editRequest": event.get("editRequest"),
-                }
-                continue
-
-            if event_type == "image_gen_end":
-                success = bool(event.get("success"))
-                for item in reversed(tool_trace):
-                    if item.get("kind") == "image_gen" and item.get("status") == "running":
-                        item["status"] = "done"
-                        item["success"] = success
-                        item["prompt"] = event.get("prompt") or item.get("prompt", "")
-                        item["mode"] = event.get("mode") or item.get("mode")
-                        if event.get("url"):
-                            item["url"] = event["url"]
-                        if event.get("request"):
-                            item["request"] = event["request"]
-                        if event.get("editRequest"):
-                            item["editRequest"] = event["editRequest"]
-                        if event.get("sourceImageId"):
-                            item["sourceImageId"] = event["sourceImageId"]
-                        if event.get("sourceImageUrl"):
-                            item["sourceImageUrl"] = event["sourceImageUrl"]
-                        if event.get("sourceLabel"):
-                            item["sourceLabel"] = event["sourceLabel"]
-                        if event.get("resolvedEditRequest"):
-                            item["resolvedEditRequest"] = event["resolvedEditRequest"]
-                        if event.get("assetId"):
-                            item["assetId"] = event["assetId"]
-                        if event.get("outputWidth"):
-                            item["outputWidth"] = event["outputWidth"]
-                        if event.get("outputHeight"):
-                            item["outputHeight"] = event["outputHeight"]
-                        if event.get("outputAspectRatio"):
-                            item["outputAspectRatio"] = event["outputAspectRatio"]
-                        break
-                yield {
-                    "type": "image_gen_end",
-                    "message_id": assistant_message_id,
-                    "prompt": event.get("prompt") or "",
-                    "mode": event.get("mode"),
-                    "success": success,
-                    "assetId": event.get("assetId"),
-                    "url": event.get("url"),
-                    "request": event.get("request"),
-                    "editRequest": event.get("editRequest"),
-                    "resolvedEditRequest": event.get("resolvedEditRequest"),
-                    "sourceImageId": event.get("sourceImageId"),
-                    "sourceImageUrl": event.get("sourceImageUrl"),
-                    "sourceLabel": event.get("sourceLabel"),
-                    "outputWidth": event.get("outputWidth"),
-                    "outputHeight": event.get("outputHeight"),
-                    "outputAspectRatio": event.get("outputAspectRatio"),
-                }
-                continue
-
-        return True
-
     def _yield_tool_call_events(
         self,
         *,
@@ -492,6 +398,7 @@ class AIService:
         current_user_message_id: str | None,
         llm_messages: list[dict[str, Any]],
         content_parts: list[str],
+        hd_image: bool = False,
     ) -> Generator[dict[str, Any], None, None]:
         tool_response = self._execute_tool_call(
             call,
@@ -501,6 +408,7 @@ class AIService:
             session_id=session_id,
             current_user_images=current_user_images,
             current_user_message_id=current_user_message_id,
+            hd_image=hd_image,
         )
         while True:
             try:
@@ -529,6 +437,7 @@ class AIService:
         current_user_images: list[str],
         current_user_message_id: str | None,
         content_parts: list[str],
+        hd_image: bool = False,
     ) -> Generator[dict[str, Any], None, str]:
         tool_response = self._execute_tool_call(
             call,
@@ -538,6 +447,7 @@ class AIService:
             session_id=session_id,
             current_user_images=current_user_images,
             current_user_message_id=current_user_message_id,
+            hd_image=hd_image,
         )
         while True:
             try:
@@ -586,6 +496,7 @@ class AIService:
         session_id: str | None,
         current_user_images: list[str],
         current_user_message_id: str | None,
+        hd_image: bool = False,
     ):
         name = str(call.get("name") or "").strip()
         arguments = call.get("arguments") if isinstance(call.get("arguments"), dict) else {}
@@ -616,6 +527,7 @@ class AIService:
             request = self.image._normalize_image_request(arguments)
             prompt = self.image.build_request_prompt(arguments) or request.get("subject") or "生成图片"
             asset_id = self.image.build_conversation_asset_id("latest_tool_image", assistant_message_id, len(tool_trace) + 1)
+            current_model_label = self.image.model_label(hd_image)
             trace = {
                 "kind": "image_gen",
                 "assetId": asset_id,
@@ -623,6 +535,7 @@ class AIService:
                 "prompt": prompt,
                 "status": "running",
                 "request": request,
+                "modelLabel": current_model_label,
             }
             tool_trace.append(trace)
             yield {
@@ -633,12 +546,46 @@ class AIService:
                 "mode": "generate",
                 "assetId": asset_id,
                 "request": request,
+                "modelLabel": current_model_label,
             }
-            result = self.image.generate(arguments, user_id=user_id, session_id=session_id)
+            if user_id:
+                ok, _scope, quota_msg = self.usage.check(user_id, self.usage.IMAGE_COST)
+                if not ok:
+                    trace["status"] = "done"
+                    trace["success"] = False
+                    yield {
+                        "type": "image_gen_end",
+                        "message_id": assistant_message_id,
+                        "prompt": prompt,
+                        "mode": "generate",
+                        "success": False,
+                        "assetId": asset_id,
+                        "request": request,
+                        "modelLabel": current_model_label,
+                        "error": quota_msg,
+                    }
+                    return json.dumps({
+                        "status": "error",
+                        "tool": "generate_image",
+                        "mode": "generate",
+                        "assetId": asset_id,
+                        "message": quota_msg,
+                        "assistantInstruction": "请用中文向用户说明 Campbell 出图额度已用完，建议明天/下月再试，或先用文字回答。不要再尝试调用 generate_image。",
+                        "error": quota_msg,
+                    }, ensure_ascii=False)
+            result = self.image.generate(
+                arguments,
+                user_id=user_id,
+                session_id=session_id,
+                current_user_image_urls=current_user_images,
+                current_user_message_id=current_user_message_id,
+                hd=hd_image,
+            )
             success = bool(result.get("success") and result.get("image"))
             trace["status"] = "done"
             trace["success"] = success
             trace["url"] = result.get("image")
+            trace["blurredUrl"] = result.get("blurred_image")
             trace["assetId"] = asset_id
             if success and result.get("prompt"):
                 trace["prompt"] = result["prompt"]
@@ -655,6 +602,11 @@ class AIService:
                     session_id=session_id,
                     assistant_message_id=assistant_message_id,
                 )
+                if user_id:
+                    try:
+                        self.usage.record_image_call(user_id)
+                    except Exception as exc:
+                        print(f"[Usage] record_image_call failed: {type(exc).__name__}: {exc}")
             yield {
                 "type": "image_gen_end",
                 "message_id": assistant_message_id,
@@ -663,11 +615,14 @@ class AIService:
                 "success": success,
                 "assetId": asset_id,
                 "url": result.get("image"),
+                "blurredUrl": result.get("blurred_image"),
                 "request": request,
                 "outputWidth": result.get("output_width"),
                 "outputHeight": result.get("output_height"),
                 "outputAspectRatio": result.get("output_aspect_ratio"),
+                "modelLabel": current_model_label,
             }
+            error_message = result.get("error") or "图片生成失败，请稍后重试。"
             return json.dumps({
                 "status": "ok" if success else "error",
                 "tool": "generate_image",
@@ -679,16 +634,21 @@ class AIService:
                 "outputHeight": result.get("output_height"),
                 "outputAspectRatio": result.get("output_aspect_ratio"),
                 "message": (
-                    "The image was successfully generated and already shown to the user."
-                    if success else (result.get("error") or "图片生成失败，请稍后重试。")
+                    "Image generated successfully and already shown to the user."
+                    if success else error_message
                 ),
-                "error": "" if success else (result.get("error") or "图片生成失败，请稍后重试。"),
+                "assistantInstruction": (
+                    "请用中文简短确认图片已生成完成，并提示用户可以继续提出修改要求；不要重复输出原始 URL。"
+                    if success else "请用中文简短说明图片生成失败，并询问用户是否要重试或调整提示词。"
+                ),
+                "error": "" if success else error_message,
             }, ensure_ascii=False)
 
         if name == "edit_image":
             request = self.image._normalize_image_edit_request(arguments)
             prompt = self.image.build_edit_prompt(arguments) or request.get("instruction") or "编辑图片"
             asset_id = self.image.build_conversation_asset_id("latest_tool_image", assistant_message_id, len(tool_trace) + 1)
+            current_model_label = self.image.model_label(hd_image)
             trace = {
                 "kind": "image_gen",
                 "assetId": asset_id,
@@ -696,6 +656,7 @@ class AIService:
                 "prompt": prompt,
                 "status": "running",
                 "editRequest": request,
+                "modelLabel": current_model_label,
             }
             tool_trace.append(trace)
             yield {
@@ -706,18 +667,46 @@ class AIService:
                 "mode": "edit",
                 "assetId": asset_id,
                 "editRequest": request,
+                "modelLabel": current_model_label,
             }
+            if user_id:
+                ok, _scope, quota_msg = self.usage.check(user_id, self.usage.IMAGE_COST)
+                if not ok:
+                    trace["status"] = "done"
+                    trace["success"] = False
+                    yield {
+                        "type": "image_gen_end",
+                        "message_id": assistant_message_id,
+                        "prompt": prompt,
+                        "mode": "edit",
+                        "success": False,
+                        "assetId": asset_id,
+                        "editRequest": request,
+                        "modelLabel": current_model_label,
+                        "error": quota_msg,
+                    }
+                    return json.dumps({
+                        "status": "error",
+                        "tool": "edit_image",
+                        "mode": "edit",
+                        "assetId": asset_id,
+                        "message": quota_msg,
+                        "assistantInstruction": "请用中文向用户说明 Campbell 出图额度已用完，建议明天/下月再试。不要再尝试调用 edit_image。",
+                        "error": quota_msg,
+                    }, ensure_ascii=False)
             result = self.image.edit(
                 arguments,
                 user_id=user_id,
                 session_id=session_id,
                 current_user_image_urls=current_user_images,
                 current_user_message_id=current_user_message_id,
+                hd=hd_image,
             )
             success = bool(result.get("success") and result.get("image"))
             trace["status"] = "done"
             trace["success"] = success
             trace["url"] = result.get("image")
+            trace["blurredUrl"] = result.get("blurred_image")
             trace["assetId"] = asset_id
             if result.get("source_image_id"):
                 trace["sourceImageId"] = result["source_image_id"]
@@ -742,6 +731,11 @@ class AIService:
                     session_id=session_id,
                     assistant_message_id=assistant_message_id,
                 )
+                if user_id:
+                    try:
+                        self.usage.record_image_call(user_id)
+                    except Exception as exc:
+                        print(f"[Usage] record_image_call failed: {type(exc).__name__}: {exc}")
             yield {
                 "type": "image_gen_end",
                 "message_id": assistant_message_id,
@@ -750,6 +744,7 @@ class AIService:
                 "success": success,
                 "assetId": asset_id,
                 "url": result.get("image"),
+                "blurredUrl": result.get("blurred_image"),
                 "editRequest": request,
                 "resolvedEditRequest": result.get("resolved_edit_request"),
                 "sourceImageId": result.get("source_image_id"),
@@ -758,7 +753,9 @@ class AIService:
                 "outputWidth": result.get("output_width"),
                 "outputHeight": result.get("output_height"),
                 "outputAspectRatio": result.get("output_aspect_ratio"),
+                "modelLabel": current_model_label,
             }
+            error_message = result.get("error") or "图片编辑失败，请稍后重试。"
             return json.dumps({
                 "status": "ok" if success else "error",
                 "tool": "edit_image",
@@ -773,10 +770,14 @@ class AIService:
                 "outputHeight": result.get("output_height"),
                 "outputAspectRatio": result.get("output_aspect_ratio"),
                 "message": (
-                    "The image was successfully edited and already shown to the user."
-                    if success else (result.get("error") or "图片编辑失败，请稍后重试。")
+                    "Image edited successfully and already shown to the user."
+                    if success else error_message
                 ),
-                "error": "" if success else (result.get("error") or "图片编辑失败，请稍后重试。"),
+                "assistantInstruction": (
+                    "请用中文简短确认图片已编辑完成，并提示用户可以继续提出局部修改；不要重复输出原始 URL。"
+                    if success else "请用中文简短说明图片编辑失败，并询问用户是否要重试或调整修改要求。"
+                ),
+                "error": "" if success else error_message,
             }, ensure_ascii=False)
 
         return "不支持的工具调用。"
@@ -839,6 +840,68 @@ class AIService:
 
     def _strip_tool_markers(self, content: str) -> str:
         return TOOL_MARKER_RE.sub("", content or "").strip()
+
+    def _is_vision_blind_transport(self, cfg: dict[str, Any]) -> bool:
+        transport = str(cfg.get("transport") or cfg.get("provider") or "").strip().lower()
+        return transport.startswith("deepseek")
+
+    def _preprocess_vision_if_blind(
+        self,
+        messages: list[dict[str, Any]],
+        cfg: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        if not self._is_vision_blind_transport(cfg):
+            return messages
+        return self._describe_image_parts(messages)
+
+    def _describe_image_parts(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        transformed: list[dict[str, Any]] = []
+        cache: dict[str, str] = {}
+        for msg in messages:
+            content = msg.get("content")
+            if not isinstance(content, list):
+                transformed.append(msg)
+                continue
+
+            new_parts: list[dict[str, Any]] = []
+            for part in content:
+                if not isinstance(part, dict) or part.get("type") != "image_url":
+                    new_parts.append(part)
+                    continue
+                image_url = str((part.get("image_url") or {}).get("url") or "").strip()
+                if not image_url:
+                    continue
+                if image_url not in cache:
+                    cache[image_url] = self._describe_single_image(image_url)
+                new_parts.append({
+                    "type": "text",
+                    "text": f"[用户上传的图片，由视觉模型识别得到的描述]\n{cache[image_url]}",
+                })
+            transformed.append({**msg, "content": new_parts})
+        return transformed
+
+    def _describe_single_image(self, image_url: str) -> str:
+        prompt = (
+            "请用中文详细描述这张图片的内容，目标是让一个不支持视觉的语言模型能基于你的描述理解图片。"
+            "请涵盖：主体/人物/物体、可见文字、布局结构、风格氛围、关键细节。"
+            "直接输出描述，不要前缀。"
+        )
+        try:
+            description = self.llm.complete(
+                [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": image_url}},
+                    ],
+                }],
+                model="image_describer",
+            )
+        except Exception as exc:
+            print(f"[vision-preprocess] 描述失败: {type(exc).__name__}: {exc}")
+            return "[图片识别失败，请基于用户的文字提问继续回答]"
+        text = strip_assistant_reasoning(str(description or "")).strip()
+        return text or "[图片识别失败，请基于用户的文字提问继续回答]"
 
     def _format_tool_trace_summary(self, tool_trace: list[dict[str, Any]]) -> str:
         if not tool_trace:

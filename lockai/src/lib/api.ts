@@ -53,6 +53,23 @@ export async function getModels(): Promise<ChatModel[]> {
   }
 }
 
+export interface CampbellUsage {
+  today: { day: string; chat_calls: number; image_calls: number; credits: number };
+  month: { month: string; chat_calls: number; image_calls: number; credits: number };
+  limits: { daily: number; monthly: number; chat_cost: number; image_cost: number };
+  remaining: { daily: number; monthly: number };
+}
+
+export async function getUsage(userId: string): Promise<CampbellUsage | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/api/usage?user_id=${encodeURIComponent(userId)}`);
+    if (!res.ok) return null;
+    return (await res.json()) as CampbellUsage;
+  } catch {
+    return null;
+  }
+}
+
 export async function createRealtimeAsrSession(): Promise<RealtimeAsrSessionResponse> {
   try {
     const response = await fetch(`${API_BASE_URL}/api/asr/sessions`, {
@@ -173,7 +190,9 @@ export async function sendChatMessageStream(
       user_id: request.user_id,
       session_id: request.session_id,
       thinking: request.thinking,
+      reasoning_effort: request.reasoning_effort,
       current_message_id: request.current_message_id,
+      image_quality: request.image_quality,
     }),
     signal,
   });
@@ -241,7 +260,9 @@ export async function sendChatMessage(request: ChatRequest): Promise<ChatRespons
       user_id: request.user_id,
       session_id: request.session_id,
       thinking: request.thinking,
+      reasoning_effort: request.reasoning_effort,
       current_message_id: request.current_message_id,
+      image_quality: request.image_quality,
     }),
   });
 

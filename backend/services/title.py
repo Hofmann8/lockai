@@ -23,10 +23,11 @@ class TitleService:
         print(f"[Title] 生成标题...")
         
         result = self.llm.complete(
-            messages, 
+            messages,
             model="title_generator",
             temperature=0.3,
-            max_tokens=20
+            max_tokens=20,
+            enable_thinking=False,
         )
         
         if result:

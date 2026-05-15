@@ -4,7 +4,8 @@ import ReactMarkdown from 'react-markdown';
 import remarkMath from 'remark-math';
 import remarkGfm from 'remark-gfm';
 import rehypeKatex from 'rehype-katex';
-import { fixIncompleteMarkdown, fixEmphasisFlanking } from '@/lib/markdown';
+import rehypeRaw from 'rehype-raw';
+import { fixIncompleteMarkdown, fixEmphasisFlanking, normalizeLatexDelimiters } from '@/lib/markdown';
 import 'katex/dist/katex.min.css';
 
 interface StreamingMarkdownProps {
@@ -14,10 +15,10 @@ interface StreamingMarkdownProps {
 
 export function StreamingMarkdown({ content, showCursor = true }: StreamingMarkdownProps) {
   return (
-    <div className="prose prose-sm max-w-none dark:prose-invert">
+    <div className="prose prose-sm max-w-none dark:prose-invert" style={{ overflowWrap: 'anywhere' }}>
       <ReactMarkdown
         remarkPlugins={[remarkMath, remarkGfm]}
-        rehypePlugins={[rehypeKatex]}
+        rehypePlugins={[rehypeRaw, rehypeKatex]}
         components={{
           h1: ({ children }) => <h1 className="text-2xl font-bold mb-3 mt-4 first:mt-0">{children}</h1>,
           h2: ({ children }) => <h2 className="text-xl font-bold mb-2 mt-3 first:mt-0">{children}</h2>,
@@ -81,8 +82,8 @@ export function StreamingMarkdown({ content, showCursor = true }: StreamingMarkd
           thead: ({ children }) => <thead className="bg-muted">{children}</thead>,
           tbody: ({ children }) => <tbody>{children}</tbody>,
           tr: ({ children }) => <tr className="border-b last:border-b-0 border-border">{children}</tr>,
-          th: ({ children }) => <th className="px-3 py-2 text-left font-semibold">{children}</th>,
-          td: ({ children }) => <td className="px-3 py-2">{children}</td>,
+          th: ({ children, style }) => <th className="px-3 py-2 font-semibold" style={style}>{children}</th>,
+          td: ({ children, style }) => <td className="px-3 py-2" style={style}>{children}</td>,
           img: ({ src, alt }) => (
             src ? (
               <img 
@@ -92,9 +93,24 @@ export function StreamingMarkdown({ content, showCursor = true }: StreamingMarkd
               />
             ) : null
           ),
+          sup: ({ children }) => <sup className="text-xs">{children}</sup>,
+          sub: ({ children }) => <sub className="text-xs">{children}</sub>,
+          kbd: ({ children }) => (
+            <kbd className="px-1.5 py-0.5 rounded text-xs font-mono bg-muted border border-border shadow-sm">
+              {children}
+            </kbd>
+          ),
+          details: ({ children }) => (
+            <details className="my-2 rounded-lg border border-border p-3 open:pb-3">
+              {children}
+            </details>
+          ),
+          summary: ({ children }) => (
+            <summary className="cursor-pointer font-medium select-none">{children}</summary>
+          ),
         }}
       >
-        {fixEmphasisFlanking(fixIncompleteMarkdown(content))}
+        {fixEmphasisFlanking(fixIncompleteMarkdown(normalizeLatexDelimiters(content)))}
       </ReactMarkdown>
       {showCursor && (
         <span className="inline-block w-0.5 h-4 bg-primary animate-pulse ml-0.5 align-middle" />

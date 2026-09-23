@@ -6,9 +6,7 @@ import json
 import re
 from datetime import datetime, timezone
 
-from flask_sqlalchemy import SQLAlchemy
-
-db = SQLAlchemy()
+from database import db
 
 
 TOOL_MARKER_RE = re.compile(r'<!--tool:(\d+)-->')
@@ -106,6 +104,7 @@ class ChatSession(db.Model):
     user_id = db.Column(db.String(36), nullable=False, index=True)
     title = db.Column(db.String(100), default='新对话')
     model_id = db.Column(db.String(100), nullable=False, default='campbell')
+    pinned = db.Column(db.Boolean, nullable=False, default=False)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -117,6 +116,7 @@ class ChatSession(db.Model):
             'user_id': self.user_id,
             'title': self.title,
             'model_id': self.model_id,
+            'pinned': bool(self.pinned),
             'created_at': _serialize_utc(self.created_at),
             'updated_at': _serialize_utc(self.updated_at),
         }
@@ -132,6 +132,8 @@ class ChatMessage(db.Model):
     content = db.Column(db.Text, nullable=False)
     images = db.Column(db.Text, nullable=True)  # JSON: S3 URL 列表
     tool_trace = db.Column(db.Text, nullable=True)  # JSON: 工具调用记录
+    reasoning = db.Column(db.Text, nullable=True)  # 模型的思考过程（上游返回时才有）
+    reasoning_seconds = db.Column(db.Integer, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     
     def to_dict(self):
@@ -160,6 +162,10 @@ class ChatMessage(db.Model):
             result['images'] = images_list
         if trace:
             result['tool_trace'] = trace
+        if self.reasoning:
+            result['reasoning'] = self.reasoning
+            if self.reasoning_seconds is not None:
+                result['reasoning_seconds'] = self.reasoning_seconds
         return result
 
 
@@ -212,7 +218,11 @@ class CallingOutUsage(db.Model):
 
 
 class CampbellUsage(db.Model):
-    """Campbell 配额日度用量（按北京时间日聚合）"""
+    """Campbell 配额日度用量（按北京时间日聚合）
+
+    存原始 token，不存算好的 credits：计费权重写在 models.json 与 services/usage.py，
+    调整权重后历史数据可以整体重算。
+    """
     __tablename__ = 'campbell_usages'
 
     id = db.Column(db.Integer, primary_key=True)
@@ -220,11 +230,27 @@ class CampbellUsage(db.Model):
     day = db.Column(db.String(10), nullable=False, index=True)  # YYYY-MM-DD (Asia/Shanghai)
     chat_calls = db.Column(db.Integer, nullable=False, default=0)
     image_calls = db.Column(db.Integer, nullable=False, default=0)
+    # 计费量单位：以「gpt-6-astra 输入 token」为 1，其余按 models.json 的 billing 权重折算
+    new_input_units = db.Column(db.Float, nullable=False, default=0.0)
+    cached_input_units = db.Column(db.Float, nullable=False, default=0.0)
+    output_units = db.Column(db.Float, nullable=False, default=0.0)
+    # 出图下限等与 token 无关的补足计费量
+    floor_units = db.Column(db.Float, nullable=False, default=0.0)
+    estimated = db.Column(db.Boolean, nullable=False, default=False)  # 历史回填数据标记
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     __table_args__ = (
         db.UniqueConstraint('user_id', 'day', name='uq_campbell_usages_user_day'),
     )
+
+    @property
+    def billed_units(self) -> float:
+        return (
+            (self.new_input_units or 0.0)
+            + (self.cached_input_units or 0.0)
+            + (self.output_units or 0.0)
+            + (self.floor_units or 0.0)
+        )
 
     def to_dict(self):
         return {
@@ -232,36 +258,10 @@ class CampbellUsage(db.Model):
             'day': self.day,
             'chat_calls': self.chat_calls,
             'image_calls': self.image_calls,
-            'credits': self.chat_calls + 5 * self.image_calls,
-        }
-
-
-class PaperRecord(db.Model):
-    """论文记录（持久化）"""
-    __tablename__ = 'paper_records'
-
-    id = db.Column(db.String(36), primary_key=True)
-    user_id = db.Column(db.String(36), nullable=False, index=True)
-    topic = db.Column(db.String(500), nullable=False)
-    status = db.Column(db.String(20), nullable=False)
-    vfs_s3_key = db.Column(db.String(255))
-    pdf_s3_key = db.Column(db.String(255))
-    pdf_url = db.Column(db.String(500))
-    outline_json = db.Column(db.Text)
-    error = db.Column(db.Text)
-    progress_detail = db.Column(db.String(500), default='')
-    planning_messages = db.Column(db.Text)  # JSON: 规划对话消息
-    created_at = db.Column(db.DateTime, default=datetime.utcnow)
-    completed_at = db.Column(db.DateTime)
-
-    def to_dict(self):
-        return {
-            'id': self.id,
-            'topic': self.topic,
-            'status': self.status,
-            'pdf_url': self.pdf_url,
-            'error': self.error,
-            'progress_detail': self.progress_detail or '',
-            'created_at': _serialize_utc(self.created_at),
-            'completed_at': _serialize_utc(self.completed_at),
+            'new_input_units': self.new_input_units,
+            'cached_input_units': self.cached_input_units,
+            'output_units': self.output_units,
+            'floor_units': self.floor_units,
+            'billed_units': self.billed_units,
+            'estimated': bool(self.estimated),
         }

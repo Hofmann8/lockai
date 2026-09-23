@@ -199,6 +199,8 @@ def build_tool_calling_instruction() -> str:
 - 需要从零生成新图片时调用 `generate_image`
 - 需要修改已有图片时优先调用 `edit_image`，不要误用 `generate_image`
 - 只填写用户明确表达的信息，不要臆造
+- 调用工具前不要先输出"我来搜索一下""I'll search…"之类的旁白，界面会自动显示工具进度；拿到结果后直接给答案
+- 用户用中文提问时，搜索关键词也用中文；只有查询对象本身是英文资料时才用英文
 
 `web_search` 使用原则：
 1. 如果预计需要多个搜索，请在同一轮一次性发出多个 `web_search` 调用

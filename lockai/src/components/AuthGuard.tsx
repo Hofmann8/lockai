@@ -3,6 +3,7 @@
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { isAuthenticated, onAuthStateChange } from '@/lib/auth';
+import { LockMark } from '@/components/brand/LockMark';
 
 interface AuthGuardProps {
   children: React.ReactNode;
@@ -42,11 +43,8 @@ export function AuthGuard({ children }: AuthGuardProps) {
   // Show loading state while checking authentication
   if (isChecking) {
     return (
-      <div className="flex min-h-screen items-center justify-center bg-background">
-        <div className="flex flex-col items-center gap-4">
-          <div className="h-8 w-8 border-2 border-primary/30 border-t-primary rounded-full animate-spin" />
-          <p className="text-sm text-muted-foreground">验证身份中...</p>
-        </div>
+      <div className="flex min-h-dvh items-center justify-center bg-bg">
+        <LockMark size={32} state="busy" className="text-fg" />
       </div>
     );
   }

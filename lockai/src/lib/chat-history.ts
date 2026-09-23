@@ -74,10 +74,12 @@ export async function createSession(modelId?: string): Promise<ChatSession | nul
   }
 }
 
-export async function deleteSession(sessionId: string): Promise<boolean> {
+export async function deleteSession(sessionId: string, options: { keepalive?: boolean } = {}): Promise<boolean> {
   try {
     const res = await fetch(`${API_BASE_URL}/api/sessions/${sessionId}`, {
       method: 'DELETE',
+      // 页面关闭前补发的删除请求要能活过卸载
+      keepalive: options.keepalive,
     });
     return res.ok;
   } catch {
@@ -110,6 +112,8 @@ export async function addMessage(sessionId: string, message: ChatMessage): Promi
         content: message.content,
         images: message.images,
         tool_trace: message.tool_trace,
+        reasoning: message.reasoning,
+        reasoning_seconds: message.reasoning_seconds,
       }),
     });
     console.log('[chat-history] addMessage 响应:', res.status, res.ok);
@@ -117,6 +121,38 @@ export async function addMessage(sessionId: string, message: ChatMessage): Promi
   } catch (e) {
     console.error('[chat-history] addMessage 异常:', e);
     return false;
+  }
+}
+
+export async function updateSession(
+  sessionId: string,
+  payload: { title?: string; model_id?: string; pinned?: boolean },
+): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/api/sessions/${sessionId}`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+/** 从某条消息分叉出新会话，返回新会话 id */
+export async function branchSession(sessionId: string, messageId: string): Promise<string | null> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/api/sessions/${sessionId}/branch`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message_id: messageId }),
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.id || null;
+  } catch {
+    return null;
   }
 }
 

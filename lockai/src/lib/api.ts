@@ -2,13 +2,6 @@ import {
   ChatModel,
   ChatRequest,
   ChatResponse,
-  PaperAssistRequest,
-  PaperAssistResponse,
-  PaperFileContent,
-  PaperFiles,
-  PaperGenerateRequest,
-  PaperRecord,
-  PaperReviseRequest,
   RealtimeAsrEvent,
   RealtimeAsrSessionResponse,
   StreamEvent,
@@ -54,9 +47,9 @@ export async function getModels(): Promise<ChatModel[]> {
 }
 
 export interface CampbellUsage {
-  today: { day: string; chat_calls: number; image_calls: number; credits: number };
-  month: { month: string; chat_calls: number; image_calls: number; credits: number };
-  limits: { daily: number; monthly: number; chat_cost: number; image_cost: number };
+  today: { day: string; chat_calls: number; image_calls: number; units: number; credits: number };
+  month: { month: string; chat_calls: number; image_calls: number; units: number; credits: number };
+  limits: { daily: number; monthly: number; tokens_per_credit: number; image_min_credits: number };
   remaining: { daily: number; monthly: number };
 }
 
@@ -133,9 +126,21 @@ export function parseRealtimeAsrEvent(eventData: MessageEvent<string>): Realtime
   }
 }
 
-/** 获取论文 PDF 代理预览 URL（解决 S3 不支持 inline 预览） */
-export function getPaperPdfProxyUrl(paperId: string): string {
-  return `${API_BASE_URL}/api/paper/${paperId}/pdf`;
+/** 根据最后一轮问答要 3 条追问建议；失败时返回空数组 */
+export async function fetchSuggestions(userMessage: string, assistantMessage: string, signal?: AbortSignal): Promise<string[]> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/api/chat/suggestions`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user_message: userMessage, assistant_message: assistantMessage }),
+      signal,
+    });
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data.suggestions) ? data.suggestions.filter((s: unknown) => typeof s === 'string') : [];
+  } catch {
+    return [];
+  }
 }
 
 export type StreamCallback = (event: StreamEvent) => void;
@@ -286,37 +291,6 @@ export async function sendChatMessage(request: ChatRequest): Promise<ChatRespons
 }
 
 /**
- * Request AI assistance for paper content
- */
-export async function requestPaperAssist(request: PaperAssistRequest): Promise<PaperAssistResponse> {
-  const response = await fetch(`${API_BASE_URL}/api/paper/assist`, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(request),
-  });
-
-  if (!response.ok) {
-    const errorData = await response.json().catch(() => ({}));
-
-    if (response.status === 429) {
-      return { result: '', error: 'AI 服务繁忙，请稍后重试' };
-    }
-    if (response.status === 503) {
-      return { result: '', error: 'AI 服务暂时不可用，请稍后重试' };
-    }
-    if (response.status === 400) {
-      return { result: '', error: errorData.error || '请求格式错误' };
-    }
-
-    return { result: '', error: errorData.error || '请求失败，请重试' };
-  }
-
-  return response.json();
-}
-
-/**
  * 生成会话标题
  */
 export async function generateSessionTitle(
@@ -344,137 +318,4 @@ export async function generateSessionTitle(
     console.error('[API] 生成标题失败:', e);
   }
   return null;
-}
-
-/**
- * 创建论文规划记录（planning_chat 状态），返回 paper_id
- */
-export async function createPaperSession(
-  topic: string,
-  userId: string,
-): Promise<string | null> {
-  const response = await fetch(`${API_BASE_URL}/api/paper/create`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ topic, user_id: userId }),
-  });
-  if (!response.ok) return null;
-  const data = await response.json();
-  return data.paper_id || null;
-}
-
-/**
- * 保存规划对话消息
- */
-export async function savePlanningMessages(
-  paperId: string,
-  messages: { role: string; content: string }[],
-): Promise<void> {
-  await fetch(`${API_BASE_URL}/api/paper/${paperId}/planning-messages`, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ messages }),
-  });
-}
-
-/**
- * 获取规划对话消息
- */
-export async function getPlanningMessages(
-  paperId: string,
-): Promise<{ role: string; content: string }[]> {
-  const response = await fetch(`${API_BASE_URL}/api/paper/${paperId}/planning-messages`);
-  if (!response.ok) return [];
-  const data = await response.json();
-  return data.messages || [];
-}
-
-/**
- * 提交论文生成任务（后台执行），返回 paper_id
- */
-export async function generatePaper(
-  request: PaperGenerateRequest,
-): Promise<string | null> {
-  const response = await fetch(`${API_BASE_URL}/api/paper/generate`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(request),
-  });
-
-  if (!response.ok) return null;
-  const data = await response.json();
-  return data.paper_id || null;
-}
-
-/**
- * 提交论文修订任务（后台执行），返回是否成功
- */
-export async function revisePaper(
-  paperId: string,
-  request: PaperReviseRequest,
-): Promise<boolean> {
-  const response = await fetch(`${API_BASE_URL}/api/paper/${paperId}/revise`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(request),
-  });
-
-  return response.ok;
-}
-
-/**
- * 从失败阶段恢复生成，返回是否成功
- */
-export async function retryPaper(paperId: string): Promise<boolean> {
-  const response = await fetch(`${API_BASE_URL}/api/paper/${paperId}/retry`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-  });
-  return response.ok;
-}
-
-/**
- * 轮询论文状态
- */
-export async function pollPaperStatus(paperId: string): Promise<PaperRecord | null> {
-  const response = await fetch(`${API_BASE_URL}/api/paper/${paperId}/status`);
-  if (!response.ok) return null;
-  return response.json();
-}
-
-/**
- * 获取论文 VFS 文件列表
- */
-export async function getPaperFiles(paperId: string): Promise<PaperFiles | null> {
-  const response = await fetch(`${API_BASE_URL}/api/paper/${paperId}/files`);
-  if (!response.ok) return null;
-  return response.json();
-}
-
-/**
- * 读取论文 VFS 中的单个文件内容
- */
-export async function getPaperFileContent(paperId: string, filePath: string): Promise<PaperFileContent | null> {
-  const response = await fetch(`${API_BASE_URL}/api/paper/${paperId}/files/${encodeURIComponent(filePath)}`);
-  if (!response.ok) return null;
-  return response.json();
-}
-
-/**
- * 列出用户的所有论文
- */
-export async function listPapers(userId: string): Promise<PaperRecord[]> {
-  const response = await fetch(`${API_BASE_URL}/api/papers?user_id=${encodeURIComponent(userId)}`);
-  if (!response.ok) return [];
-  return response.json();
-}
-
-/**
- * 删除论文（DB + S3）
- */
-export async function deletePaper(paperId: string): Promise<boolean> {
-  const response = await fetch(`${API_BASE_URL}/api/paper/${paperId}`, {
-    method: 'DELETE',
-  });
-  return response.ok;
 }

@@ -40,6 +40,10 @@ class _DummyLLM:
 
 
 class _DummyImageService:
+    @staticmethod
+    def model_label(hd):
+        return "Campbell 3.0 Image" if hd else "Campbell 2.5 Image"
+
     def _normalize_image_request(self, arguments):
         return {"subject": arguments.get("subject", "")}
 
@@ -49,7 +53,7 @@ class _DummyImageService:
     def build_conversation_asset_id(self, scope, assistant_message_id, index):
         return f"{scope}:{assistant_message_id}:{index}"
 
-    def generate(self, arguments, user_id=None, session_id=None):
+    def generate(self, arguments, user_id=None, session_id=None, **kwargs):
         return {
             "success": True,
             "image": "https://example.com/generated.png",
@@ -60,10 +64,37 @@ class _DummyImageService:
         }
 
 
+class _DummyUsageService:
+    """配额服务替身：不限额，只记录调用。"""
+
+    CHAT_COST = 1
+    IMAGE_COST = 5
+
+    def __init__(self):
+        self.chat_calls = 0
+        self.image_calls = 0
+        self.last_chat_usage = None
+        self.last_image_usage = None
+
+    def check(self, user_id, cost):
+        return True, None, None
+
+    def record_chat_call(self, user_id, raw_usage=None, model_cfg=None):
+        self.chat_calls += 1
+        self.last_chat_usage = raw_usage
+        return 1.0
+
+    def record_image_call(self, user_id, raw_usage=None, model_cfg=None):
+        self.image_calls += 1
+        self.last_image_usage = raw_usage
+        return 2.0
+
+
 def test_chat_with_complete_forwards_thinking_toggle():
     provider_runtime = _DummyProviderRuntime()
     service = AIService.__new__(AIService)
     service.llm = _DummyLLM(provider_runtime)
+    service.usage = _DummyUsageService()
     service.max_tool_rounds = 1
 
     events = list(
@@ -90,6 +121,7 @@ def test_chat_with_complete_forwards_thinking_toggle():
 def test_execute_tool_call_image_result_marks_image_as_already_shown():
     service = AIService.__new__(AIService)
     service.image = _DummyImageService()
+    service.usage = _DummyUsageService()
     service._save_generated_image = lambda **kwargs: None
 
     tool_trace = []

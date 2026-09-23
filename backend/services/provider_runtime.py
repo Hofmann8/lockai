@@ -13,6 +13,8 @@ from typing import Any
 
 import httpx
 
+from .http_client import build_http_client
+
 from models import strip_assistant_reasoning
 
 from .tool_contracts import build_anthropic_tools
@@ -86,7 +88,7 @@ class ProviderRuntime:
 
         kind = str(state.get("kind") or "openai-compatible")
         try:
-            with httpx.Client(timeout=self.request_timeout) as client:
+            with build_http_client(self.request_timeout) as client:
                 if kind == "anthropic-native":
                     response = self._request_anthropic_turn(client, state)
                     return self._parse_anthropic_response(response)
@@ -320,6 +322,7 @@ class ProviderRuntime:
             "tool_calls": self.llm._parse_tool_calls(message.get("tool_calls")),
             "finish_reason": choice.get("finish_reason", ""),
             "assistant_history_item": assistant_history_item,
+            "usage": payload.get("usage"),
         }
 
     def _parse_anthropic_response(self, payload: dict[str, Any]) -> dict[str, Any]:
@@ -371,6 +374,7 @@ class ProviderRuntime:
             "tool_calls": tool_calls,
             "finish_reason": self._clean_optional_string(payload.get("stop_reason")),
             "assistant_history_item": {"role": "assistant", "content": visible_blocks} if visible_blocks else None,
+            "usage": payload.get("usage"),
         }
 
     def _build_openai_tool_calls(self, parsed_calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -451,7 +455,7 @@ class ProviderRuntime:
         if not image_url:
             return None, ""
         try:
-            with httpx.Client(timeout=self.image_fetch_timeout) as client:
+            with build_http_client(self.image_fetch_timeout) as client:
                 response = client.get(image_url)
             if response.status_code != 200:
                 return None, ""

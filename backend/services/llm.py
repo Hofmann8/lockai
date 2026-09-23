@@ -12,12 +12,15 @@ from typing import Any, Generator, Optional
 
 import httpx
 
+from .http_client import build_http_client
 from .provider_runtime import ProviderRuntime
 
 
 ENV_SUB_RE = re.compile(r'\$\{(\w+)\}')
+REASONING_EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
 RETIRED_CHAT_MODEL_ALIASES = {
     "xiaosuolaoshi": "campbell",
+    "leo": "scooby",
 }
 
 
@@ -33,7 +36,7 @@ class LLMService:
         self._key_index_by_model: dict[str, int] = {}
 
         # 兼容旧代码的默认配置
-        self.legacy_api_base = os.environ.get("API_BASE_URL", "https://api.vectorengine.ai")
+        self.legacy_api_base = os.environ.get("API_BASE_URL", "https://api.relayrouter.ai")
         self.qwen_base_url = os.environ.get("QWEN_API_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
         self.qwen_api_key = os.environ.get("QWEN_API_KEY", "")
         self.provider_runtime = ProviderRuntime(self)
@@ -131,7 +134,7 @@ class LLMService:
         print(f"\n[LLM] 流式调用: {cfg.get('model')} via {cfg.get('id')}")
 
         try:
-            with httpx.Client(timeout=httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0)) as client:
+            with build_http_client(httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0)) as client:
                 with client.stream(
                     "POST",
                     self._chat_endpoint(cfg["api_base"]),
@@ -154,6 +157,8 @@ class LLMService:
                             data = json.loads(data_str)
                         except json.JSONDecodeError:
                             continue
+                        if data.get("usage"):
+                            yield {"type": "usage", "usage": data["usage"]}
                         choices = data.get("choices") or []
                         if not choices:
                             continue
@@ -453,16 +458,18 @@ class LLMService:
         return [
             {
                 "id": "campbell",
-                "name": "Campbell 1.5",
+                "name": "Campbell 3.0",
                 "description": "深度推理与复杂任务处理",
-                "model": "claude-sonnet-4-6",
+                "model": "gpt-6-astra",
                 "api_base": self.legacy_api_base,
-                "api_key": os.environ.get("ANTHROPIC_API_KEY", ""),
-                "provider": "anthropic-native",
-                "transport": "anthropic-native",
-                "native_api_key_env": "ANTHROPIC_API_KEY",
+                "api_key": os.environ.get("RELAY_API_KEY", ""),
+                "provider": "openai-compatible",
+                "transport": "openai-compatible",
                 "thinking_mode": "optional",
                 "default_thinking": True,
+                "billable": True,
+                "identity_guard": True,
+                "vision": True,
                 "available": True,
                 "visible": True,
                 "is_default": True,
@@ -471,56 +478,57 @@ class LLMService:
             {
                 "id": "scooby",
                 "name": "Scooby 2.0",
-                "description": "通用助理，适合多数对话与创作任务",
-                "model": "deepseek-v4-pro",
+                "description": "响应快的通用助理，适合日常问答与创作",
+                "model": "deepseek-flash",
                 "api_base": os.environ.get("DEEPSEEK_API_BASE_URL", "https://api.deepseek.com"),
                 "api_key": os.environ.get("DEEPSEEK_API_KEY", ""),
                 "provider": "deepseek-compatible",
                 "transport": "deepseek-compatible",
                 "thinking_mode": "optional",
                 "default_thinking": True,
+                "identity_guard": True,
+                "vision": True,
                 "available": True,
                 "visible": True,
                 "prompt_id": "scooby",
             },
             {
-                "id": "leo",
-                "name": "Leo 2.0",
-                "description": "响应更快，适合日常问答与轻量任务",
-                "model": "deepseek-v4-flash",
+                "id": "search_builtin",
+                "name": "联网搜索",
+                "description": "内部搜索执行模型（中转站 Responses API + web_search 工具）",
+                "model": "gpt-4.1-mini",
+                "api_base": self.legacy_api_base,
+                "api_key": os.environ.get("RELAY_API_KEY", ""),
+                "provider": "openai-responses",
+                "transport": "openai-responses",
+                "available": True,
+                "visible": False,
+                "temperature": 0.2,
+                "max_tokens": 1200,
+            },
+            {
+                "id": "image_describer",
+                "name": "图片识别",
+                "description": "内部视觉模型，把图片转成文字描述喂给不支持视觉的主模型",
+                "model": "deepseek-flash",
                 "api_base": os.environ.get("DEEPSEEK_API_BASE_URL", "https://api.deepseek.com"),
                 "api_key": os.environ.get("DEEPSEEK_API_KEY", ""),
                 "provider": "deepseek-compatible",
                 "transport": "deepseek-compatible",
-                "thinking_mode": "optional",
-                "default_thinking": True,
-                "available": True,
-                "visible": True,
-                "prompt_id": "leo",
-            },
-            {
-                "id": "search_builtin",
-                "name": "联网搜索",
-                "description": "内部搜索执行模型",
-                "model": "qwen3.5-flash",
-                "api_base": self.qwen_base_url,
-                "api_key": self.qwen_api_key,
-                "provider": "qwen-compatible",
-                "transport": "qwen-compatible",
                 "available": True,
                 "visible": False,
                 "temperature": 0.3,
-                "max_tokens": 4096,
+                "max_tokens": 1024,
             },
             {
                 "id": "title_generator",
                 "name": "标题生成",
                 "description": "内部标题生成模型",
-                "model": "qwen-plus",
-                "api_base": self.qwen_base_url,
-                "api_key": self.qwen_api_key,
-                "provider": "qwen-compatible",
-                "transport": "qwen-compatible",
+                "model": "deepseek-flash",
+                "api_base": os.environ.get("DEEPSEEK_API_BASE_URL", "https://api.deepseek.com"),
+                "api_key": os.environ.get("DEEPSEEK_API_KEY", ""),
+                "provider": "deepseek-compatible",
+                "transport": "deepseek-compatible",
                 "available": True,
                 "visible": False,
                 "temperature": 0.3,
@@ -528,12 +536,12 @@ class LLMService:
             },
             {
                 "id": "image_generator",
-                "name": "Campbell 1.5 Image",
-                "description": "实时绘图（Gemini 3 Pro Image Preview）",
-                "model": "gemini-3-pro-image-preview",
-                "edit_model": "gemini-3-pro-image-preview",
-                "api_base": os.environ.get("GEMINI_API_BASE_URL", self.legacy_api_base),
-                "image_api_key_env": "GEMINI_API_KEY",
+                "name": "Campbell 2.5 Image",
+                "description": "实时绘图（gpt-image-2.5-flare）",
+                "model": "gpt-image-2.5-flare",
+                "edit_model": "gpt-image-2.5-flare",
+                "api_base": self.legacy_api_base,
+                "image_api_key_env": "RELAY_API_KEY",
                 "provider": "openai-image",
                 "transport": "openai-image",
                 "available": True,
@@ -541,12 +549,12 @@ class LLMService:
             },
             {
                 "id": "image_generator_hd",
-                "name": "Campbell 2.0 Image",
-                "description": "高清绘图（gpt-image-2，较慢）",
-                "model": "gpt-image-2",
-                "edit_model": "gpt-image-2",
+                "name": "Campbell 3.0 Image",
+                "description": "高清绘图（gpt-image-2.5-sunburst，较慢）",
+                "model": "gpt-image-2.5-sunburst",
+                "edit_model": "gpt-image-2.5-sunburst",
                 "api_base": self.legacy_api_base,
-                "api_key_pool_prefix": "API_KEY_",
+                "image_api_key_env": "RELAY_API_KEY",
                 "provider": "openai-image",
                 "transport": "openai-image",
                 "available": True,
@@ -586,7 +594,7 @@ class LLMService:
             "name": model_name,
             "model": model_name,
             "api_base": self.legacy_api_base,
-            "api_key_pool_prefix": "API_KEY_",
+            "api_key": os.environ.get("RELAY_API_KEY", ""),
             "provider": "openai-compatible",
             "transport": "openai-compatible",
             "thinking_mode": "never",
@@ -660,6 +668,13 @@ class LLMService:
                 effort = (reasoning_effort or "").strip().lower()
                 if effort in {"max", "xhigh"}:
                     payload["reasoning_effort"] = "max"
+        elif enable_thinking:
+            effort = (reasoning_effort or "").strip().lower()
+            if effort in REASONING_EFFORT_LEVELS:
+                payload["reasoning_effort"] = effort
+        if stream and cfg.get("billable"):
+            # 计费模型要按 token 记账，流末需要上游附带 usage（实测含 cached_tokens）
+            payload["stream_options"] = {"include_usage": True}
         if extra_payload:
             payload.update(extra_payload)
         return payload

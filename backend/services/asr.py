@@ -13,7 +13,7 @@ from http import HTTPStatus
 from pathlib import Path
 from typing import Any
 
-from .terminal.event_bus import EventBus
+from .event_bus import EventBus
 
 
 DEFAULT_ASR_MODEL = "fun-asr-realtime-2026-02-28"

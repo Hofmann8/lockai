@@ -12,11 +12,6 @@ _backend_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if _backend_dir not in sys.path:
     sys.path.insert(0, _backend_dir)
 
-# tests 目录也加入（让 helpers.py 可 import）
-_tests_dir = os.path.dirname(__file__)
-if _tests_dir not in sys.path:
-    sys.path.insert(0, _tests_dir)
-
 # 阻止 services/__init__.py 的重量级导入（boto3 等）
 if "services" not in sys.modules:
     mod = types.ModuleType("services")

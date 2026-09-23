@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 import uuid
 from datetime import datetime
 from typing import Any, Generator
@@ -23,7 +24,7 @@ from models import (
 
 from .image import ImageService
 from .llm import LLMService
-from .prompts import get_system_prompt
+from .prompts import current_time_context, get_identity_reminder, get_system_prompt
 from .search import SearchService
 from .storage import StorageService
 from .tool_contracts import CHAT_TOOLS
@@ -31,6 +32,20 @@ from .title import TitleService
 
 
 TOOLS = CHAT_TOOLS
+
+# 一次回答里最多搜几次。超过后不再真的去搜，而是告诉模型"够了，直接答"。
+MAX_SEARCHES_PER_ANSWER = 4
+# 工具调用前的旁白一般就一句话；扣住开头这么多字再放，够判断又不明显拖慢首字
+PREAMBLE_HOLD_CHARS = 48
+SEARCH_BUDGET_EXHAUSTED = (
+    "本次回答已经搜索过多次，不要再调用 web_search。"
+    "请基于已经拿到的搜索结果直接回答用户；信息确实不足就如实说明缺了什么。"
+)
+FINAL_ROUND_NUDGE = (
+    "工具调用次数已用完。现在请直接用已有的信息回答用户的问题，"
+    "不要再尝试调用任何工具，也不要提到工具次数。"
+)
+TOOL_LIMIT_FALLBACK = "\n\n（这次查了很多资料还没理清，可以换个问法或把问题拆小一点再试。）"
 
 TOOL_MARKER_RE = re.compile(r"<!--tool:\d+-->")
 
@@ -55,7 +70,6 @@ class AIService:
     def available_models(self) -> list[dict[str, Any]]:
         result = []
         for cfg in self.llm.get_chat_models():
-            transport = str(cfg.get("transport") or cfg.get("provider") or "").lower()
             result.append({
                 "id": cfg["id"],
                 "name": cfg.get("name", cfg["id"]),
@@ -65,7 +79,7 @@ class AIService:
                 "thinking_mode": cfg.get("thinking_mode", "never"),
                 "default_thinking": cfg.get("default_thinking", False),
                 "tags": cfg.get("tags", []),
-                "supports_reasoning_effort": transport.startswith("deepseek") or transport.startswith("anthropic"),
+                "supports_reasoning_effort": cfg.get("thinking_mode", "never") != "never",
             })
         return result
 
@@ -77,6 +91,9 @@ class AIService:
 
     def generate_title(self, user_message: str, assistant_message: str = "") -> str:
         return self.title.generate(user_message)
+
+    def suggest_followups(self, user_message: str, assistant_message: str) -> list[str]:
+        return self.title.suggest_followups(user_message, assistant_message)
 
     def chat_stream(
         self,
@@ -108,7 +125,9 @@ class AIService:
         hd_image = str(image_quality or "").strip().lower() == "hd"
         assistant_message_id = str(uuid.uuid4())
 
-        if self._is_billable_chat(cfg) and user_id:
+        billable = self._is_billable_chat(cfg)
+
+        if billable and user_id:
             ok, scope, quota_msg = self.usage.check(user_id, self.usage.CHAT_COST)
             if not ok:
                 yield {"type": "message_start", "message_id": assistant_message_id}
@@ -119,6 +138,8 @@ class AIService:
 
         content_parts: list[str] = []
         tool_trace: list[dict[str, Any]] = []
+        # 上游返回的思考过程（reasoning_content / reasoning），流给前端并随消息落库
+        reasoning_state: dict[str, Any] = {"parts": [], "started": None, "ended": None}
         llm_messages = self._build_messages(
             message=message,
             history=history or [],
@@ -132,6 +153,7 @@ class AIService:
         try:
             if self._should_stream_chat(cfg):
                 completed = yield from self._chat_with_stream(
+                    reasoning_state=reasoning_state,
                     llm_messages=llm_messages,
                     model_id=runtime_model_id,
                     effective_thinking=effective_thinking,
@@ -144,6 +166,7 @@ class AIService:
                     tool_trace=tool_trace,
                     content_parts=content_parts,
                     hd_image=hd_image,
+                    billable=billable,
                 )
             else:
                 completed = yield from self._chat_with_complete(
@@ -159,6 +182,7 @@ class AIService:
                     tool_trace=tool_trace,
                     content_parts=content_parts,
                     hd_image=hd_image,
+                    billable=billable,
                 )
             if completed is False:
                 return
@@ -168,6 +192,8 @@ class AIService:
                 session=session,
                 content="".join(content_parts),
                 tool_trace=tool_trace,
+                reasoning="".join(reasoning_state["parts"]),
+                reasoning_seconds=self._reasoning_seconds(reasoning_state),
             )
 
             yield {"type": "message_end", "message_id": assistant_message_id}
@@ -190,10 +216,25 @@ class AIService:
             return False
         return True
 
+    def _record_chat_usage(self, user_id: str, raw_usage: dict[str, Any] | None, model_id: str) -> None:
+        try:
+            cfg = self.llm.get_model_config(model_id)
+            spent = self.usage.record_chat_call(user_id, raw_usage, cfg)
+            print(f"[Usage] chat {model_id} 扣 {spent:g} credits (usage={raw_usage})")
+        except Exception as exc:
+            print(f"[Usage] record_chat_call failed: {type(exc).__name__}: {exc}")
+
+    def _record_image_usage(self, user_id: str, raw_usage: dict[str, Any] | None, hd: bool) -> None:
+        try:
+            cfg = self.llm.get_model_config("image_generator_hd" if hd else "image_generator")
+            spent = self.usage.record_image_call(user_id, raw_usage, cfg)
+            print(f"[Usage] image {cfg.get('model')} 扣 {spent:g} credits (usage={raw_usage})")
+        except Exception as exc:
+            print(f"[Usage] record_image_call failed: {type(exc).__name__}: {exc}")
+
     def _is_billable_chat(self, cfg: dict[str, Any]) -> bool:
-        """Campbell（anthropic-native）走计费；其他模型免费。"""
-        transport = str(cfg.get("transport") or cfg.get("provider") or "").strip().lower()
-        return transport.startswith("anthropic")
+        """models.json 里标记 billable 的模型走 Campbell 配额；其他模型免费。"""
+        return bool(cfg.get("billable"))
 
     def _chat_with_stream(
         self,
@@ -210,16 +251,41 @@ class AIService:
         tool_trace: list[dict[str, Any]],
         content_parts: list[str],
         hd_image: bool = False,
+        billable: bool = False,
+        reasoning_state: dict[str, Any] | None = None,
     ) -> Generator[dict[str, Any], None, None]:
         for _round in range(self.max_tool_rounds):
+            if _round > 0 and billable and user_id:
+                ok, scope, quota_msg = self.usage.check(user_id, self.usage.CHAT_COST)
+                if not ok:
+                    yield {"type": "error", "code": f"quota_{scope}", "message": quota_msg}
+                    return False
+
             round_content = ""
             parsed_calls = []
+            round_usage: dict[str, Any] | None = None
             tool_call_accumulators: dict[int, dict[str, Any]] = {}
+
+            # 最后一轮不给工具，逼模型用手里已有的结果作答，而不是吐一句"轮数已达上限"
+            final_round = _round == self.max_tool_rounds - 1
+            if final_round and _round > 0:
+                llm_messages.append({"role": "system", "content": FINAL_ROUND_NUDGE})
+            round_tools = None if final_round and _round > 0 else TOOLS
+
+            # 模型常在调工具前先说一句"我来搜索一下"，提示词压不住。开头一小段先扣着：
+            # 紧跟着出现工具调用就当作旁白丢掉，否则原样放出去。
+            held = "" if round_tools else None
+
+            def emit(text: str):
+                nonlocal round_content
+                round_content += text
+                content_parts.append(text)
+                return {"type": "content_delta", "delta": text}
 
             for chunk in self.llm.stream_chat_completion(
                 llm_messages,
                 model=model_id,
-                tools=TOOLS,
+                tools=round_tools,
                 enable_thinking=effective_thinking,
                 reasoning_effort=reasoning_effort,
             ):
@@ -227,12 +293,33 @@ class AIService:
                     yield {"type": "error", "message": chunk.get("content", "请求失败")}
                     return False
 
+                if chunk.get("type") == "usage":
+                    round_usage = chunk.get("usage")
+                    continue
+
                 delta = chunk.get("delta") or {}
+                reasoning = delta.get("reasoning_content") or delta.get("reasoning") or ""
+                if isinstance(reasoning, str) and reasoning:
+                    if reasoning_state is not None:
+                        now = time.monotonic()
+                        if reasoning_state["started"] is None:
+                            reasoning_state["started"] = now
+                        reasoning_state["ended"] = now
+                        reasoning_state["parts"].append(reasoning)
+                    yield {"type": "reasoning_delta", "delta": reasoning}
                 content = delta.get("content") or ""
                 if content:
-                    round_content += content
-                    content_parts.append(content)
-                    yield {"type": "content_delta", "delta": content}
+                    if held is None:
+                        yield emit(content)
+                    else:
+                        held += content
+                        if len(held) > PREAMBLE_HOLD_CHARS:
+                            yield emit(held)
+                            held = None
+
+                if delta.get("tool_calls") and held:
+                    print(f"[AI] 丢掉工具调用前的旁白: {held!r}")
+                    held = None
 
                 for tc_delta in delta.get("tool_calls") or []:
                     idx = int(tc_delta.get("index", 0))
@@ -250,6 +337,13 @@ class AIService:
                         accumulator["name"] = fn["name"]
                     if fn.get("arguments"):
                         accumulator["arguments"] += fn["arguments"]
+
+            if held and not tool_call_accumulators:
+                yield emit(held)
+            held = None
+
+            if billable and user_id:
+                self._record_chat_usage(user_id, round_usage, model_id)
 
             for idx in sorted(tool_call_accumulators.keys()):
                 call = tool_call_accumulators[idx]
@@ -288,7 +382,7 @@ class AIService:
                     hd_image=hd_image,
                 )
 
-        limit_text = "\n\n工具调用轮数已达上限。"
+        limit_text = TOOL_LIMIT_FALLBACK
         content_parts.append(limit_text)
         yield {"type": "content_delta", "delta": limit_text}
         return True
@@ -308,6 +402,7 @@ class AIService:
         tool_trace: list[dict[str, Any]],
         content_parts: list[str],
         hd_image: bool = False,
+        billable: bool = False,
     ) -> Generator[dict[str, Any], None, None]:
         runtime = self.llm.provider_runtime.build_state(
             messages=llm_messages,
@@ -323,7 +418,7 @@ class AIService:
         print(f"[Chat] runtime transport: {runtime.get('kind')} model={model_id}")
 
         for _round in range(self.max_tool_rounds):
-            if _round > 0 and user_id:
+            if _round > 0 and billable and user_id:
                 ok, scope, quota_msg = self.usage.check(user_id, self.usage.CHAT_COST)
                 if not ok:
                     yield {"type": "error", "code": f"quota_{scope}", "message": quota_msg}
@@ -334,11 +429,8 @@ class AIService:
                 yield {"type": "error", "message": "请求失败"}
                 return False
 
-            if user_id:
-                try:
-                    self.usage.record_chat_call(user_id)
-                except Exception as exc:
-                    print(f"[Usage] record_chat_call failed: {type(exc).__name__}: {exc}")
+            if billable and user_id:
+                self._record_chat_usage(user_id, response.get("usage"), model_id)
 
             content_text = strip_assistant_reasoning(response.get("content") or "")
             parsed_calls = response.get("tool_calls") or []
@@ -381,7 +473,7 @@ class AIService:
 
             self.llm.provider_runtime.append_tool_results(runtime, tool_results)
 
-        limit_text = "\n\n工具调用轮数已达上限。"
+        limit_text = TOOL_LIMIT_FALLBACK
         content_parts.append(limit_text)
         yield {"type": "content_delta", "delta": limit_text}
         return True
@@ -461,31 +553,6 @@ class AIService:
             except StopIteration as stop:
                 return stop.value or "工具执行完成"
 
-    def paper_assist(self, text: str, action: str) -> dict:
-        prompts = {
-            "explain": f"请详细解释以下学术内容，使用通俗易懂的语言：\n\n{text}",
-            "summarize": f"请简洁地总结以下内容的要点：\n\n{text}",
-            "translate": f"请将以下内容翻译成中文（如果已是中文则翻译成英文）：\n\n{text}",
-        }
-
-        prompt = prompts.get(action)
-        if not prompt:
-            return {"error": "无效的操作类型", "code": "INVALID_REQUEST"}
-
-        messages = [
-            {"role": "system", "content": "你是一个学术助手，帮助用户理解和处理学术论文内容。"},
-            {"role": "user", "content": prompt},
-        ]
-
-        result = ""
-        for chunk in self.llm.stream(messages):
-            if chunk["type"] == "error":
-                return {"error": chunk["content"], "code": "API_ERROR"}
-            if chunk["type"] == "content":
-                result += chunk["content"]
-
-        return {"result": strip_assistant_reasoning(result)}
-
     def _execute_tool_call(
         self,
         call: dict[str, Any],
@@ -504,6 +571,10 @@ class AIService:
 
         if name == "web_search":
             query = str(arguments.get("query") or "").strip()
+            searches_done = sum(1 for item in tool_trace if item.get("kind") == "search")
+            if searches_done >= MAX_SEARCHES_PER_ANSWER:
+                print(f"[Chat] 搜索次数已达 {searches_done}，跳过: {query}")
+                return SEARCH_BUDGET_EXHAUSTED
             trace = {"kind": "search", "query": query, "status": "running"}
             tool_trace.append(trace)
             yield {
@@ -512,14 +583,17 @@ class AIService:
                 "message_id": assistant_message_id,
                 "query": query,
             }
-            result = self.search.search(query) if query else ""
+            result, sources = self.search.search_with_sources(query) if query else ("", [])
             trace["status"] = "done"
             trace["success"] = bool(result and not result.startswith("搜索失败"))
+            if sources:
+                trace["sources"] = sources
             yield {
                 "type": "search_end",
                 "message_id": assistant_message_id,
                 "query": query,
                 "success": trace["success"],
+                "sources": sources,
             }
             return result or "搜索失败，请基于已有知识继续回答。"
 
@@ -604,7 +678,7 @@ class AIService:
                 )
                 if user_id:
                     try:
-                        self.usage.record_image_call(user_id)
+                        self._record_image_usage(user_id, result.get("usage"), hd_image)
                     except Exception as exc:
                         print(f"[Usage] record_image_call failed: {type(exc).__name__}: {exc}")
             yield {
@@ -733,7 +807,7 @@ class AIService:
                 )
                 if user_id:
                     try:
-                        self.usage.record_image_call(user_id)
+                        self._record_image_usage(user_id, result.get("usage"), hd_image)
                     except Exception as exc:
                         print(f"[Usage] record_image_call failed: {type(exc).__name__}: {exc}")
             yield {
@@ -794,7 +868,7 @@ class AIService:
     ) -> list[dict[str, Any]]:
         cfg = self.llm.get_model_config(model_id)
         prompt_id = str(cfg.get("prompt_id") or model_id)
-        system_prompt = get_system_prompt(prompt_id)
+        system_prompt = f"{get_system_prompt(prompt_id)}\n\n{current_time_context()}"
         asset_catalog = self.image.build_asset_catalog_message(
             session_id,
             images,
@@ -836,12 +910,21 @@ class AIService:
             messages.append({"role": "user", "content": parts})
         else:
             messages.append({"role": "user", "content": message})
+
+        # 上游通道会在更早的位置注入自己的产品人设，开头的身份提示词压不住它。
+        # 实测在消息列表末尾再锚一次身份，中英文越权提问才不会泄露底层模型。
+        if cfg.get("identity_guard"):
+            series = prompt_id.capitalize() if prompt_id else None
+            messages.append({"role": "system", "content": get_identity_reminder(series)})
         return messages
 
     def _strip_tool_markers(self, content: str) -> str:
         return TOOL_MARKER_RE.sub("", content or "").strip()
 
     def _is_vision_blind_transport(self, cfg: dict[str, Any]) -> bool:
+        # models.json 里显式写了 vision 就以它为准；deepseek-flash 现在能直接看图
+        if "vision" in cfg:
+            return not bool(cfg.get("vision"))
         transport = str(cfg.get("transport") or cfg.get("provider") or "").strip().lower()
         return transport.startswith("deepseek")
 
@@ -896,6 +979,7 @@ class AIService:
                     ],
                 }],
                 model="image_describer",
+                enable_thinking=False,
             )
         except Exception as exc:
             print(f"[vision-preprocess] 描述失败: {type(exc).__name__}: {exc}")
@@ -958,6 +1042,12 @@ class AIService:
             return bool(thinking)
         return False
 
+    @staticmethod
+    def _reasoning_seconds(state: dict[str, Any]) -> int | None:
+        if state.get("started") is None or state.get("ended") is None:
+            return None
+        return max(1, round(state["ended"] - state["started"]))
+
     def _save_assistant_message(
         self,
         *,
@@ -965,6 +1055,8 @@ class AIService:
         session: ChatSession | None,
         content: str,
         tool_trace: list[dict[str, Any]],
+        reasoning: str = "",
+        reasoning_seconds: int | None = None,
     ) -> None:
         if not session:
             return
@@ -976,6 +1068,8 @@ class AIService:
             role="assistant",
             content=stored_content,
             tool_trace=json.dumps(tool_trace, ensure_ascii=False) if tool_trace else None,
+            reasoning=reasoning or None,
+            reasoning_seconds=reasoning_seconds if reasoning else None,
         )
         db.session.add(assistant_message)
         session.updated_at = datetime.utcnow()

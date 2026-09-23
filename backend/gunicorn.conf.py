@@ -1,6 +1,8 @@
 """
-Gunicorn 配置文件
+Gunicorn 配置文件（FastAPI / ASGI）
 适用于 2核2G 服务器，可用内存约 700M
+
+启动：gunicorn -c gunicorn.conf.py asgi:app
 """
 
 import os
@@ -9,12 +11,16 @@ import os
 bind = os.environ.get("GUNICORN_BIND", "0.0.0.0:5003")
 
 # Worker 配置
-workers = int(os.environ.get("GUNICORN_WORKERS", 1))  # 小内存机器用 1 个 worker
-worker_class = "gevent"  # 协程模式，支持高并发长连接
-worker_connections = int(os.environ.get("GUNICORN_CONNECTIONS", 50))  # 每个 worker 50 并发
+# 小内存机器用 1 个 worker。并发靠事件循环 + 线程池：普通接口在线程池里跑，
+# SSE 流由后台线程生产、事件循环转发，长连接不会占满 worker。
+workers = int(os.environ.get("GUNICORN_WORKERS", 1))
+worker_class = "uvicorn_worker.UvicornWorker"
 
-# 超时配置（SSE 长连接和长任务需要更长超时）
-timeout = 300
+# 超时配置
+# uvicorn worker 的心跳由事件循环维持，长请求本身不会触发 timeout；
+# 这里保留一个宽松值，只用于回收真正卡死的 worker。
+# HD 出图的上限见 services/image.py 的 IMAGE_GEN_HD_TIMEOUT（900s）。
+timeout = 1200
 graceful_timeout = 30
 keepalive = 5
 
@@ -22,12 +28,11 @@ keepalive = 5
 accesslog = "-"  # stdout
 errorlog = "-"   # stderr
 loglevel = os.environ.get("GUNICORN_LOG_LEVEL", "info")
-access_log_format = '%(h)s %(l)s %(u)s %(t)s "%(r)s" %(s)s %(b)s "%(f)s" "%(a)s" %(D)sμs'
 
 # 进程管理
 daemon = False
 pidfile = None
-preload_app = False  # gevent 不建议 preload
+preload_app = False
 
 # 安全
 limit_request_line = 4094

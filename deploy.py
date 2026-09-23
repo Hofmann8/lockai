@@ -2,7 +2,7 @@
 LockAI 部署打包脚本
 生成两个 zip：
   - lockai-frontend.zip  (Next.js standalone + static + public)
-  - lockai-backend.zip   (Flask 后端 + .env + db + models.json)
+  - lockai-backend.zip   (FastAPI 后端 + .env + db + models.json)
 两个包内部都不套额外目录，解压即用。
 """
 
@@ -25,20 +25,23 @@ PUBLIC_DIR = FRONTEND_DIR / "public"
 # 后端需要打包的顶层文件
 BACKEND_FILES = [
     "app.py",
+    "asgi.py",
     "wsgi.py",
+    "database.py",
+    "schemas.py",
+    "sse.py",
     "models.py",
     "models.json",
     "gunicorn.conf.py",
     "requirements.txt",
     ".env",
-    "dev_routes.py",
 ]
 
 # 后端需要打包的目录
 BACKEND_DIRS = [
     "services",
-    "templates",
     "instance",
+    "scripts",
 ]
 
 # 排除模式
@@ -46,6 +49,7 @@ EXCLUDE_PATTERNS = {
     "__pycache__",
     ".pytest_cache",
     "_tmp_runtime",
+    "tmp",
     ".pyc",
 }
 

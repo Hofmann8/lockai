@@ -2,8 +2,8 @@
 图像生成与编辑服务
 
 通过代理 (vectorengine.ai 等) 调用 OpenAI 兼容的图片生成接口：
-- Campbell 1.5 Image (默认): gemini-3-pro-image-preview，实时
-- Campbell 2.0 Image (hd):  gpt-image-2，高清但较慢
+- Campbell 2.5 Image (默认): gpt-image-2.5-flare，出图较快
+- Campbell 3.0 Image (hd):  gpt-image-2.5-sunburst，高清但较慢
 """
 
 import base64
@@ -14,6 +14,8 @@ import re
 from math import gcd
 
 import httpx
+
+from .http_client import build_http_client
 
 from .tool_contracts import (
     DEFAULT_IMAGE_ASPECT_RATIO,
@@ -41,7 +43,7 @@ class ImageService:
 
     @staticmethod
     def model_label(hd: bool) -> str:
-        return "Campbell 2.0 Image" if hd else "Campbell 1.5 Image"
+        return "Campbell 3.0 Image" if hd else "Campbell 2.5 Image"
 
     def build_request_prompt(self, request_or_prompt) -> str:
         request = self._normalize_image_request(request_or_prompt)
@@ -93,13 +95,13 @@ class ImageService:
             print(f"[Image] 使用参考图 {len(reference_sources)} 张")
 
         if self._is_gemini_model(cfg.get("model")):
-            extracted, failure = self._gemini_generate(
+            extracted, failure, api_usage = self._gemini_generate(
                 cfg, api_key, image_request, prompt,
                 reference_sources=reference_sources,
                 hd=hd,
             )
         else:
-            extracted, failure = self._openai_generate(
+            extracted, failure, api_usage = self._openai_generate(
                 cfg, api_key, image_request, prompt,
                 reference_sources=reference_sources,
                 hd=hd,
@@ -117,6 +119,7 @@ class ImageService:
         )
         if result.get("success"):
             result["model_label"] = self.model_label(hd)
+            result["usage"] = api_usage
         return result
 
     def edit(
@@ -163,7 +166,7 @@ class ImageService:
         print(f"\n[Image] 编辑图片({self.model_label(hd)}): {prompt[:80]}...")
 
         if self._is_gemini_model(cfg.get("edit_model") or cfg.get("model")):
-            extracted, failure = self._gemini_edit(
+            extracted, failure, api_usage = self._gemini_edit(
                 cfg, api_key, effective_request, prompt,
                 source_url=source_url_clean,
                 source_bytes=source_bytes,
@@ -171,7 +174,7 @@ class ImageService:
                 hd=hd,
             )
         else:
-            extracted, failure = self._openai_edit(
+            extracted, failure, api_usage = self._openai_edit(
                 cfg, api_key, effective_request, prompt,
                 source_url=source_url_clean,
                 source_bytes=source_bytes,
@@ -191,6 +194,7 @@ class ImageService:
         )
         if result.get("success"):
             result["model_label"] = self.model_label(hd)
+            result["usage"] = api_usage
             result["source_image_id"] = source_candidate["assetId"]
             result["source_image_url"] = source_candidate["url"]
             result["source_label"] = source_candidate["label"]
@@ -265,7 +269,7 @@ class ImageService:
         files: list,
         data: dict,
         hd: bool = False,
-    ) -> tuple[tuple[bytes, str] | None, str | None]:
+    ) -> tuple[tuple[bytes, str] | None, str | None, dict | None]:
         url = self._build_openai_image_edit_url(cfg)
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -273,22 +277,23 @@ class ImageService:
         }
         timeout = IMAGE_GEN_HD_TIMEOUT if hd else IMAGE_GEN_TIMEOUT
         try:
-            with httpx.Client(timeout=timeout) as client:
+            with build_http_client(timeout) as client:
                 resp = client.post(url, headers=headers, files=files, data=data)
             print(f"[Image] openai_image_edit: HTTP {resp.status_code}")
             if resp.status_code != 200:
                 error_text = self._format_http_error(resp)
                 print(f"[Image] openai_image_edit 错误: {error_text}")
-                return None, self._translate_openai_error(resp.status_code, error_text)
-            extracted = self._extract_openai_image(resp.json())
+                return None, self._translate_openai_error(resp.status_code, error_text), None
+            data = resp.json()
+            extracted = self._extract_openai_image(data)
             if not extracted:
-                return None, "上游未返回图片数据"
-            return extracted, None
+                return None, "上游未返回图片数据", None
+            return extracted, None, data.get("usage")
         except httpx.TimeoutException:
-            return None, "图片服务超时，请稍后重试"
+            return None, "图片服务超时，请稍后重试", None
         except Exception as exc:
             print(f"[Image] openai_image_edit 异常: {type(exc).__name__}: {exc}")
-            return None, f"图片服务请求异常: {type(exc).__name__}"
+            return None, f"图片服务请求异常: {type(exc).__name__}", None
 
     def _request_openai_image(
         self,
@@ -296,7 +301,7 @@ class ImageService:
         api_key: str,
         payload: dict,
         hd: bool = False,
-    ) -> tuple[tuple[bytes, str] | None, str | None]:
+    ) -> tuple[tuple[bytes, str] | None, str | None, dict | None]:
         url = self._build_openai_image_url(cfg)
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -305,23 +310,24 @@ class ImageService:
         }
         timeout = IMAGE_GEN_HD_TIMEOUT if hd else IMAGE_GEN_TIMEOUT
         try:
-            with httpx.Client(timeout=timeout) as client:
+            with build_http_client(timeout) as client:
                 resp = client.post(url, headers=headers, json=payload)
             print(f"[Image] openai_image: HTTP {resp.status_code}")
             if resp.status_code != 200:
                 error_text = self._format_http_error(resp)
                 print(f"[Image] openai_image 错误: {error_text}")
-                return None, self._translate_openai_error(resp.status_code, error_text)
+                return None, self._translate_openai_error(resp.status_code, error_text), None
 
-            extracted = self._extract_openai_image(resp.json())
+            data = resp.json()
+            extracted = self._extract_openai_image(data)
             if not extracted:
-                return None, "上游未返回图片数据"
-            return extracted, None
+                return None, "上游未返回图片数据", None
+            return extracted, None, data.get("usage")
         except httpx.TimeoutException:
-            return None, "图片服务超时，请稍后重试"
+            return None, "图片服务超时，请稍后重试", None
         except Exception as exc:
             print(f"[Image] openai_image 异常: {type(exc).__name__}: {exc}")
-            return None, f"图片服务请求异常: {type(exc).__name__}"
+            return None, f"图片服务请求异常: {type(exc).__name__}", None
 
     @staticmethod
     def _is_gemini_model(model_id) -> bool:
@@ -355,14 +361,14 @@ class ImageService:
         prompt: str,
         reference_sources: list[dict] | None = None,
         hd: bool = False,
-    ) -> tuple[tuple[bytes, str] | None, str | None]:
-        # gpt-image-2 的 /v1/images/generations 不接受图片输入。
+    ) -> tuple[tuple[bytes, str] | None, str | None, dict | None]:
+        # gpt-image 系列的 /v1/images/generations 不接受图片输入。
         # 当传了参考图时，统一走 /v1/images/edits 的 multipart 路径，把所有参考图作为 image 字段一起上传。
         if reference_sources:
             return self._openai_generate_with_refs(cfg, api_key, image_request, prompt, reference_sources, hd=hd)
         payload = self._build_openai_image_payload(cfg, image_request, prompt)
         if not payload:
-            return None, "缺少绘图描述"
+            return None, "缺少绘图描述", None
         return self._request_openai_image(cfg, api_key, payload, hd=hd)
 
     def _openai_generate_with_refs(
@@ -373,16 +379,16 @@ class ImageService:
         prompt: str,
         reference_sources: list[dict],
         hd: bool = False,
-    ) -> tuple[tuple[bytes, str] | None, str | None]:
+    ) -> tuple[tuple[bytes, str] | None, str | None, dict | None]:
         prompt_clean = self._clean_optional_string(prompt)
         if not prompt_clean:
-            return None, "缺少绘图描述"
+            return None, "缺少绘图描述", None
         if len(prompt_clean) > 1000:
             prompt_clean = prompt_clean[:1000]
         model_id = (
             self._clean_optional_string(cfg.get("edit_model"))
             or self._clean_optional_string(cfg.get("model"))
-            or "gpt-image-2"
+            or "gpt-image-2.5-sunburst"
         )
         size = self._map_openai_size(image_request.get("imageConfig"))
         quality = self._map_openai_quality(image_request.get("imageConfig"))
@@ -415,20 +421,20 @@ class ImageService:
         source_bytes: bytes | None = None,
         source_mime: str | None = None,
         hd: bool = False,
-    ) -> tuple[tuple[bytes, str] | None, str | None]:
+    ) -> tuple[tuple[bytes, str] | None, str | None, dict | None]:
         if not source_bytes:
             if not self._clean_optional_string(source_url):
-                return None, "缺少源图地址"
+                return None, "缺少源图地址", None
             source_bytes, fetched_mime = self._download_source_image(source_url)
             if not source_bytes:
-                return None, "源图下载失败"
+                return None, "源图下载失败", None
             source_mime = source_mime or fetched_mime
         prompt_clean = self._clean_optional_string(prompt)
         if not prompt_clean:
-            return None, "缺少绘图描述"
+            return None, "缺少绘图描述", None
         if len(prompt_clean) > 1000:
             prompt_clean = prompt_clean[:1000]
-        model_id = self._clean_optional_string(cfg.get("edit_model")) or "gpt-image-2"
+        model_id = self._clean_optional_string(cfg.get("edit_model")) or "gpt-image-2.5-sunburst"
         size = self._map_openai_size(edit_request.get("imageConfig"))
         quality = self._map_openai_quality(edit_request.get("imageConfig"))
         mime = source_mime or "image/png"
@@ -456,8 +462,8 @@ class ImageService:
         prompt: str,
         reference_sources: list[dict] | None = None,
         hd: bool = False,
-    ) -> tuple[tuple[bytes, str] | None, str | None]:
-        model_id = self._clean_optional_string(cfg.get("model")) or "gemini-3-pro-image-preview"
+    ) -> tuple[tuple[bytes, str] | None, str | None, dict | None]:
+        model_id = self._clean_optional_string(cfg.get("model")) or "gpt-image-2.5-flare"
         parts: list[dict] = [{"text": prompt[:4000]}]
         for ref in reference_sources or []:
             mime = ref.get("mime") or "image/png"
@@ -483,8 +489,8 @@ class ImageService:
         source_bytes: bytes | None = None,
         source_mime: str | None = None,
         hd: bool = False,
-    ) -> tuple[tuple[bytes, str] | None, str | None]:
-        model_id = self._clean_optional_string(cfg.get("edit_model")) or self._clean_optional_string(cfg.get("model")) or "gemini-3-pro-image-preview"
+    ) -> tuple[tuple[bytes, str] | None, str | None, dict | None]:
+        model_id = self._clean_optional_string(cfg.get("edit_model")) or self._clean_optional_string(cfg.get("model")) or "gpt-image-2.5-flare"
         mime = source_mime or "image/png"
         if self._clean_optional_string(source_url):
             image_part = {"file_data": {"mime_type": mime, "file_uri": source_url.strip()}}
@@ -492,7 +498,7 @@ class ImageService:
             b64 = base64.b64encode(source_bytes).decode("utf-8")
             image_part = {"inline_data": {"mime_type": mime, "data": b64}}
         else:
-            return None, "缺少源图数据"
+            return None, "缺少源图数据", None
         body = {
             "contents": [{
                 "parts": [
@@ -510,7 +516,7 @@ class ImageService:
         api_key: str,
         model_id: str,
         body: dict,
-    ) -> tuple[tuple[bytes, str] | None, str | None]:
+    ) -> tuple[tuple[bytes, str] | None, str | None, dict | None]:
         url = self._build_gemini_image_url(cfg, model_id)
         headers = {
             "Authorization": f"Bearer {api_key}",
@@ -519,22 +525,23 @@ class ImageService:
         }
         params = {"key": api_key}
         try:
-            with httpx.Client(timeout=IMAGE_GEN_TIMEOUT) as client:
+            with build_http_client(IMAGE_GEN_TIMEOUT) as client:
                 resp = client.post(url, headers=headers, params=params, json=body)
             print(f"[Image] gemini_image: HTTP {resp.status_code}")
             if resp.status_code != 200:
                 error_text = self._format_http_error(resp)
                 print(f"[Image] gemini_image 错误: {error_text}")
-                return None, self._translate_openai_error(resp.status_code, error_text)
-            extracted = self._extract_gemini_image(resp.json())
+                return None, self._translate_openai_error(resp.status_code, error_text), None
+            data = resp.json()
+            extracted = self._extract_gemini_image(data)
             if not extracted:
-                return None, "上游未返回图片数据"
-            return extracted, None
+                return None, "上游未返回图片数据", None
+            return extracted, None, data.get("usageMetadata")
         except httpx.TimeoutException:
-            return None, "图片服务超时，请稍后重试"
+            return None, "图片服务超时，请稍后重试", None
         except Exception as exc:
             print(f"[Image] gemini_image 异常: {type(exc).__name__}: {exc}")
-            return None, f"图片服务请求异常: {type(exc).__name__}"
+            return None, f"图片服务请求异常: {type(exc).__name__}", None
 
     def _extract_gemini_image(self, data: dict) -> tuple[bytes, str] | None:
         candidates = data.get("candidates") or []
@@ -841,7 +848,7 @@ class ImageService:
 
         size = self._map_openai_size(image_request.get("imageConfig"))
         quality = self._map_openai_quality(image_request.get("imageConfig"))
-        model_id = self._clean_optional_string(cfg.get("model")) or "gpt-image-2"
+        model_id = self._clean_optional_string(cfg.get("model")) or "gpt-image-2.5-sunburst"
 
         payload: dict = {
             "model": model_id,
@@ -869,7 +876,7 @@ class ImageService:
 
         size = self._map_openai_size(edit_request.get("imageConfig"))
         quality = self._map_openai_quality(edit_request.get("imageConfig"))
-        model_id = self._clean_optional_string(cfg.get("edit_model")) or "gpt-image-2"
+        model_id = self._clean_optional_string(cfg.get("edit_model")) or "gpt-image-2.5-sunburst"
 
         payload: dict = {
             "model": model_id,
@@ -1205,7 +1212,7 @@ class ImageService:
     def _download_source_image(self, url: str) -> tuple[bytes | None, str | None]:
         try:
             fetch_url = url.split("?", 1)[0] if "?mark=" in url else url
-            with httpx.Client(timeout=IMAGE_GEN_TIMEOUT) as client:
+            with build_http_client(IMAGE_GEN_TIMEOUT) as client:
                 resp = client.get(fetch_url)
             if resp.status_code != 200:
                 return None, None
@@ -1411,13 +1418,6 @@ class ImageService:
         explicit_key = self._clean_optional_string(cfg.get("image_api_key"))
         if explicit_key:
             return explicit_key
-
-        dedicated_env_key = (
-            self._clean_optional_string(os.environ.get("IMAGE_API_KEY"))
-            or self._clean_optional_string(os.environ.get("API_KEY_PAPER"))
-        )
-        if dedicated_env_key:
-            return dedicated_env_key
 
         fallback_key = self.llm.get_api_key(cfg)
         return self._clean_optional_string(fallback_key)

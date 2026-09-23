@@ -1,4 +1,11 @@
 // Chat messages
+export interface SearchSource {
+  title: string;
+  url: string;
+  site: string;
+  icon?: string;
+}
+
 export interface SearchToolTrace {
   kind: 'search';
   query: string;
@@ -6,6 +13,7 @@ export interface SearchToolTrace {
   success?: boolean;
   startedAtMs?: number;
   durationSeconds?: number;
+  sources?: SearchSource[];
 }
 
 export interface ImageGenRequest {
@@ -67,10 +75,14 @@ export type ToolTrace = SearchToolTrace | ImageGenToolTrace;
 
 export interface ChatMessage {
   id: string;
+  /** 流式期间的临时 id；回答结束换成服务端 id 后仍用它做 React key，避免重挂载闪烁 */
+  clientKey?: string;
   role: 'user' | 'assistant';
   content: string;
   images?: string[];
   tool_trace?: ToolTrace[];
+  reasoning?: string;
+  reasoning_seconds?: number;
   timestamp: Date;
 }
 
@@ -79,6 +91,7 @@ export interface ChatSession {
   id: string;
   title: string;
   model_id: string;
+  pinned?: boolean;
   messages: ChatMessage[];
   createdAt: Date;
   updatedAt: Date;
@@ -130,7 +143,6 @@ export interface RealtimeAsrEvent {
   message?: string;
   ts?: number;
   session_id?: string;
-  paper_id?: string;
 }
 
 // Streaming events
@@ -141,6 +153,11 @@ export interface StreamMessageStartEvent {
 
 export interface StreamContentDeltaEvent {
   type: 'content_delta';
+  delta: string;
+}
+
+export interface StreamReasoningDeltaEvent {
+  type: 'reasoning_delta';
   delta: string;
 }
 
@@ -155,6 +172,7 @@ export interface StreamSearchEndEvent {
   message_id?: string;
   query: string;
   success: boolean;
+  sources?: SearchSource[];
 }
 
 export interface StreamImageGenStartEvent {
@@ -202,11 +220,13 @@ export interface StreamTitleUpdateEvent {
 export interface StreamErrorEvent {
   type: 'error';
   message: string;
+  code?: string;
 }
 
 export type StreamEvent =
   | StreamMessageStartEvent
   | StreamContentDeltaEvent
+  | StreamReasoningDeltaEvent
   | StreamSearchStartEvent
   | StreamSearchEndEvent
   | StreamImageGenStartEvent
@@ -233,66 +253,9 @@ export interface ChatState {
   error: string | null;
 }
 
-// Paper AI assistance
-export interface PaperAssistRequest {
-  text: string;
-  action: 'explain' | 'summarize' | 'translate';
-}
-
-export interface PaperAssistResponse {
-  result: string;
-  error?: string;
-}
-
-// Paper state
-export interface PaperState {
-  latexContent: string;
-  pdfFile: File | null;
-  currentPage: number;
-  totalPages: number;
-  zoom: number;
-  selectedText: string;
-  aiAssistResult: string | null;
-  isAiLoading: boolean;
-}
-
 // Errors
 export interface ErrorResponse {
   error: string;
   code: string;
   details?: string;
-}
-
-// Paper generation types
-export interface PaperGenerateRequest {
-  topic: string;
-  user_id?: string;
-  design_context?: string;
-  paper_id?: string;
-}
-
-export interface PaperReviseRequest {
-  instruction: string;
-}
-
-export interface PaperRecord {
-  id: string;
-  topic: string;
-  status: string;
-  pdf_url: string | null;
-  progress_detail?: string | null;
-  error?: string | null;
-  created_at: string;
-  completed_at: string | null;
-}
-
-export interface PaperFiles {
-  id: string;
-  topic: string;
-  files: string[];
-}
-
-export interface PaperFileContent {
-  path: string;
-  content: string;
 }

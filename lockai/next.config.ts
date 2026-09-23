@@ -2,7 +2,6 @@ import type { NextConfig } from 'next';
 
 const nextConfig: NextConfig = {
   output: 'standalone',
-  serverExternalPackages: ['pdfjs-dist'],
   images: {
     unoptimized: process.env.NODE_ENV === 'development',
     remotePatterns: [

@@ -6,6 +6,8 @@ export interface ChatSettings {
   selectedModelId: string | null;
   thinkingLevel: ThinkingLevel;
   imageQuality: ImageQuality;
+  /** 回答结束后给出追问建议 */
+  suggestions: boolean;
 }
 
 const SETTINGS_KEY = 'lockai_settings';
@@ -15,6 +17,7 @@ const defaultSettings: ChatSettings = {
   selectedModelId: 'campbell',
   thinkingLevel: 'standard',
   imageQuality: 'standard',
+  suggestions: true,
 };
 
 function normalizeSettings(raw: Record<string, unknown>): ChatSettings {
@@ -27,6 +30,7 @@ function normalizeSettings(raw: Record<string, unknown>): ChatSettings {
   if (!['standard', 'hd'].includes(merged.imageQuality as string)) {
     merged.imageQuality = 'standard';
   }
+  merged.suggestions = merged.suggestions !== false;
   return merged;
 }
 

@@ -1,15 +1,11 @@
 """
-WSGI 入口文件
-生产环境使用 gunicorn 启动
+兼容入口：后端已从 Flask 迁到 FastAPI，这里不再是 WSGI 应用。
 
-启动命令（2核2G服务器推荐配置）：
-    gunicorn -c gunicorn.conf.py wsgi:app
-
-或直接命令行：
-    gunicorn -w 1 -k gevent --worker-connections 50 -b 0.0.0.0:5000 wsgi:app
+保留这个文件是为了让服务器上旧的启动命令 `gunicorn -c gunicorn.conf.py wsgi:app` 继续可用，
+gunicorn.conf.py 已经把 worker 换成了 uvicorn worker。新部署请改用 `asgi:app`。
+不要在这里恢复 gevent 的 monkey.patch_all()，它和 asyncio 事件循环冲突。
 """
 
-from app import app
+from asgi import app
 
-if __name__ == "__main__":
-    app.run()
+__all__ = ["app"]

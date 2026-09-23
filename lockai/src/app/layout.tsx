@@ -1,7 +1,8 @@
-import type { Metadata } from "next";
-import { Geist, Geist_Mono, Quicksand } from "next/font/google";
+import type { Metadata, Viewport } from "next";
+import { Fraunces, Geist, Geist_Mono, Noto_Serif_SC } from "next/font/google";
 import "./globals.css";
 import { ThemeProvider } from "@/lib/theme";
+import { Toaster } from "@/components/ui/Toast";
 
 const geistSans = Geist({
   variable: "--font-geist-sans",
@@ -13,19 +14,48 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
-const quicksand = Quicksand({
-  variable: "--font-logo",
-  weight: ["600"],
+// 只用在字标和少量展示性标题上：带一点 70 年代的软圆衬线
+const fraunces = Fraunces({
+  variable: "--font-fraunces",
   subsets: ["latin"],
+  axes: ["SOFT", "WONK", "opsz"],
+  style: ["normal", "italic"],
+});
+
+const notoSerifSC = Noto_Serif_SC({
+  variable: "--font-serif-sc",
+  weight: ["500", "600"],
+  preload: false,
+  display: "swap",
 });
 
 export const metadata: Metadata = {
-  title: "LockAI - Funk&Love AI Platform",
+  title: "LockAI",
   description: "浙江大学 DFM 街舞社 Funk&Love 舞队内部 AI 应用平台",
   icons: {
     icon: "/favicon.ico",
   },
 };
+
+export const viewport: Viewport = {
+  themeColor: [
+    { media: "(prefers-color-scheme: light)", color: "#faf9f7" },
+    { media: "(prefers-color-scheme: dark)", color: "#161412" },
+  ],
+  width: "device-width",
+  initialScale: 1,
+  viewportFit: "cover",
+};
+
+const themeBootstrap = `
+(function() {
+  try {
+    var theme = localStorage.getItem('lockai-theme');
+    var dark = theme === 'dark' || ((theme === 'system' || !theme) && window.matchMedia('(prefers-color-scheme: dark)').matches);
+    document.documentElement.classList.add(dark ? 'dark' : 'light');
+  } catch (e) {}
+})();
+`;
 
 export default function RootLayout({
   children,
@@ -35,29 +65,14 @@ export default function RootLayout({
   return (
     <html lang="zh-CN" suppressHydrationWarning>
       <head>
-        <link rel="icon" href="/favicon.ico" />
-        <script
-          dangerouslySetInnerHTML={{
-            __html: `
-              (function() {
-                try {
-                  var theme = localStorage.getItem('lockai-theme');
-                  if (theme === 'dark' || (theme === 'system' || !theme) && window.matchMedia('(prefers-color-scheme: dark)').matches) {
-                    document.documentElement.classList.add('dark');
-                  } else if (theme === 'light') {
-                    document.documentElement.classList.add('light');
-                  }
-                } catch (e) {}
-              })();
-            `,
-          }}
-        />
+        <script dangerouslySetInnerHTML={{ __html: themeBootstrap }} />
       </head>
       <body
-        className={`${geistSans.variable} ${geistMono.variable} ${quicksand.variable} antialiased`}
+        className={`${geistSans.variable} ${geistMono.variable} ${fraunces.variable} ${notoSerifSC.variable} antialiased`}
       >
         <ThemeProvider>
           {children}
+          <Toaster />
         </ThemeProvider>
       </body>
     </html>

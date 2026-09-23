@@ -8,11 +8,9 @@
 # Environment & Secrets (重要！包含 API 密钥)
 # ============================================
 .env
-.env.local
-.env.*.local
-.env.production
+.env.*
 *.env
-backend/.env
+!.env.example
 !*.env.example
 
 # ============================================
@@ -73,6 +71,9 @@ coverage.xml
 # Flask / SQLite
 instance/
 *.db
+*.db-journal
+*.db-wal
+*.db-shm
 *.sqlite
 *.sqlite3
 
@@ -156,7 +157,14 @@ temp/
 *.pem
 *.key
 *.crt
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
 .cache/
+
+# AI 助手的本地配置 / 记忆
+.claude/
 
 # Deploy artifacts
 *.zip

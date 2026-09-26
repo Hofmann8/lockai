@@ -1,0 +1,62 @@
+#!/usr/bin/env python3
+"""typst 命令行的替身：镜像里装的是 Python 绑定（typst-py），这里接住最常用的写法。
+
+    typst compile main.typ [out.pdf] [--format pdf|png|svg] [--ppi 144] [--root DIR] [--font-path DIR]
+    typst fonts
+    typst --version
+"""
+
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+import typst
+
+
+def main() -> int:
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    if argv[0] in ("-V", "--version"):
+        print(f"typst (typst-py {getattr(typst, '__version__', '')})")
+        return 0
+    if argv[0] == "fonts":
+        return subprocess.call(["fc-list", ":", "family"])
+    if argv[0] not in ("compile", "c"):
+        print(f"这里只支持 typst compile（收到：{argv[0]}）；watch 可以改成改完再 compile 一次", file=sys.stderr)
+        return 2
+
+    parser = argparse.ArgumentParser(prog="typst compile")
+    parser.add_argument("input")
+    parser.add_argument("output", nargs="?")
+    parser.add_argument("-f", "--format", choices=["pdf", "png", "svg"])
+    parser.add_argument("--ppi", type=float, default=144.0)
+    parser.add_argument("--root")
+    parser.add_argument("--font-path", action="append", default=[])
+    args = parser.parse_args(argv[1:])
+
+    source = Path(args.input)
+    fmt = args.format or (Path(args.output).suffix.lstrip(".") if args.output else "pdf") or "pdf"
+    output = args.output or str(source.with_suffix(f".{fmt}"))
+    # 多页导出图片时 typst 用 {p} 占位页码
+    if fmt in ("png", "svg") and "{p}" not in output and "{n}" not in output:
+        output = str(Path(output).with_name(f"{Path(output).stem}-{{p}}{Path(output).suffix}"))
+    try:
+        typst.compile(
+            str(source),
+            output=output,
+            format=fmt,
+            ppi=args.ppi,
+            root=args.root,
+            font_paths=args.font_path,
+        )
+    except Exception as exc:  # typst 的编译错误带行号，原样给出来
+        print(exc, file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

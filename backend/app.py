@@ -10,11 +10,12 @@ import json
 import os
 import tempfile
 import uuid
+from urllib.parse import quote
 from datetime import datetime
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import Body, FastAPI, File, Request, UploadFile
+from fastapi import Body, FastAPI, File, Form, Request, UploadFile
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
@@ -29,6 +30,7 @@ from schemas import (
     ChatBody,
     CreateSessionBody,
     GenerateTitleBody,
+    StopRunBody,
     TruncateBody,
     UpdateSessionBody,
     SuggestionsBody,
@@ -36,8 +38,10 @@ from schemas import (
 )
 from services.ai import AIService
 from services.asr import ASRService, ASRServiceError, RealtimeASRSessionManager
+from services.sandbox import guess_mime, safe_filename, safe_relpath
 from services.storage import StorageService
 from sse import HEARTBEAT, StreamFailed, iterate_in_thread, poll_queue, sse_response
+from services.runs import HEARTBEAT as RUNS_HEARTBEAT, MAX_PER_USER as RUNS_PER_USER, RunLimit, runs
 
 load_dotenv()
 
@@ -69,6 +73,8 @@ def init_database() -> None:
         for column, ddl in (
             ('reasoning', 'ALTER TABLE chat_messages ADD COLUMN reasoning TEXT'),
             ('reasoning_seconds', 'ALTER TABLE chat_messages ADD COLUMN reasoning_seconds INTEGER'),
+            ('reasoning_tokens', 'ALTER TABLE chat_messages ADD COLUMN reasoning_tokens INTEGER'),
+            ('files', 'ALTER TABLE chat_messages ADD COLUMN files TEXT'),
         ):
             if column not in message_columns:
                 db.session.execute(text(ddl))
@@ -83,6 +89,10 @@ def init_database() -> None:
             db.session.execute(text("ALTER TABLE chat_sessions ADD COLUMN pinned BOOLEAN NOT NULL DEFAULT 0"))
             db.session.commit()
             print("[DB] 已添加 chat_sessions.pinned 列")
+        if 'sandbox_id' not in session_columns:
+            db.session.execute(text("ALTER TABLE chat_sessions ADD COLUMN sandbox_id TEXT"))
+            db.session.commit()
+            print("[DB] 已添加 chat_sessions.sandbox_id 列")
         usage_columns = [c['name'] for c in inspector.get_columns('campbell_usages')]
         for column, ddl in (
             ('new_input_units', 'ALTER TABLE campbell_usages ADD COLUMN new_input_units FLOAT DEFAULT 0'),
@@ -133,7 +143,7 @@ class DatabaseScopeMiddleware:
             await self.app(scope, receive, send)
 
 
-app = FastAPI(title="LockAI API", version="0.8")
+app = FastAPI(title="LockAI API", version="1.0.0")
 app.add_middleware(DatabaseScopeMiddleware)
 app.add_middleware(
     CORSMiddleware,
@@ -201,7 +211,8 @@ def get_sessions(user_id: str | None = None):
         .limit(50)
         .all()
     )
-    return [s.to_dict() for s in sessions]
+    running = runs.running_sessions(user_id)
+    return [{**s.to_dict(), "running": s.id in running} for s in sessions]
 
 
 @app.post("/api/sessions")
@@ -232,6 +243,8 @@ def get_session(session_id: str):
     messages = ChatMessage.query.filter_by(session_id=session_id).order_by(ChatMessage.created_at).all()
     result = session.to_dict()
     result['messages'] = [m.to_dict() for m in messages]
+    run = runs.get(session_id)
+    result['running'] = bool(run and run.active)
     return result
 
 
@@ -282,27 +295,43 @@ def generate_session_title(session_id: str, body: GenerateTitleBody | None = Non
     return {"title": title}
 
 
+def _session_only_image_keys(session: ChatSession) -> set[str]:
+    """这个会话目录下的图片，加上它消息里引用的图片，去掉仍被其他会话（比如分支）引用的。
+
+    用户上传的图不进 GeneratedImage，只按目录找才不会漏；分支会话直接沿用原会话的图片地址，
+    所以删之前要确认没有别的会话在用。
+    """
+    keys = storage_service.list_keys(f"users/{session.user_id}/sessions/{session.id}/")
+    keys |= {img.s3_key for img in GeneratedImage.query.filter_by(session_id=session.id)}
+    for message in ChatMessage.query.filter_by(session_id=session.id):
+        keys |= storage_service.keys_in(message.images, message.files, message.tool_trace, message.content)
+
+    def used_elsewhere(key: str) -> bool:
+        pattern = f"%{quote(key)}%"  # 消息里存的是编码后的地址
+        return ChatMessage.query.filter(
+            ChatMessage.session_id != session.id,
+            (ChatMessage.images.like(pattern)) | (ChatMessage.files.like(pattern))
+            | (ChatMessage.tool_trace.like(pattern)) | (ChatMessage.content.like(pattern)),
+        ).first() is not None
+
+    return {key for key in keys if not used_elsewhere(key)}
+
+
 @app.delete("/api/sessions/{session_id}")
 def delete_session(session_id: str):
-    """删除会话（同时清理 S3 图片）"""
+    """删除会话（同时清理只属于这个会话的图片）"""
     session = ChatSession.query.get(session_id)
     if not session:
         return error("会话不存在", 404)
 
-    images = GeneratedImage.query.filter_by(session_id=session_id).all()
-    if images:
-        try:
-            s3_client = ai_service._s3_client
-            bucket = os.environ.get("S3_BUCKET")
-            if s3_client and bucket:
-                for img in images:
-                    try:
-                        s3_client.delete_object(Bucket=bucket, Key=img.s3_key)
-                        print(f"[S3] 删除图片: {img.s3_key}")
-                    except Exception as e:
-                        print(f"[S3] 删除图片失败: {e}")
-        except Exception as e:
-            print(f"[S3] 清理图片失败: {e}")
+    try:
+        for key in _session_only_image_keys(session):
+            storage_service.delete_object(key)
+    except Exception as e:
+        print(f"[S3] 清理图片失败: {e}")
+    # 还在回答的话先叫停，不再往要删掉的会话里写
+    runs.stop(session.id, "deleted")
+    ai_service.sandbox.forget_session(session.id, session.sandbox_id)
 
     GeneratedImage.query.filter_by(session_id=session_id).delete()
     db.session.delete(session)
@@ -312,12 +341,16 @@ def delete_session(session_id: str):
 
 @app.post("/api/sessions/{session_id}/branch")
 def branch_session(session_id: str, body: TruncateBody | None = None):
-    """从某条消息处分叉出一个新会话：复制这条消息及之前的全部消息，原会话不动。"""
+    """
+    从某条消息处分叉出一个新会话：复制这条消息及之前的全部消息，原会话不动。
+    exclusive 时不含这条消息本身：重试 / 改写重发走这里，原来那条回答（可能做了一半的产物）留在原会话里。
+    """
     source = ChatSession.query.get(session_id)
     if not source:
         return error("会话不存在", 404)
 
-    message_id = (body or TruncateBody()).message_id
+    body = body or TruncateBody()
+    message_id = body.message_id
     if not message_id:
         return error("缺少 message_id", 400)
     target = ChatMessage.query.get(message_id)
@@ -327,7 +360,7 @@ def branch_session(session_id: str, body: TruncateBody | None = None):
     history = (
         ChatMessage.query.filter(
             ChatMessage.session_id == session_id,
-            ChatMessage.created_at <= target.created_at,
+            ChatMessage.created_at < target.created_at if body.exclusive else ChatMessage.created_at <= target.created_at,
         )
         .order_by(ChatMessage.created_at)
         .all()
@@ -335,7 +368,7 @@ def branch_session(session_id: str, body: TruncateBody | None = None):
     branch = ChatSession(
         id=str(uuid.uuid4()),
         user_id=source.user_id,
-        title=f"{source.title or '新对话'} · 分支"[:100],
+        title=f"{source.title or '新对话'} · {'重试' if body.exclusive else '分支'}"[:100],
         model_id=source.model_id,
     )
     db.session.add(branch)
@@ -346,12 +379,15 @@ def branch_session(session_id: str, body: TruncateBody | None = None):
             role=item.role,
             content=item.content,
             images=item.images,
+            files=item.files,
             tool_trace=item.tool_trace,
             reasoning=item.reasoning,
             reasoning_seconds=item.reasoning_seconds,
+            reasoning_tokens=item.reasoning_tokens,
             created_at=item.created_at,
         ))
     db.session.commit()
+    ai_service.sandbox.copy_workspace(source.id, branch.id)
     return JSONResponse(branch.to_dict(), status_code=201)
 
 
@@ -386,6 +422,19 @@ def truncate_messages(session_id: str, body: TruncateBody | None = None):
     return {"success": True}
 
 
+# 图片是直接给模型看的：前端会压到 2048px / 4MB 以内，GIF 原样传，这里兜底
+UPLOAD_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp"}
+MAX_UPLOAD_IMAGE_BYTES = 12 * 1024 * 1024
+# 每条消息直接进上下文的图片上限（要更多就作为文件上传，放进沙箱按需看）
+MAX_MESSAGE_IMAGES = 8
+# 附件不限数量，只防误操作把整个硬盘拖进来
+MAX_MESSAGE_FILES = 2000
+
+
+def _clean_images(raw: list | None) -> list[str]:
+    return [u for u in (raw or []) if isinstance(u, str) and u.startswith("http")][:MAX_MESSAGE_IMAGES]
+
+
 @app.post("/api/upload-image")
 def upload_image(body: UploadImageBody | None = None):
     """上传图片到 S3，返回公开 URL"""
@@ -398,9 +447,16 @@ def upload_image(body: UploadImageBody | None = None):
     if not image_data_url or not image_data_url.startswith("data:"):
         return error("无效的图片数据", 400)
 
-    header, b64_data = image_data_url.split(",", 1)
-    mime = header.split(":")[1].split(";")[0]
-    image_bytes = base64.b64decode(b64_data)
+    try:
+        header, b64_data = image_data_url.split(",", 1)
+        mime = header.split(":")[1].split(";")[0]
+        image_bytes = base64.b64decode(b64_data)
+    except Exception:
+        return error("无效的图片数据", 400)
+    if mime not in UPLOAD_IMAGE_TYPES:
+        return error("只支持 JPG、PNG、GIF、WebP 图片", 400)
+    if len(image_bytes) > MAX_UPLOAD_IMAGE_BYTES:
+        return error("图片超过 12MB", 413)
 
     result = storage_service.upload_image(
         image_bytes,
@@ -411,6 +467,71 @@ def upload_image(body: UploadImageBody | None = None):
     if not result:
         return error("图片上传失败", 500)
     return {"url": result["url"]}
+
+
+MAX_UPLOAD_FILE_BYTES = 100 * 1024 * 1024
+
+
+@app.post("/api/upload-file")
+def upload_file(
+    file: UploadFile | None = File(default=None),
+    user_id: str | None = Form(default=None),
+    session_id: str | None = Form(default=None),
+    path: str | None = Form(default=None),
+):
+    """上传任意附件（文档、表格、音视频……），沙箱里处理用。返回 {name, path, url, size, mime}
+
+    path 是上传文件夹时文件在文件夹里的相对路径（如 活动照片/day1/a.jpg），沙箱里按它还原目录结构。
+    """
+    if file is None or not file.filename:
+        return error("缺少文件", 400)
+    name = safe_filename(file.filename)
+    if not name:
+        return error("文件名无效", 400)
+    rel = safe_relpath(path or "") or name
+    file.file.seek(0, os.SEEK_END)
+    size = file.file.tell()
+    file.file.seek(0)
+    if size > MAX_UPLOAD_FILE_BYTES:
+        return error("文件超过 100MB", 413)
+    if not storage_service.available:
+        return error("存储未配置", 500)
+    mime = file.content_type or guess_mime(name)
+    key = f"users/{user_id or 'anonymous'}/sessions/{session_id or 'unsorted'}/uploads/{uuid.uuid4().hex[:10]}/{rel}"
+    try:
+        storage_service._client.upload_fileobj(
+            file.file, storage_service.bucket, key, ExtraArgs={"ContentType": mime},
+        )
+    except Exception as exc:
+        print(f"[S3] 附件上传失败: {exc}")
+        return error("文件上传失败", 500)
+    result = {"name": name, "url": f"{storage_service.public_url}/{quote(key)}", "size": size, "mime": mime}
+    if rel != name:
+        result["path"] = rel
+    return result
+
+
+def _clean_attachments(raw: list | None) -> list[dict]:
+    """只收本桶里的附件地址，字段收窄到前端需要的几个。"""
+    cleaned = []
+    for item in raw or []:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "")
+        name = safe_filename(item.get("name") or "")
+        if not name or not storage_service.public_url or not url.startswith(storage_service.public_url + "/"):
+            continue
+        entry = {
+            "name": name,
+            "url": url,
+            "size": int(item.get("size") or 0),
+            "mime": str(item.get("mime") or guess_mime(name))[:120],
+        }
+        rel = safe_relpath(item.get("path") or "")
+        if rel and rel != name:
+            entry["path"] = rel
+        cleaned.append(entry)
+    return cleaned[:MAX_MESSAGE_FILES]
 
 
 # ============ ASR APIs ============
@@ -548,14 +669,15 @@ def add_message(session_id: str, body: AddMessageBody | None = None):
         return error("缺少 role", 400)
 
     # images 此时已经是 S3 URL 列表
-    image_urls = body.images
+    image_urls = _clean_images(body.images) if body.role == "user" else body.images
     tool_trace = body.tool_trace
     content = body.content
+    files = _clean_attachments(body.files)
     has_content = isinstance(content, str) and bool(content.strip())
     has_images = isinstance(image_urls, list) and len(image_urls) > 0
     has_tool_trace = isinstance(tool_trace, list) and len(tool_trace) > 0
 
-    if not has_content and not has_images and not has_tool_trace:
+    if not has_content and not has_images and not has_tool_trace and not files:
         return error("消息内容不能为空", 400)
 
     message = ChatMessage(
@@ -564,9 +686,11 @@ def add_message(session_id: str, body: AddMessageBody | None = None):
         role=body.role,
         content=content if isinstance(content, str) else '',
         images=json.dumps(image_urls) if has_images else None,
+        files=json.dumps(files, ensure_ascii=False) if files else None,
         tool_trace=json.dumps(tool_trace, ensure_ascii=False) if has_tool_trace else None,
         reasoning=body.reasoning or None,
         reasoning_seconds=body.reasoning_seconds,
+        reasoning_tokens=body.reasoning_tokens,
     )
     db.session.add(message)
     session.updated_at = datetime.utcnow()
@@ -586,6 +710,8 @@ def _chat_kwargs(body: ChatBody) -> dict:
         "reasoning_effort": body.reasoning_effort,
         "current_message_id": body.current_message_id,
         "image_quality": body.image_quality,
+        "files": _clean_attachments(body.files),
+        "delivery": body.delivery,
     }
 
 
@@ -601,7 +727,7 @@ def chat(body: ChatBody | None = None):
     for chunk in ai_service.chat_stream(
         body.message,
         body.history or [],
-        images=body.images or [],
+        images=_clean_images(body.images),
         **_chat_kwargs(body),
     ):
         if chunk["type"] == "error":
@@ -624,21 +750,79 @@ async def _chat_sse(upstream):
     yield "data: [DONE]\n\n"
 
 
+async def _run_sse(run, *, resume: bool = False, notice: str | None = None):
+    """转发一轮后台回答的事件。断开只是少一个观众，回答继续（见 services/runs.py）。"""
+    if notice:
+        yield f"data: {json.dumps({'type': 'notice', 'message': notice}, ensure_ascii=False)}\n\n"
+    async for item in runs.follow(run, resume=resume):
+        if item is RUNS_HEARTBEAT:
+            yield ": keepalive\n\n"
+            continue
+        yield f"data: {json.dumps(item, ensure_ascii=False)}\n\n"
+    yield "data: [DONE]\n\n"
+
+
 @app.post("/api/chat/stream")
 def chat_stream(body: ChatBody | None = None):
-    """POST /api/chat/stream (流式 SSE)"""
+    """POST /api/chat/stream (流式 SSE)。有会话的回答在后台跑，关掉页面也会做完。"""
     if _empty(body):
         return error("请求体不能为空", 400)
     if not body.message or not body.message.strip():
         return error("消息内容不能为空", 400)
 
-    upstream = ai_service.chat_stream(
-        body.message,
-        body.history or [],
-        images=body.images,  # S3 公开 URL 列表
-        **_chat_kwargs(body),
-    )
-    return sse_response(_chat_sse(upstream))
+    def work(run=None):
+        return ai_service.chat_stream(
+            body.message,
+            body.history or [],
+            images=_clean_images(body.images),  # S3 公开 URL 列表
+            control=run,
+            **_chat_kwargs(body),
+        )
+
+    session = ChatSession.query.get(body.session_id) if body.session_id else None
+    if not session or not body.user_id:
+        return sse_response(_chat_sse(work()))
+
+    try:
+        run, evicted = runs.start(
+            session_id=session.id, user_id=str(body.user_id), title=session.title or "", work=work, evict=body.evict,
+        )
+    except RunLimit as exc:
+        return error(exc.message, 429)
+    notice = None
+    if evicted:
+        notice = f"「{evicted.title or '新对话'}」已停下，做好的部分和工作区都保存了，回到那段对话发「继续」就能接着做"
+    return sse_response(_run_sse(run, notice=notice))
+
+
+@app.get("/api/chat/runs")
+def running_chats(user_id: str | None = None):
+    """这个用户正在后台回答的会话（跑得最久的在前），以及同时回答的上限"""
+    if not user_id:
+        return error("缺少 user_id", 400)
+    return {
+        "limit": RUNS_PER_USER,
+        "runs": [
+            {"session_id": r.session_id, "title": r.title, "started_at": int(r.started_at * 1000)}
+            for r in runs.running(user_id)
+        ],
+    }
+
+
+@app.get("/api/chat/runs/{session_id}/events")
+def resume_chat(session_id: str):
+    """回到正在回答的会话：先重放已有的事件，再接着推实时的"""
+    run = runs.get(session_id)
+    if not run:
+        return error("这段对话现在没有在回答", 404)
+    return sse_response(_run_sse(run, resume=True))
+
+
+@app.post("/api/chat/runs/{session_id}/stop")
+def stop_chat(session_id: str, body: StopRunBody | None = None):
+    """停止正在回答的会话。discard=True 时连已写的部分也不保存（重新生成、编辑前用）"""
+    reason = "discard" if body and body.discard else "user"
+    return {"stopped": runs.stop(session_id, reason)}
 
 
 @app.post("/api/chat/suggestions")

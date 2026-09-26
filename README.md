@@ -1,15 +1,16 @@
 # LockAI
 
-Funk&Love 舞队 AI 平台。多角色对话、联网搜索、AI 绘图 / 修图 / 识图、语音输入。
+Funk&Love 舞队 AI 平台。多角色对话、联网搜索、AI 绘图 / 修图 / 识图、语音输入，以及在云沙箱里动手干活（做 PPT / 文档 / 表格 / 图表、处理音视频和图片、写网页并预览）。
 
-当前版本：**0.9**
+当前版本：**1.0.0**
 
 ## 技术栈
 
 - **Frontend**：Next.js 16 + React 19 + Tailwind CSS 4，React Compiler 启用；动画用 GSAP（`@gsap/react`），登录页 / 空状态的 3D 锁是一个手写 WebGL 着色器（无 three.js）
 - **Backend**：FastAPI + SQLAlchemy 2 + SQLite，生产用 gunicorn + uvicorn worker
-- **AI Providers**：RelayRouter（Campbell / gpt-6-astra，绘图 / 修图，联网搜索）、DeepSeek（Scooby / deepseek-flash，标题 / 追问建议 / 识图转述）、DashScope（仅语音识别）
-- **Storage**：Bitiful S3（图片 + 服务端 SVG 水印）
+- **AI Providers**：RelayRouter（Campbell / gpt-6-astra，绘图 / 修图，搜索备用通道）、DeepSeek（Scooby / deepseek-flash，标题 / 追问建议 / 识图转述）、阿里云 CleverSee（联网搜索）、DashScope（仅语音识别）
+- **Sandbox**：阿里云函数计算云沙箱（E2B 协议兼容，杭州，和模板镜像所在的 ACR 同地域），每个会话一台；模板镜像和发布流程见 [sandbox/README.md](sandbox/README.md)
+- **Storage**：阿里云 OSS 北京 `lock-ai` 桶（S3 兼容接口）。水印是桶里的 `public/watermark.png`，由 OSS 的 `x-oss-process` 实时叠加，原图不动；桶策略只公开 `users/` 和 `public/`。从缤纷云迁移见 [backend/scripts/migrate_bitiful_to_oss.py](backend/scripts/migrate_bitiful_to_oss.py)
 
 ## 项目结构
 
@@ -34,17 +35,19 @@ Funk&Love 舞队 AI 平台。多角色对话、联网搜索、AI 绘图 / 修图
 │       ├── usage.py        # Campbell 日 / 月配额
 │       ├── title.py        # 自动会话标题
 │       ├── event_bus.py    # 实时语音识别的事件分发
+│       ├── sandbox.py      # 云沙箱：会话绑定、命令执行、附件同步、交付文件、工作区快照
 │       └── storage.py
+├── sandbox/                # 云沙箱模板：Dockerfile + 场景经验说明书（skills/）
 └── lockai/                 # Next.js 前端
     ├── public/
-    │   └── watermark.svg   # 服务端水印（已上传 S3 为 public/watermark2.svg）
+    │   └── watermark.svg   # 水印源文件（渲染成 PNG 后上传到 OSS 的 public/watermark.png）
     └── src/
         ├── app/(app)/chat/
         ├── components/
         │   ├── AppShell.tsx        # 外壳：会话列表、全局快捷键、删除撤销
         │   ├── brand/              # LockMark（SVG 锁标）、LockOrb（WebGL 3D 锁）
         │   ├── shell/              # 侧栏、命令面板、设置、快捷键
-        │   ├── chat/               # ChatView、消息、输入框、Markdown、工具卡片、划词、顺便问
+        │   ├── chat/               # ChatView、消息、输入框、Markdown、工具卡片、工作过程 / 文件卡片、划词、顺便问
         │   └── ui/                 # Popover / Tooltip / Dialog / Toast
         └── lib/
             ├── chat/               # useChatController（流式状态机）、traces、compose、export
@@ -63,6 +66,16 @@ Funk&Love 舞队 AI 平台。多角色对话、联网搜索、AI 绘图 / 修图
 - 表格一键复制 Markdown / 下载 CSV，代码块复制 / 换行，整段对话导出 Markdown
 - 侧栏：置顶、按日期分组、重命名、删除可撤销、可收起成窄栏；⌘K 命令面板，⌘/ 查看全部快捷键
 
+### 云沙箱
+
+- 模型只有一个 `shell` 工具，在会话专属的 Linux 沙箱里执行命令；Campbell 和 Scooby 都能用。没配 `E2B_API_KEY` 时这个工具不出现
+- 沙箱预装中文字体、LibreOffice、TeX Live / Typst、Chromium、ffmpeg、OCR、抠图等，常见场景的经验写在 `/opt/lockai/skills/*.md`，模型按需读
+- 用户附件（输入框"上传文件"或直接拖入）和发过的图片会放进 `~/inputs/`；模型写进 `~/outputs/` 的文件每步之后自动交付，前端显示成可预览 / 下载的文件卡片
+- 连续几步命令在界面上收成一段"工作过程"时间线：运行中实时显示输出，做完收起成一行
+- 后台服务（`background` + `port`）给出公开预览链接；模型可以用 `show` 看自己做出来的截图来自检
+- 空闲 5 分钟回收，每轮结束后工作区快照存到 OSS，下次自动恢复（一两秒）；删除会话时一起清理，分支会复制一份
+- 文件预览全部自己做：Word / PPT 交付时在沙箱里转 PDF，表格和用户上传的 Word 在浏览器里解析
+
 ## 模型角色
 
 | ID       | 名称        | 后端模型            | 说明 |
@@ -75,8 +88,28 @@ Leo 已于 0.8 下线，历史会话在后端启动时自动并入 Scooby。Deep
 
 两个角色均可触发联网搜索、绘图（Campbell 2.5 / 3.0 Image）、识图、修图。绘图统一消耗 Campbell 配额。
 
-联网搜索：DeepSeek 自己不能上网，`web_search` 工具由 RelayRouter 的 `gpt-4.1-mini`（Responses API + `web_search`）代搜，按次计费。
-每次回答最多真搜 4 次，最后一轮不再给工具、强制作答；系统提示词里带北京时间的当前日期，避免模型拿错年份去搜。
+联网搜索走阿里云 CleverSee（原 IQS）的 UnifiedSearch 纯搜索接口（`CLEVERSEE_API_KEY`），结果交给主模型自己读。
+模型在 `web_search` 的参数里自己选引擎，`services/search.py` 翻译成 CleverSee 的档位：
+
+| 模型选的 `engine` | CleverSee 档位 | 用途 | 元/千次 |
+|---|---|---|---|
+| `cn_fast`（默认） | CNLiteBasic | 中文网页，约 0.5s | 8 |
+| `cn_news` | CNAuto | 时效强的新闻 | 18 |
+| `cn_authority` | Generic | 权威来源 + 天气 / 时间 / 汇率 / 股价 / 金价结构化数据 | 42 |
+| `global` | GlobalAdvanced | 英文 / 海外话题，约 2s | 56 |
+
+另有 `time_range`、`sites`、`full_text` 参数；档位不支持的组合由后端改写并在结果里告诉模型，限定站点搜不到会放宽成全网。
+CleverSee 出错或没配 Key 时，改走 RelayRouter 的 `gpt-4.1-mini` + `web_search`（`search_builtin`）。
+每次回答最多真搜 4 次，最后一轮不再给工具、强制作答；系统提示词里带北京时间的当前日期。
+历史消息里只留"搜过什么"，不留搜索结果，追问需要新数据时模型会重新搜。
+
+思考强度：前端统一三档（快速 / 思考 / 深度思考），后端按模型翻译，只用上游稳定支持的值：
+
+| 档位 | Campbell（`thinking_levels`） | Scooby（DeepSeek） |
+|---|---|---|
+| 快速 | `reasoning_effort=low` | 关闭思考 |
+| 思考 | `high` | 开启思考（默认强度） |
+| 深度思考 | `xhigh`（中转站部分通道不认 `max`，不用） | `reasoning_effort=max` |
 
 识图：`models.json` 里 `"vision": true` 的模型直接看图（Campbell、Scooby 都是）；否则先由 `image_describer`（deepseek-flash）转述成文字。
 
@@ -109,6 +142,8 @@ Campbell 按上游真实 token 用量计费，Scooby 免费。计费量以「gpt
 先不带参数试算，确认后加 `--apply`。
 
 ## 快速开始
+
+本机已经装好环境、只想把前后端拉起来，看 [QUICKSTART.md](QUICKSTART.md)。下面是从零搭建。
 
 ### 端口规范
 

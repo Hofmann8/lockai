@@ -42,6 +42,7 @@ BACKEND_DIRS = [
     "services",
     "instance",
     "scripts",
+    "assets",  # tiktoken 编码文件，计费数 token 用，线上不联网下载
 ]
 
 # 排除模式
@@ -51,6 +52,10 @@ EXCLUDE_PATTERNS = {
     "_tmp_runtime",
     "tmp",
     ".pyc",
+    ".bak",  # instance/ 里手动留的数据库备份
+    "-journal",
+    "-wal",
+    "-shm",
 }
 
 

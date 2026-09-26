@@ -115,3 +115,25 @@ def test_inspect_image_bytes_extracts_png_geometry():
     assert metadata["width"] == 1
     assert metadata["height"] == 1
     assert metadata["aspectRatio"] == "1:1"
+
+
+def test_watermarked_url_uses_oss_processing_scaled_to_image(monkeypatch):
+    from services.storage import StorageService, strip_image_processing
+
+    monkeypatch.delenv("S3_ENDPOINT", raising=False)
+    storage = StorageService()
+    raw = "https://lock-ai.oss-cn-beijing.aliyuncs.com/users/u/images/a.png"
+
+    marked = storage.watermarked_url(raw, 1000, 600)
+    assert marked.startswith(raw + "?x-oss-process=image/watermark,image_")
+    assert ",g_se,x_30,y_18,t_40" in marked
+    mark_b64 = marked.split("image_", 1)[1].split(",", 1)[0]
+    assert base64.urlsafe_b64decode(mark_b64 + "=" * (-len(mark_b64) % 4)).decode() == (
+        "public/watermark.png?x-oss-process=image/resize,P_15"
+    )
+    assert storage.watermarked_url(raw, blur=True).endswith("/blur,r_30,s_30")
+    # 已经带参数的地址重新加水印时不叠加
+    assert storage.watermarked_url(marked, 1000, 600) == marked
+
+    assert strip_image_processing(marked) == raw
+    assert strip_image_processing("https://example.com/a.png?token=1") == "https://example.com/a.png?token=1"

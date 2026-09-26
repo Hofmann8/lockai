@@ -10,12 +10,17 @@
     "transport": "openai-compatible",
     "thinking_mode": "optional",
     "default_thinking": true,
+    "thinking_levels": {
+      "fast": "low",
+      "standard": "high",
+      "deep": "xhigh"
+    },
     "billable": true,
     "identity_guard": true,
     "available": true,
     "visible": true,
-    "is_default": true,
     "prompt_id": "campbell",
+    "delegate_to": "scooby",
     "tags": [
       "联网",
       "绘图",
@@ -43,7 +48,9 @@
     "identity_guard": true,
     "available": true,
     "visible": true,
+    "is_default": true,
     "prompt_id": "scooby",
+    "max_tool_rounds": 150,
     "tags": [
       "联网",
       "绘图",

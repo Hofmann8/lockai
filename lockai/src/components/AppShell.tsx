@@ -40,6 +40,8 @@ export function useAppShell() {
 }
 
 const COLLAPSE_KEY = 'lockai_sidebar_collapsed';
+/** 有对话在后台回答时，多久刷新一次列表（看它们做完没有） */
+const RUNNING_POLL_MS = 4000;
 
 export function AppShell({ children }: { children: ReactNode }) {
   const pathname = usePathname();
@@ -54,6 +56,11 @@ export function AppShell({ children }: { children: ReactNode }) {
   const [shortcutsOpen, setShortcutsOpen] = useState(false);
   const [activity, setActivity] = useState<ChatActivity>({ busy: false, snapKey: 0 });
   const pendingDeletes = useRef<Set<string>>(new Set());
+  const currentRef = useRef<string | null>(null);
+  const runningRef = useRef<Set<string> | null>(null);
+  const selectRef = useRef<(id: string) => void>(() => {});
+
+  useEffect(() => { currentRef.current = currentSessionId; }, [currentSessionId]);
 
   useEffect(() => {
     setSidebarCollapsedState(localStorage.getItem(COLLAPSE_KEY) === '1');
@@ -68,6 +75,19 @@ export function AppShell({ children }: { children: ReactNode }) {
     const data = await getSessions();
     setSessions(data);
     setSessionsLoaded(true);
+    // 在后台做完的对话（不是正看着的这段）：提示一下，点一下就过去
+    const running = new Set(data.filter((s) => s.running).map((s) => s.id));
+    const before = runningRef.current;
+    runningRef.current = running;
+    for (const id of before ?? []) {
+      if (running.has(id) || id === currentRef.current || pendingDeletes.current.has(id)) continue;
+      const session = data.find((s) => s.id === id);
+      if (!session) continue;
+      toast(`「${session.title || '新对话'}」有新回复`, {
+        duration: 6000,
+        action: { label: '查看', onClick: () => selectRef.current(id) },
+      });
+    }
     return data;
   }, []);
 
@@ -76,6 +96,23 @@ export function AppShell({ children }: { children: ReactNode }) {
   }, [loadSessions]);
 
   const visibleSessions = useMemo(() => sessions.filter((s) => !hidden.has(s.id)), [hidden, sessions]);
+  const anyRunning = sessions.some((s) => s.running);
+
+  // 有对话在后台回答：定时刷新列表，页面切回来时也刷新一次
+  useEffect(() => {
+    if (!anyRunning) return;
+    const timer = window.setInterval(() => {
+      if (document.visibilityState === 'visible') void loadSessions();
+    }, RUNNING_POLL_MS);
+    const onVisible = () => {
+      if (document.visibilityState === 'visible') void loadSessions();
+    };
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      window.clearInterval(timer);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, [anyRunning, loadSessions]);
 
   const newChat = useCallback(() => {
     setCurrentSessionId(null);
@@ -86,6 +123,7 @@ export function AppShell({ children }: { children: ReactNode }) {
     setCurrentSessionId(id);
     setMobileOpen(false);
   }, []);
+  useEffect(() => { selectRef.current = selectSession; }, [selectSession]);
 
   const renameSession = useCallback(async (id: string, title: string) => {
     setSessions((list) => list.map((s) => (s.id === id ? { ...s, title } : s)));

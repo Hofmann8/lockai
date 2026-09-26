@@ -18,10 +18,20 @@ from .provider_runtime import ProviderRuntime
 
 ENV_SUB_RE = re.compile(r'\$\{(\w+)\}')
 REASONING_EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
+
+
+def thinking_level(enable_thinking: bool | None, reasoning_effort: str | None) -> str:
+    """前端只有三档：快速 / 思考 / 深度思考。从请求里的开关和 effort 还原是哪一档。"""
+    if not enable_thinking:
+        return "fast"
+    return "deep" if (reasoning_effort or "").strip().lower() in {"max", "xhigh"} else "standard"
 RETIRED_CHAT_MODEL_ALIASES = {
     "xiaosuolaoshi": "campbell",
     "leo": "scooby",
 }
+
+
+DEEPSEEK_OUTPUT_CEILING = 131072
 
 
 class LLMService:
@@ -29,7 +39,8 @@ class LLMService:
 
     def __init__(self):
         self.temperature = float(os.environ.get("AI_TEMPERATURE", "0.7"))
-        self.max_tokens = int(os.environ.get("AI_MAX_TOKENS", "8192"))
+        # 默认不限制输出长度（0 = 不限）；个别内部调用自己传小上限
+        self.max_tokens = int(os.environ.get("AI_MAX_TOKENS", "0") or 0)
         self.models_config_path = os.environ.get("MODELS_CONFIG", "models.json")
         self._backend_dir = Path(__file__).resolve().parent.parent
         self._models_cache: list[dict[str, Any]] = []
@@ -100,6 +111,18 @@ class LLMService:
 
     def _get_api_key(self, model: str | dict[str, Any] | None = None) -> Optional[str]:
         return self.get_api_key(model or self.get_default_chat_model_id())
+
+    def resolve_max_tokens(self, cfg: dict[str, Any], explicit: int | None = None) -> int | None:
+        """输出上限：调用方指定 > 模型配置 > AI_MAX_TOKENS；都没有就不限。
+
+        DeepSeek 不传 max_tokens 时用自己的小默认值，长文和深度思考会被截断，
+        所以给一个远超实际的数，上游按模型能力封顶。其他家不传即不限。
+        """
+        limit = explicit if explicit is not None else cfg.get("max_tokens") or self.max_tokens
+        if limit:
+            return int(limit)
+        transport = str(cfg.get("transport") or cfg.get("provider") or "")
+        return DEEPSEEK_OUTPUT_CEILING if transport.startswith("deepseek") else None
 
     def stream_chat_completion(
         self,
@@ -467,6 +490,8 @@ class LLMService:
                 "transport": "openai-compatible",
                 "thinking_mode": "optional",
                 "default_thinking": True,
+                # 中转站的 gpt-6-astra 有的通道不认 max，最高只用 xhigh
+                "thinking_levels": {"fast": "low", "standard": "high", "deep": "xhigh"},
                 "billable": True,
                 "identity_guard": True,
                 "vision": True,
@@ -650,8 +675,10 @@ class LLMService:
             "messages": messages,
             "stream": stream,
             "temperature": temperature if temperature is not None else cfg.get("temperature", self.temperature),
-            "max_tokens": max_tokens if max_tokens is not None else cfg.get("max_tokens", self.max_tokens),
         }
+        limit = self.resolve_max_tokens(cfg, max_tokens)
+        if limit:
+            payload["max_tokens"] = limit
         if tools:
             payload["tools"] = tools
 
@@ -668,12 +695,17 @@ class LLMService:
                 effort = (reasoning_effort or "").strip().lower()
                 if effort in {"max", "xhigh"}:
                     payload["reasoning_effort"] = "max"
+        elif isinstance(cfg.get("thinking_levels"), dict):
+            # 模型自己声明三档各发什么（只填上游稳定支持的值），前端不用关心各家的档位名
+            mapped = cfg["thinking_levels"].get(thinking_level(enable_thinking, reasoning_effort))
+            if mapped in REASONING_EFFORT_LEVELS:
+                payload["reasoning_effort"] = mapped
         elif enable_thinking:
             effort = (reasoning_effort or "").strip().lower()
             if effort in REASONING_EFFORT_LEVELS:
                 payload["reasoning_effort"] = effort
-        if stream and cfg.get("billable"):
-            # 计费模型要按 token 记账，流末需要上游附带 usage（实测含 cached_tokens）
+        if stream:
+            # 流末附带 usage：计费模型按 token 记账，界面要显示思考 token 数
             payload["stream_options"] = {"include_usage": True}
         if extra_payload:
             payload.update(extra_payload)

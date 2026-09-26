@@ -7,15 +7,7 @@ const nextConfig: NextConfig = {
     remotePatterns: [
       {
         protocol: 'https',
-        hostname: 'funkandlove-main.s3.bitiful.net',
-      },
-      {
-        protocol: 'https',
-        hostname: 'funkandlove-ai.s3.bitiful.net',
-      },
-      {
-        protocol: 'https',
-        hostname: 'funkandlove-cloud-public.s3.bitiful.net',
+        hostname: 'lock-ai.oss-cn-beijing.aliyuncs.com',
       },
     ],
   },

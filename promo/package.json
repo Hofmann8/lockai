@@ -1,0 +1,35 @@
+{
+  "name": "lockai-promo",
+  "version": "1.0.0",
+  "scripts": {
+    "studio": "remotion studio src/index.ts --port 3100",
+    "still": "remotion still src/index.ts",
+    "render": "remotion render src/index.ts Film out/render-raw.mp4 --gl=angle --image-format=png --crf=15 && npm run mux",
+    "mux": "ffmpeg -v error -y -i out/render-raw.mp4 -i public/audio/score.wav -map 0:v -map 1:a -c:v copy -c:a aac -b:a 320k -ar 48000 -t 84.9833 -movflags +faststart out/LockAI-1.0.mp4"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "typescript": "^7.0.2"
+  },
+  "dependencies": {
+    "@fontsource-variable/fraunces": "^5.3.0",
+    "@fontsource-variable/geist": "^5.3.0",
+    "@fontsource-variable/geist-mono": "^5.3.0",
+    "@remotion/cli": "^4.0.529",
+    "@remotion/motion-blur": "^4.0.529",
+    "@remotion/noise": "^4.0.529",
+    "@remotion/tailwind-v4": "^4.0.529",
+    "@types/qrcode": "^1.5.6",
+    "csstype": "^3.2.3",
+    "lucide-react": "^0.563.0",
+    "qrcode": "^1.5.4",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "remotion": "^4.0.529"
+  },
+  "description": "LockAI 1.0 宣传片（Remotion）",
+  "private": true
+}

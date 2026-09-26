@@ -1,0 +1,91 @@
+% LockAI 中文论文 / 报告模板（xelatex）
+% 用法：复制到 work/ 改正文，然后 `latexmk -xelatex -interaction=nonstopmode paper.tex`
+% 要同时交 Word：`todocx paper.tex -o /home/user/outputs/题目.docx`（正文只用下面出现过的写法，Word 版才转得干净）
+\documentclass[UTF8,zihao=-4,a4paper,fontset=none]{ctexart}
+
+% ---------- 字体：思源宋体 / 思源黑体 + Times 风格西文 ----------
+\setCJKmainfont{Noto Serif CJK SC}[BoldFont=Noto Serif CJK SC Bold]
+\setCJKsansfont{Noto Sans CJK SC}[BoldFont=Noto Sans CJK SC Bold]
+\setCJKmonofont{Noto Sans Mono CJK SC}
+\setCJKfamilyfont{zhsong}{Noto Serif CJK SC}
+\setCJKfamilyfont{zhhei}{Noto Sans CJK SC}
+\setmainfont{TeX Gyre Termes}
+\setsansfont{TeX Gyre Heros}
+
+% ---------- 版面：A4，页边距同 Word 默认，1.5 倍行距 ----------
+\usepackage[top=2.54cm,bottom=2.54cm,left=3.17cm,right=3.17cm]{geometry}
+\linespread{1.6}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{caption}
+\captionsetup{font=small,labelsep=quad}
+\usepackage[hidelinks]{hyperref}
+
+% ---------- 标题样式（黑体，自动编号 1 / 1.1 / 1.1.1，Word 版编号一致） ----------
+\ctexset{
+  section = {format = \sffamily\zihao{-3}\bfseries, beforeskip = 1.2ex plus .2ex, afterskip = 1ex},
+  subsection = {format = \sffamily\zihao{4}\bfseries, beforeskip = 1ex, afterskip = .6ex},
+  subsubsection = {format = \sffamily\zihao{-4}\bfseries, beforeskip = .8ex, afterskip = .4ex},
+  abstractname = {摘\quad 要},
+}
+\renewenvironment{abstract}{%
+  \par\begin{center}\sffamily\zihao{4}\bfseries\abstractname\end{center}\par\zihao{-4}%
+}{\par\medskip}
+
+% ---------- 页码居中 ----------
+\pagestyle{plain}
+
+\title{\sffamily\zihao{2}\bfseries 这里写论文题目}
+\author{\zihao{-4}作者姓名\quad 学号 2025xxxxxx\\ \zihao{5}某某大学某某学院}
+\date{\zihao{5}2026 年 9 月}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+这里写摘要，200~300 字，概括研究问题、方法、主要观点和结论。
+
+\noindent\textbf{关键词：}关键词一；关键词二；关键词三
+\end{abstract}
+
+\section{引言}
+正文段落直接写，段首自动缩进两字。引用文献用 \verb|\cite{key}|，如已有研究指出这一点\cite{marx1972}。
+
+\section{第一部分}
+\subsection{小节标题}
+行内公式 $E = mc^2$，行间公式：
+\begin{equation}
+  f(x) = \int_{0}^{x} e^{-t^2}\,\mathrm{d}t
+\end{equation}
+
+表格用三线表：
+\begin{table}[htbp]
+  \centering
+  \caption{表格标题}
+  \begin{tabular}{lcc}
+    \toprule
+    项目 & 数值 A & 数值 B \\
+    \midrule
+    第一行 & 1.0 & 2.0 \\
+    第二行 & 3.0 & 4.0 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+图片：
+% \begin{figure}[htbp]
+%   \centering
+%   \includegraphics[width=.7\linewidth]{figure.png}
+%   \caption{图片标题}
+% \end{figure}
+
+\section{结论}
+总结全文。
+
+% 参考文献按 GB/T 7714—2015 手写格式，只列查证过的真实文献
+\begin{thebibliography}{99}
+  \bibitem{marx1972} 恩格斯. 自然辩证法[M]. 北京: 人民出版社, 1971.
+\end{thebibliography}
+
+\end{document}

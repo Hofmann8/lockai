@@ -1,6 +1,6 @@
 'use client';
 
-import { memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
+import { Fragment, memo, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import {
   Check,
   ChevronDown,
@@ -11,17 +11,23 @@ import {
   Pencil,
   RotateCcw,
 } from 'lucide-react';
-import type { ChatMessage, ChatModel, SearchToolTrace, ToolTrace } from '@/types';
+import type { ChatMessage, ChatModel, SearchToolTrace, ShellToolTrace, TaskToolTrace, ToolTrace } from '@/types';
 import { cn } from '@/lib/cn';
 import { copyRich, copyText, markdownToPlain, messageMarkdown } from '@/lib/clipboard';
 import { decomposeMessage } from '@/lib/chat/compose';
 import { splitAssistantParts, type AssistantPart } from '@/lib/chat/traces';
+import { messageFiles } from '@/lib/chat/artifacts';
 import { Markdown } from './Markdown';
 import { ImageCard, Lightbox, SearchCard, SearchGroup, Seconds, useElapsed } from './ToolCards';
+import { Deliverables, ShellGroup, TaskCard } from './WorkCards';
+import { UploadList } from './UploadTree';
+import { ThinkingChip } from './Thinking';
+import type { LiveThinking } from '@/lib/chat/useChatController';
 import { LockMark } from '@/components/brand/LockMark';
 import { MenuItem, MenuLabel, MenuSeparator, Popover } from '@/components/ui/Popover';
 import { Tooltip } from '@/components/ui/Tooltip';
 import { toast } from '@/components/ui/Toast';
+import { useHoldAnchor } from '@/lib/hooks/useScrollAnchor';
 
 /* ------------------------------------------------------------------ */
 /* 小按钮 */
@@ -87,6 +93,25 @@ function useStartedAt(active: boolean): number | undefined {
   return at;
 }
 
+const STALL_MS = 2500;
+
+/** signal 上一次变化到现在过了多久（毫秒），active 时每半秒刷新 */
+function useQuietFor(signal: string | number, active: boolean): number {
+  const [since, setSince] = useState(() => Date.now());
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const at = Date.now();
+    setSince(at);
+    setNow(at);
+  }, [signal]);
+  useEffect(() => {
+    if (!active) return;
+    const timer = window.setInterval(() => setNow(Date.now()), 500);
+    return () => window.clearInterval(timer);
+  }, [active]);
+  return active ? Math.max(0, now - since) : 0;
+}
+
 function formatTime(value: Date) {
   const date = value instanceof Date ? value : new Date(value);
   if (Number.isNaN(date.getTime())) return '';
@@ -110,8 +135,10 @@ function UserMessageImpl({ message, editing, onEditStart, onEditCancel, onEditSu
   const [copied, markCopied] = useCopied();
   const [preview, setPreview] = useState<string | null>(null);
   const [openPaste, setOpenPaste] = useState<string | null>(null);
-  const text = parts.text === '(图片)' ? '' : parts.text;
+  const holdAnchor = useHoldAnchor();
+  const text = parts.text === '(图片)' || parts.text === '(附件)' ? '' : parts.text;
   const images = message.images ?? [];
+  const files = message.files ?? [];
 
   return (
     <div className="group/user flex flex-col items-end" data-message-id={message.id} data-role="user">
@@ -131,8 +158,14 @@ function UserMessageImpl({ message, editing, onEditStart, onEditCancel, onEditSu
         </div>
       )}
 
+      {files.length > 0 && (
+        <div className="mb-2 flex max-w-[80%] flex-wrap justify-end gap-2">
+          <UploadList files={files} />
+        </div>
+      )}
+
       {editing ? (
-        <EditBox initial={message.content === '(图片)' ? '' : message.content} onCancel={onEditCancel} onSubmit={onEditSubmit} />
+        <EditBox initial={text ? message.content : ''} onCancel={onEditCancel} onSubmit={onEditSubmit} />
       ) : (
         <>
           {parts.quotes.map((quote, i) => (
@@ -148,7 +181,10 @@ function UserMessageImpl({ message, editing, onEditStart, onEditCancel, onEditSu
             <button
               key={paste.id}
               type="button"
-              onClick={() => setOpenPaste((v) => (v === paste.id ? null : paste.id))}
+              onClick={(e) => {
+                holdAnchor(e.currentTarget);
+                setOpenPaste((v) => (v === paste.id ? null : paste.id));
+              }}
               className="mb-1.5 max-w-[80%] rounded-2xl border border-line bg-surface px-3.5 py-2 text-left text-[13px] text-fg-soft transition-colors hover:border-line-strong"
             >
               <span className="flex items-center gap-1.5">
@@ -260,82 +296,50 @@ function EditBox({ initial, onCancel, onSubmit }: { initial: string; onCancel: (
 export const UserMessage = memo(UserMessageImpl);
 
 /* ------------------------------------------------------------------ */
-/* 思考过程 */
-/* ------------------------------------------------------------------ */
-
-function ReasoningBlock({ text, active, seconds }: { text: string; active: boolean; seconds?: number }) {
-  const [open, setOpen] = useState(false);
-  const startedAt = useStartedAt(active);
-  const elapsed = useElapsed(startedAt, active);
-  const bodyRef = useRef<HTMLDivElement>(null);
-
-  // 思考时自动跟到最新一行
-  useEffect(() => {
-    if (active && bodyRef.current) bodyRef.current.scrollTop = bodyRef.current.scrollHeight;
-  }, [active, text]);
-
-  if (!text && !active) return null;
-  const expanded = active || open;
-  const finalSeconds = seconds ?? 0;
-
-  return (
-    <div className="mb-3">
-      <button
-        type="button"
-        onClick={() => !active && setOpen((v) => !v)}
-        aria-expanded={expanded}
-        className={cn(
-          'flex items-center gap-1.5 text-[13.5px] transition-colors',
-          active ? 'cursor-default' : 'text-fg-faint hover:text-fg-soft',
-        )}
-      >
-        {active ? (
-          <>
-            <span className="shimmer-text">思考中</span>
-            <Seconds value={elapsed} />
-          </>
-        ) : (
-          <>
-            <span>{finalSeconds > 0 ? `思考了 ${finalSeconds} 秒` : '思考过程'}</span>
-            <ChevronDown className={cn('h-3.5 w-3.5 transition-transform duration-200', open && 'rotate-180')} />
-          </>
-        )}
-      </button>
-      {expanded && text && (
-        <div
-          ref={bodyRef}
-          className={cn(
-            'mt-2 border-l-2 border-line pl-4 text-[13.5px] leading-[1.75] text-fg-faint whitespace-pre-wrap animate-fade',
-            active && 'max-h-40 overflow-hidden [mask-image:linear-gradient(to_bottom,transparent,#000_2.5rem)]',
-            !active && 'max-h-[28rem] overflow-y-auto',
-          )}
-        >
-          {text}
-        </div>
-      )}
-    </div>
-  );
-}
-
-/* ------------------------------------------------------------------ */
 /* 助手回答 */
 
 type Block =
   | { type: 'text'; value: string; index: number }
   | { type: 'tool'; traceIdx: number; index: number }
-  | { type: 'searches'; traceIdxs: number[]; index: number };
+  | { type: 'searches'; traceIdxs: number[]; index: number }
+  | { type: 'shells'; traceIdxs: number[]; index: number }
+  /** 派给执行助手的一块工作，连同它做的每一步 */
+  | { type: 'task'; traceIdx: number; stepIdxs: number[]; index: number };
 
-/** 连着的几次搜索合成一组，不然模型连搜五六次会把回答顶得老长 */
-function groupSearches(parts: AssistantPart[], trace: ToolTrace[]): Block[] {
+/**
+ * 连着的几次搜索合成一组，不然模型连搜五六次会把回答顶得老长；
+ * 沙箱命令哪怕只有一步也放进"工作过程"，连着的几步是一条时间线。
+ */
+function groupTools(parts: AssistantPart[], trace: ToolTrace[]): Block[] {
   const blocks: Block[] = [];
   parts.forEach((part, index) => {
     if (part.type === 'text') {
       blocks.push({ type: 'text', value: part.value, index });
       return;
     }
-    const isSearch = trace[part.traceIdx]?.kind === 'search';
+    const item = trace[part.traceIdx];
+    const kind = item?.kind;
     const prev = blocks[blocks.length - 1];
-    if (isSearch && prev && (prev.type === 'searches' || (prev.type === 'tool' && trace[prev.traceIdx]?.kind === 'search'))) {
+    if (kind === 'task') {
+      blocks.push({ type: 'task', traceIdx: part.traceIdx, stepIdxs: [], index });
+      return;
+    }
+    // 执行助手的步骤收进它所属的那块工作
+    if (item?.kind === 'shell' && item.taskId) {
+      for (let i = blocks.length - 1; i >= 0; i -= 1) {
+        const b = blocks[i];
+        if (b.type === 'task' && (trace[b.traceIdx] as TaskToolTrace | undefined)?.id === item.taskId) {
+          blocks[i] = { ...b, stepIdxs: [...b.stepIdxs, part.traceIdx] };
+          return;
+        }
+      }
+    }
+    if (kind === 'shell') {
+      if (prev?.type === 'shells') blocks[blocks.length - 1] = { ...prev, traceIdxs: [...prev.traceIdxs, part.traceIdx], index };
+      else blocks.push({ type: 'shells', traceIdxs: [part.traceIdx], index });
+      return;
+    }
+    if (kind === 'search' && prev && (prev.type === 'searches' || (prev.type === 'tool' && trace[prev.traceIdx]?.kind === 'search'))) {
       const idxs = prev.type === 'searches' ? prev.traceIdxs : [prev.traceIdx];
       blocks[blocks.length - 1] = { type: 'searches', traceIdxs: [...idxs, part.traceIdx], index };
       return;
@@ -345,10 +349,19 @@ function groupSearches(parts: AssistantPart[], trace: ToolTrace[]): Block[] {
   return blocks;
 }
 
+function blockKey(block: Block): string {
+  if (block.type === 'text') return `t-${block.index}`;
+  if (block.type === 'tool') return `tool-${block.traceIdx}`;
+  if (block.type === 'task') return `task-${block.traceIdx}`;
+  return `${block.type === 'shells' ? 'sh' : 's'}-${block.traceIdxs[0]}`;
+}
+
 /* ------------------------------------------------------------------ */
 
 function settlingLabel(trace: ToolTrace): string {
+  if (trace.kind === 'task') return trace.success === false ? '这块工作没做完，正在想办法' : '正在看执行报告，想下一步';
   if (trace.kind === 'search') return trace.success === false ? '搜索没成功，先按已知的回答' : '正在读搜索结果';
+  if (trace.kind === 'shell') return trace.success === false ? '这一步出错了，正在排查' : '正在看结果，想下一步';
   if (trace.success === false) return '这张没画成，正在整理说明';
   return '主体已经出来了，正在补细节';
 }
@@ -358,8 +371,7 @@ interface AssistantMessageProps {
   streaming: boolean;
   /** 流式时还没提交进 message.content 的尾巴 */
   buffer?: string;
-  liveReasoning?: string;
-  reasoningActive?: boolean;
+  liveThinking?: LiveThinking | null;
   thinking: boolean;
   isLast: boolean;
   models: ChatModel[];
@@ -374,8 +386,7 @@ function AssistantMessageImpl({
   message,
   streaming,
   buffer = '',
-  liveReasoning = '',
-  reasoningActive = false,
+  liveThinking = null,
   thinking,
   isLast,
   models,
@@ -388,7 +399,6 @@ function AssistantMessageImpl({
   const content = streaming ? `${message.content}${buffer}` : message.content;
   const trace = useMemo(() => message.tool_trace ?? [], [message.tool_trace]);
   const parts = useMemo(() => splitAssistantParts(content, trace), [content, trace]);
-  const reasoning = streaming ? liveReasoning : message.reasoning ?? '';
   const bodyRef = useRef<HTMLDivElement>(null);
   const copyAnchor = useRef<HTMLButtonElement>(null);
   const retryAnchor = useRef<HTMLButtonElement>(null);
@@ -402,13 +412,44 @@ function AssistantMessageImpl({
   );
 
   const hasRunningTool = trace.some((t) => t.status === 'running');
-  const waiting = streaming && !content.trim() && trace.length === 0 && !reasoning;
+  const waiting = streaming && !content.trim() && trace.length === 0;
   const waitingSince = useStartedAt(waiting);
   const waitingSeconds = useElapsed(waitingSince, waiting);
 
-  // 工具卡片后面还没有文字：说明模型在消化工具结果
-  const lastTextIndex = parts.reduce((acc, p, i) => (p.type === 'text' ? i : acc), -1);
-  const blocks = useMemo(() => groupSearches(parts, trace), [parts, trace]);
+  // 思考：生成中看实时状态，生成完看存下来的用时 / token 数
+  const live = streaming ? liveThinking : null;
+  const thinkingNow = Boolean(live && live.endedAt === null);
+  const thoughtSeconds = streaming
+    ? live?.stats?.seconds ?? (live?.sawReasoning && live.endedAt ? Math.round((live.endedAt - live.startedAt) / 1000) : undefined)
+    : message.reasoning_seconds;
+  const thoughtTokens = streaming ? live?.stats?.tokens : message.reasoning_tokens;
+  const showThought = !thinkingNow && Boolean(thoughtSeconds || thoughtTokens);
+
+  const blocks = useMemo(() => groupTools(parts, trace), [parts, trace]);
+  const lastBlock = blocks[blocks.length - 1];
+  // 最后一块是工具、后面还没有文字：模型在消化工具结果、写下一步
+  const settling = streaming && !hasRunningTool && lastBlock?.type !== 'text';
+  const lastTool = lastBlock && lastBlock.type !== 'text'
+    ? trace[lastBlock.type === 'tool' || lastBlock.type === 'task' ? lastBlock.traceIdx : lastBlock.traceIdxs[lastBlock.traceIdxs.length - 1]]
+    : undefined;
+  // 两步之间模型不出声的那段（在想、或者在把一大段正文写进下一条命令，中转会攒到最后一起发）：
+  // 底部一行持续计时，别让界面看起来停住了。这段时间事后记到写出来的那一步上（prepSeconds）
+  const doneCount = trace.filter((t) => t.status === 'done').length;
+  const quietMs = useQuietFor(`${content.length}:${trace.length}:${doneCount}`, streaming && !waiting);
+  const imageSettling = settling && lastTool?.kind === 'image_gen';
+  const idle = streaming && !waiting && !hasRunningTool && !imageSettling && (settling || quietMs >= STALL_MS);
+  const idleLabel = settling && lastTool ? settlingLabel(lastTool) : '正在准备下一步';
+
+  // 这条回答交付的全部文件放在最后一个工具块后面（工作过程 → 交付物 → 正文），不再跟着每一组走
+  const files = useMemo(() => messageFiles({ ...message, tool_trace: trace }), [message, trace]);
+  let lastToolAt = -1;
+  blocks.forEach((b, i) => { if (b.type !== 'text') lastToolAt = i; });
+  // 回答还在进行时，最后一个工具块如果是沙箱工作过程 / 派出去的一块工作，就是"正在做"的那张卡
+  const liveType = streaming ? blocks[lastToolAt]?.type : undefined;
+  const liveShellsAt = liveType === 'shells' ? lastToolAt : -1;
+  const liveTaskAt = liveType === 'task' ? lastToolAt : -1;
+  // 它后面还没有正文时，"在想下一步"显示在卡片标题上，不在底部另起一行
+  const idleInCard = liveShellsAt >= 0 && liveShellsAt === blocks.length - 1;
 
   const copyRichAnswer = async () => {
     const md = messageMarkdown(content);
@@ -417,7 +458,8 @@ function AssistantMessageImpl({
       .map((node) => {
         const clone = node.cloneNode(true) as HTMLElement;
         clone.querySelectorAll('[data-copy-skip]').forEach((el) => el.remove());
-        return clone.outerHTML;
+        // 渲染时为了让粗体认得中文标点插过零宽空格，复制出去不要带上
+        return clone.outerHTML.replace(/​/g, '');
       })
       .join('');
     const ok = html ? await copyRich(html, markdownToPlain(md)) : await copyText(markdownToPlain(md));
@@ -427,9 +469,67 @@ function AssistantMessageImpl({
   const otherModels = models.filter((m) => m.available && m.id !== currentModelId);
   const showActions = !streaming && (content.trim() || trace.length > 0);
 
+  const renderBlock = (block: Block, at: number): ReactNode => {
+    if (block.type === 'text') {
+      return (
+        <div key={`t-${block.index}`} data-part="text">
+          <Markdown
+            content={block.value}
+            streaming={streaming && block.index === parts.length - 1}
+            hiddenImageUrls={hiddenImages}
+          />
+        </div>
+      );
+    }
+    if (block.type === 'searches') {
+      const items = block.traceIdxs.map((i) => trace[i]).filter((t): t is SearchToolTrace => t?.kind === 'search');
+      return (
+        <div key={`s-${block.traceIdxs[0]}`} data-part="tool">
+          <SearchGroup traces={items} />
+        </div>
+      );
+    }
+    if (block.type === 'shells') {
+      const steps = block.traceIdxs.map((i) => trace[i]).filter((t): t is ShellToolTrace => t?.kind === 'shell');
+      return (
+        <div key={`sh-${block.traceIdxs[0]}`} data-part="tool">
+          <ShellGroup
+            steps={steps}
+            live={at === liveShellsAt}
+            idle={at === liveShellsAt && idleInCard && idle ? { label: idleLabel, seconds: Math.floor(quietMs / 1000) } : undefined}
+          />
+        </div>
+      );
+    }
+    if (block.type === 'task') {
+      const task = trace[block.traceIdx];
+      if (task?.kind !== 'task') return null;
+      const steps = block.stepIdxs.map((i) => trace[i]).filter((t): t is ShellToolTrace => t?.kind === 'shell');
+      return (
+        <div key={`task-${block.traceIdx}`} data-part="tool">
+          <TaskCard task={task} steps={steps} live={at === liveTaskAt} />
+        </div>
+      );
+    }
+    const item = trace[block.traceIdx];
+    if (!item || item.kind === 'shell' || item.kind === 'task') return null;
+    return (
+      <div key={`tool-${block.traceIdx}`} data-part="tool">
+        {item.kind === 'search' ? (
+          <SearchCard trace={item} />
+        ) : (
+          // 画图有自己的收尾状态（先出主体再补细节），不走底部那行
+          <ImageCard trace={item} settlingLabel={imageSettling && block === lastBlock ? settlingLabel(item) : undefined} />
+        )}
+      </div>
+    );
+  };
+
   return (
     <div className="group/assistant relative" data-message-id={message.id} data-role="assistant">
-      {waiting ? (
+      {waiting && thinkingNow ? (
+        <ThinkingChip active startedAt={live?.startedAt} />
+      ) : waiting ? (
         <div className="flex h-8 items-center gap-2.5 text-[13.5px]">
           <LockMark size={18} state="busy" className="text-fg" />
           <span className="shimmer-text">{thinking ? '思考中' : '正在组织回答'}</span>
@@ -437,50 +537,22 @@ function AssistantMessageImpl({
         </div>
       ) : (
         <>
-          {reasoning && <ReasoningBlock text={reasoning} active={streaming && reasoningActive} seconds={message.reasoning_seconds} />}
-          {streaming && reasoning && !reasoningActive && !content.trim() && trace.length === 0 && (
-            <div className="flex h-7 items-center gap-2.5 text-[13.5px]">
-              <LockMark size={16} state="busy" className="text-fg" />
-              <span className="shimmer-text">正在组织回答</span>
+          {showThought && <ThinkingChip active={false} seconds={thoughtSeconds} tokens={thoughtTokens} />}
+          <div ref={bodyRef}>
+            {blocks.map((block, at) => (
+              <Fragment key={blockKey(block)}>
+                {renderBlock(block, at)}
+                {at === lastToolAt && files.length > 0 && <Deliverables files={files} live={streaming} />}
+              </Fragment>
+            ))}
+          </div>
+          {idle && !idleInCard && (
+            <div className="mt-1 flex h-8 items-center gap-2.5 text-[13.5px] animate-fade">
+              <LockMark size={18} state="busy" className="text-fg" />
+              <span className="shimmer-text">{idleLabel}</span>
+              <Seconds value={Math.floor(quietMs / 1000)} />
             </div>
           )}
-          <div ref={bodyRef}>
-            {blocks.map((block) => {
-              if (block.type === 'text') {
-                return (
-                  <div key={`t-${block.index}`} data-part="text">
-                    <Markdown
-                      content={block.value}
-                      streaming={streaming && block.index === parts.length - 1}
-                      hiddenImageUrls={hiddenImages}
-                    />
-                  </div>
-                );
-              }
-              const settlingFor = (item: ToolTrace) =>
-                streaming && !hasRunningTool && block.index > lastTextIndex ? settlingLabel(item) : undefined;
-              if (block.type === 'searches') {
-                const items = block.traceIdxs.map((i) => trace[i]).filter((t): t is SearchToolTrace => t?.kind === 'search');
-                const last = items[items.length - 1];
-                return (
-                  <div key={`s-${block.traceIdxs[0]}`} data-part="tool">
-                    <SearchGroup traces={items} settlingLabel={last ? settlingFor(last) : undefined} />
-                  </div>
-                );
-              }
-              const item = trace[block.traceIdx];
-              if (!item) return null;
-              return (
-                <div key={`tool-${block.traceIdx}`} data-part="tool">
-                  {item.kind === 'search' ? (
-                    <SearchCard trace={item} settlingLabel={settlingFor(item)} />
-                  ) : (
-                    <ImageCard trace={item} settlingLabel={settlingFor(item)} />
-                  )}
-                </div>
-              );
-            })}
-          </div>
         </>
       )}
 

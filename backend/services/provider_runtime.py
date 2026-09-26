@@ -182,7 +182,7 @@ class ProviderRuntime:
             "history": list(messages),
             "tools": tools or [],
             "temperature": temperature if temperature is not None else cfg.get("temperature", self.llm.temperature),
-            "max_tokens": max_tokens if max_tokens is not None else cfg.get("max_tokens", self.llm.max_tokens),
+            "max_tokens": self.llm.resolve_max_tokens(cfg, max_tokens),
             "enable_thinking": enable_thinking,
             "reasoning_effort": reasoning_effort,
             "extra_payload": dict(extra_payload or {}),
@@ -249,8 +249,9 @@ class ProviderRuntime:
             "messages": state["history"],
             "stream": False,
             "temperature": state["temperature"],
-            "max_tokens": state["max_tokens"],
         }
+        if state.get("max_tokens"):
+            payload["max_tokens"] = state["max_tokens"]
         if state.get("tools"):
             payload["tools"] = state["tools"]
         transport_str = str(state.get("transport") or "")

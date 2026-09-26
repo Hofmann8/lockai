@@ -30,6 +30,8 @@ eggs/
 lib/
 !lockai/src/lib/
 !lockai/src/lib/**
+!promo/src/lib/
+!promo/src/lib/**
 lib64/
 parts/
 sdist/
@@ -182,3 +184,13 @@ backend/scripts/backend/tmp/
 # Next.js env (production secrets)
 # ============================================
 lockai/.env.production
+
+# ============================================
+# Sandbox template
+# ============================================
+# 抠图模型 176MB，构建前从 OSS assets/models/ 拉到本地
+sandbox/models/
+
+# pdf.js 资源（npm run dev / build 时从 node_modules 复制）
+lockai/public/pdfjs/
+lockai/public/sqljs/

@@ -1,6 +1,8 @@
 import type { ThinkingLevel } from '@/types';
 
 export type ImageQuality = 'standard' | 'hd';
+/** 文档 / 幻灯片交付：排版质量优先（LaTeX、网页排版出 PDF，另转 Word）或方便编辑优先（直接出 Word / PPT） */
+export type DeliveryMode = 'quality' | 'editable';
 
 export interface ChatSettings {
   selectedModelId: string | null;
@@ -8,16 +10,18 @@ export interface ChatSettings {
   imageQuality: ImageQuality;
   /** 回答结束后给出追问建议 */
   suggestions: boolean;
+  delivery: DeliveryMode;
 }
 
 const SETTINGS_KEY = 'lockai_settings';
 const SETTINGS_CHANGE_EVENT = 'lockai_settings_change';
 
 const defaultSettings: ChatSettings = {
-  selectedModelId: 'campbell',
+  selectedModelId: 'scooby',
   thinkingLevel: 'standard',
   imageQuality: 'standard',
   suggestions: true,
+  delivery: 'quality',
 };
 
 function normalizeSettings(raw: Record<string, unknown>): ChatSettings {
@@ -31,6 +35,9 @@ function normalizeSettings(raw: Record<string, unknown>): ChatSettings {
     merged.imageQuality = 'standard';
   }
   merged.suggestions = merged.suggestions !== false;
+  if (!['quality', 'editable'].includes(merged.delivery as string)) {
+    merged.delivery = 'quality';
+  }
   return merged;
 }
 

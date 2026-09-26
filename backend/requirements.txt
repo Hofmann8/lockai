@@ -13,8 +13,16 @@ dashscope>=1.25.6
 # Environment
 python-dotenv>=1.0.0
 
+# 计费时自己数 prompt token（扣掉中转站注入的部分）；编码文件在 assets/tiktoken/，不联网
+tiktoken>=0.7.0
+
 # S3 Storage
 boto3>=1.35.0
+
+# 云沙箱（阿里云函数计算，E2B 协议兼容）
+# e2b 2.51 起建沙箱改走 POST /v2/sandboxes，阿里云还不支持（405），先锁 2.50
+e2b==2.50.0
+e2b-code-interpreter==2.10.0
 
 # Production Server（gunicorn 管进程，uvicorn worker 跑 ASGI）
 gunicorn>=22.0.0

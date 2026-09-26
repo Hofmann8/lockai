@@ -101,7 +101,6 @@ export async function truncateMessages(sessionId: string, messageId: string): Pr
 }
 
 export async function addMessage(sessionId: string, message: ChatMessage): Promise<boolean> {
-  console.log('[chat-history] addMessage 开始, sessionId:', sessionId, 'role:', message.role);
   try {
     const res = await fetch(`${API_BASE_URL}/api/sessions/${sessionId}/messages`, {
       method: 'POST',
@@ -111,12 +110,13 @@ export async function addMessage(sessionId: string, message: ChatMessage): Promi
         role: message.role,
         content: message.content,
         images: message.images,
+        files: message.files,
         tool_trace: message.tool_trace,
         reasoning: message.reasoning,
         reasoning_seconds: message.reasoning_seconds,
+        reasoning_tokens: message.reasoning_tokens,
       }),
     });
-    console.log('[chat-history] addMessage 响应:', res.status, res.ok);
     return res.ok;
   } catch (e) {
     console.error('[chat-history] addMessage 异常:', e);
@@ -141,12 +141,13 @@ export async function updateSession(
 }
 
 /** 从某条消息分叉出新会话，返回新会话 id */
-export async function branchSession(sessionId: string, messageId: string): Promise<string | null> {
+/** 从某条消息分出新会话；exclusive 时不含这条消息本身（重试 / 改写重发用） */
+export async function branchSession(sessionId: string, messageId: string, exclusive = false): Promise<string | null> {
   try {
     const res = await fetch(`${API_BASE_URL}/api/sessions/${sessionId}/branch`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ message_id: messageId }),
+      body: JSON.stringify({ message_id: messageId, ...(exclusive ? { exclusive: true } : {}) }),
     });
     if (!res.ok) return null;
     const data = await res.json();

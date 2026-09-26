@@ -39,6 +39,12 @@ class GenerateTitleBody(Body):
 
 class TruncateBody(Body):
     message_id: str | None = None
+    # 分支：True 时不含这条消息本身（重试 / 改写重发：从这条用户消息之前分出去，再重新发）
+    exclusive: bool = False
+
+
+class StopRunBody(Body):
+    discard: bool = False
 
 
 class AddMessageBody(Body):
@@ -46,9 +52,11 @@ class AddMessageBody(Body):
     role: str | None = None
     content: str | None = None
     images: list[Any] | None = None
+    files: list[Any] | None = None
     tool_trace: list[Any] | None = None
     reasoning: str | None = None
     reasoning_seconds: int | None = None
+    reasoning_tokens: int | None = None
 
 
 class UploadImageBody(Body):
@@ -71,6 +79,9 @@ class ChatBody(Body):
     reasoning_effort: str | None = None
     current_message_id: str | None = None
     image_quality: str | None = None
+    files: list[dict[str, Any]] | None = None  # 当前这条消息的附件
+    delivery: str | None = None  # 交付偏好：quality（排版质量优先）/ editable（方便编辑优先）
+    evict: str | None = None  # 同时回答已满时，用户选了要停下的那段对话（不填就停跑得最久的）
 
 
 class SuggestionsBody(Body):

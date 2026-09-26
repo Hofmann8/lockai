@@ -1,0 +1,207 @@
+#!/usr/bin/env python3
+"""
+把 LaTeX 或 Markdown 源文件转成排版规整的 Word。从源文件转而不是从 PDF 反推：
+标题层级、公式、表格、脚注、参考文献都是 Word 原生对象，用户拿去还能接着改。
+
+    todocx paper.tex [-o outputs/论文.docx]
+    todocx report.md [-o outputs/报告.docx]
+
+流程：预处理（LaTeX 的参考文献编号、图表编号、去掉只对 PDF 有意义的字号字体命令）
+→ pandoc（套 /opt/lockai/templates/reference.docx 的中文论文样式）
+→ python-docx 收尾（参考文献悬挂缩进、三线表、标题编号间距）。
+"""
+
+import argparse
+import re
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+REFERENCE = Path("/opt/lockai/templates/reference.docx")
+
+# 只影响 PDF 外观、pandoc 不认识的命令：直接去掉（带一个参数的连参数一起去）
+DROP_WITH_ARG = ("zihao", "linespread", "setlength", "vspace", "hspace", "captionsetup", "pagestyle", "thispagestyle")
+DROP_BARE = ("sffamily", "rmfamily", "bfseries", "heiti", "songti", "kaishu", "fangsong", "centering", "noindent",
+             "newpage", "clearpage", "small", "footnotesize", "large", "Large", "LARGE", "huge", "Huge", "normalsize")
+
+
+def skip_group(tex: str, start: int) -> int:
+    """从 start 处的 { 开始，返回配对的 } 之后的位置。"""
+    depth = 0
+    for i in range(start, len(tex)):
+        if tex[i] == "{":
+            depth += 1
+        elif tex[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return i + 1
+    return len(tex)
+
+
+def drop_redefinitions(tex: str) -> str:
+    """去掉对 abstract 等环境的重定义：pandoc 会照定义展开，反而认不出这是摘要。"""
+    pattern = re.compile(r"\\renewenvironment\{(abstract|thebibliography)\}")
+    while (m := pattern.search(tex)) is not None:
+        end = m.end()
+        for _ in range(2):
+            while end < len(tex) and tex[end] in " \n\t%":
+                end += 1
+            if end < len(tex) and tex[end] == "{":
+                end = skip_group(tex, end)
+        tex = tex[: m.start()] + tex[end:]
+    return tex
+
+
+def number_captions(tex: str) -> str:
+    """图表标题加上"图 1""表 1"（pandoc 转 Word 时不编号），和 PDF 里一致。"""
+    counters = {"figure": 0, "table": 0}
+    labels = {"figure": "图", "table": "表"}
+
+    def env(m: re.Match) -> str:
+        kind = m.group(1)
+        counters[kind] += 1
+        prefix = f"{labels[kind]} {counters[kind]}\u3000"
+        return re.sub(r"\\caption\{", lambda _: "\\caption{" + prefix, m.group(0), count=1)
+
+    return re.sub(r"\\begin\{(figure|table)\*?\}.*?\\end\{\1\*?\}", env, tex, flags=re.S)
+
+
+def strip_commands(tex: str) -> str:
+    for name in DROP_WITH_ARG:
+        tex = re.sub(r"\\%s\*?(\[[^\]]*\])?\{[^{}]*\}" % name, "", tex)
+    tex = re.sub(r"\\(%s)\b\s*" % "|".join(DROP_BARE), "", tex)
+    tex = tex.replace("\\quad", " ").replace("\\qquad", "  ")
+    return tex
+
+
+def number_references(tex: str) -> str:
+    """thebibliography 换成带 [n] 的普通段落，\\cite 换成对应编号，Word 里和 PDF 一致。"""
+    match = re.search(r"\\begin\{thebibliography\}\{[^}]*\}(.*?)\\end\{thebibliography\}", tex, re.S)
+    if not match:
+        return tex
+    items = re.split(r"\\bibitem(?:\[[^\]]*\])?\{([^}]*)\}", match.group(1))
+    keys: dict[str, int] = {}
+    entries: list[str] = []
+    for i in range(1, len(items), 2):
+        key, text = items[i].strip(), " ".join(items[i + 1].split())
+        keys[key] = len(entries) + 1
+        entries.append(f"[{len(entries) + 1}] {text}")
+    body = "\\section*{参考文献}\n\n" + "\n\n".join(entries) + "\n"
+    tex = tex[: match.start()] + body + tex[match.end():]
+
+    def cite(m: re.Match) -> str:
+        nums = [keys.get(k.strip()) for k in m.group(1).split(",")]
+        nums = [n for n in nums if n]
+        return f"[{','.join(map(str, nums))}]" if nums else ""
+
+    return re.sub(r"\\cite(?:\[[^\]]*\])?\{([^}]*)\}", cite, tex)
+
+
+def polish(path: Path) -> None:
+    from docx import Document
+    from docx.enum.table import WD_TABLE_ALIGNMENT
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Pt
+
+    doc = Document(str(path))
+    styles = {s.name for s in doc.styles}
+
+    # 参考文献：标题之后的段落用悬挂缩进的 Bibliography 样式
+    in_refs = False
+    for para in doc.paragraphs:
+        if para.style.name.startswith("Heading"):
+            in_refs = para.text.strip().replace(" ", "") in {"参考文献", "References"}
+            # 编号后面 pandoc 用的是制表符，跳到默认制表位留白太宽，换成空格（和 PDF 一致）
+            for run in para.runs:
+                if "\t" in run.text:
+                    run.text = run.text.replace("\t", " ")
+            continue
+        if in_refs and para.text.strip() and "Bibliography" in styles:
+            para.style = next(s for s in doc.styles if s.name == "Bibliography")
+
+    # 三线表：顶线、底线粗，表头下细线；表格居中、五号字
+    for table in doc.tables:
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        tbl_pr = table._tbl.tblPr
+        for old in tbl_pr.findall(qn("w:tblBorders")):
+            tbl_pr.remove(old)
+        borders = OxmlElement("w:tblBorders")
+        for edge, size in (("top", 12), ("bottom", 12), ("left", 0), ("right", 0), ("insideH", 0), ("insideV", 0)):
+            el = OxmlElement(f"w:{edge}")
+            el.set(qn("w:val"), "single" if size else "nil")
+            if size:
+                el.set(qn("w:sz"), str(size))
+                el.set(qn("w:color"), "000000")
+            borders.append(el)
+        tbl_pr.append(borders)
+        if table.rows:
+            for cell in table.rows[0].cells:
+                tc_pr = cell._tc.get_or_add_tcPr()
+                tc_borders = OxmlElement("w:tcBorders")
+                bottom = OxmlElement("w:bottom")
+                bottom.set(qn("w:val"), "single")
+                bottom.set(qn("w:sz"), "6")
+                bottom.set(qn("w:color"), "000000")
+                tc_borders.append(bottom)
+                tc_pr.append(tc_borders)
+        short = len(table.rows) <= 15
+        for index, row in enumerate(table.rows):
+            tr_pr = row._tr.get_or_add_trPr()
+            tr_pr.append(OxmlElement("w:cantSplit"))
+            for cell in row.cells:
+                for para in cell.paragraphs:
+                    para.paragraph_format.first_line_indent = Pt(0)
+                    # 短表整张放在同一页，不被分页拆开
+                    para.paragraph_format.keep_with_next = short and index < len(table.rows) - 1
+                    for run in para.runs:
+                        run.font.size = Pt(10.5)
+    doc.save(str(path))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="LaTeX / Markdown → Word（套中文论文样式）")
+    parser.add_argument("source", help=".tex 或 .md")
+    parser.add_argument("-o", "--output")
+    parser.add_argument("--reference-doc", default=str(REFERENCE))
+    parser.add_argument("--no-number-sections", action="store_true", help="标题不自动编号（正文里的标题自己写了编号时用）")
+    args = parser.parse_args()
+
+    src = Path(args.source).resolve()
+    out = Path(args.output).resolve() if args.output else src.with_suffix(".docx")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    text = src.read_text(encoding="utf-8")
+    is_tex = src.suffix.lower() in {".tex", ".latex"}
+    if is_tex:
+        text = number_references(strip_commands(number_captions(drop_redefinitions(text))))
+
+    with tempfile.NamedTemporaryFile("w", suffix=src.suffix, dir=src.parent, delete=False, encoding="utf-8") as tmp:
+        tmp.write(text)
+        pre = Path(tmp.name)
+    cmd = [
+        "pandoc", str(pre), "-f", "latex" if is_tex else "markdown", "-t", "docx", "-o", str(out),
+        f"--reference-doc={args.reference_doc}", f"--resource-path={src.parent}",
+        "-M", "lang=zh-Hans", "-M", "abstract-title=摘　要",
+    ]
+    # LaTeX 的 \section 默认编号，Word 版跟着编号；Markdown 的标题一般自己写了"一、"之类，不再加
+    if is_tex and not args.no_number_sections and "\\section{" in text:
+        cmd.append("--number-sections")
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True)
+    finally:
+        pre.unlink(missing_ok=True)
+    if result.returncode != 0:
+        sys.stderr.write(result.stderr)
+        return result.returncode
+    for line in result.stderr.splitlines():
+        # 只提示真正丢内容的警告
+        if "Could not" in line or "not found" in line:
+            print("注意:", line)
+    polish(out)
+    print(out)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

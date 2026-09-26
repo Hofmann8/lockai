@@ -18,9 +18,11 @@ import {
   ChevronDown,
   CornerDownRight,
   FileText,
+  FolderUp,
   ImagePlus,
   ListPlus,
   Mic,
+  Paperclip,
   MessageCircleQuestion,
   Plus,
   Sparkles,
@@ -31,25 +33,42 @@ import {
 import type { ChatModel, ThinkingLevel } from '@/types';
 import { cn, modKey } from '@/lib/cn';
 import { ACCEPTED_IMAGE_TYPES, compressImage } from '@/lib/image';
-import { EMPTY_DRAFT, isDraftEmpty, LONG_PASTE_THRESHOLD, type ComposerDraft } from '@/lib/chat/compose';
+import { EMPTY_DRAFT, isDraftEmpty, LONG_PASTE_THRESHOLD, type ComposerDraft, type DraftFile } from '@/lib/chat/compose';
+import { uploadFile } from '@/lib/api';
+import { getAuthState } from '@/lib/auth';
 import type { QueuedMessage } from '@/lib/chat/useChatController';
 import { useVoiceInput } from '@/lib/hooks/useVoiceInput';
 import { MenuItem, MenuLabel, Popover } from '@/components/ui/Popover';
 import { Tooltip } from '@/components/ui/Tooltip';
 import { toast } from '@/components/ui/Toast';
+import { createLimiter, fromDirectoryInput, groupByFolder, isJunk, type PickedFile } from '@/lib/chat/uploads';
+import { FileChip } from './WorkCards';
+import { FolderChip } from './UploadTree';
 
-const MAX_IMAGES = 4;
+/** 图片是直接放进上下文给模型看的，有上限；更多的图作为文件上传，放进沙箱按需看 */
+const MAX_IMAGES = 8;
+/** 文件不限个数，只放进沙箱：单个 100 MB，一条消息合计 2 GB，防止误把整个硬盘拖进来 */
+const MAX_FILE_BYTES = 100 * 1024 * 1024;
+const MAX_TOTAL_BYTES = 2 * 1024 * 1024 * 1024;
+const uploadLimit = createLimiter(4);
 
 export interface ComposerHandle {
   focus: () => void;
   addQuote: (text: string) => void;
+  /** 零散的文件：能直接看的图片进图片通道（超出上限的转成文件），其余当文件 */
   addFiles: (files: File[]) => void;
+  /** 文件夹里的文件（带相对路径），一律当文件 */
+  addPicked: (files: PickedFile[]) => void;
   setText: (text: string) => void;
+  /** 发送被取消时把草稿放回去（输入框里已经有新内容就不覆盖） */
+  restore: (draft: ComposerDraft) => void;
 }
 
 interface ComposerProps {
   handleRef?: Ref<ComposerHandle>;
   variant: 'hero' | 'dock';
+  /** 附件上传到哪个会话目录下（新对话还没有会话时为空） */
+  sessionId?: string | null;
   busy: boolean;
   models: ChatModel[];
   selectedModelId: string;
@@ -71,12 +90,15 @@ interface ComposerProps {
 }
 
 function queuePreview(draft: ComposerDraft) {
-  return draft.text.trim() || draft.quotes[0] || (draft.images.length ? `${draft.images.length} 张图片` : '粘贴的内容');
+  return draft.text.trim()
+    || draft.quotes[0]
+    || (draft.images.length ? `${draft.images.length} 张图片` : draft.files.length ? `${draft.files.length} 个附件` : '粘贴的内容');
 }
 
 export function Composer({
   handleRef,
   variant,
+  sessionId,
   busy,
   models,
   selectedModelId,
@@ -103,6 +125,10 @@ export function Composer({
   const [focused, setFocused] = useState(false);
   const textRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const attachRef = useRef<HTMLInputElement>(null);
+  const folderRef = useRef<HTMLInputElement | null>(null);
+  /** 排队中被移除的附件，轮到它时就不传了 */
+  const removedRef = useRef(new Set<string>());
   const modelAnchor = useRef<HTMLButtonElement>(null);
   const thinkAnchor = useRef<HTMLButtonElement>(null);
   const plusAnchor = useRef<HTMLButtonElement>(null);
@@ -125,19 +151,69 @@ export function Composer({
     if (window.matchMedia('(pointer: fine)').matches) textRef.current?.focus();
   }, []);
 
-  const addFiles = useCallback(async (files: File[]) => {
-    const images = files.filter((f) => f.type.startsWith('image/'));
-    if (images.length === 0) return;
-    const room = MAX_IMAGES - draft.images.length;
-    if (room <= 0) {
-      toast(`一次最多 ${MAX_IMAGES} 张图片`);
-      return;
+  const uploading = draft.files.some((f) => f.status === 'uploading');
+
+  const draftBytes = draft.files.reduce((sum, f) => sum + f.size, 0);
+  const draftGroups = groupByFolder(draft.files, (f) => f.path);
+
+  /** 文件：选中就开始传（最多 4 个并发），传好的在发送时一起带上，放进沙箱 inputs/ 让模型处理 */
+  const attachFiles = useCallback((picked: PickedFile[]) => {
+    const files = picked.filter((p) => !isJunk(p.path ?? p.file.name));
+    if (files.length === 0) return;
+    const tooBig = files.filter((p) => p.file.size > MAX_FILE_BYTES);
+    if (tooBig.length > 0) {
+      const names = tooBig.slice(0, 3).map((p) => p.file.name).join('、') + (tooBig.length > 3 ? ` 等 ${tooBig.length} 个` : '');
+      toast(`单个文件不能超过 100 MB，${names}没有加上`, { tone: 'danger' });
     }
-    if (images.length > room) toast(`一次最多 ${MAX_IMAGES} 张图片，多出来的没有加上`);
+    const accepted: PickedFile[] = [];
+    let total = draftBytes;
+    for (const p of files) {
+      if (p.file.size > MAX_FILE_BYTES) continue;
+      if (total + p.file.size > MAX_TOTAL_BYTES) {
+        toast('一条消息的文件合计不能超过 2 GB，多出来的没有加上', { tone: 'danger' });
+        break;
+      }
+      total += p.file.size;
+      accepted.push(p);
+    }
+    if (accepted.length === 0) return;
+    const entries: DraftFile[] = accepted.map((p) => ({ id: crypto.randomUUID(), name: p.file.name, path: p.path, size: p.file.size, status: 'uploading' }));
+    setDraft((d) => ({ ...d, files: [...d.files, ...entries] }));
+    const userId = getAuthState().user?.id;
+    let failed = 0;
+    entries.forEach((entry, i) => {
+      void uploadLimit(() => (removedRef.current.has(entry.id)
+        ? Promise.resolve(null)
+        : uploadFile(accepted[i].file, userId, sessionId ?? undefined, entry.path))).then((artifact) => {
+        if (removedRef.current.has(entry.id)) return;
+        setDraft((d) => ({
+          ...d,
+          files: d.files.map((f) => (f.id === entry.id ? { ...f, status: artifact ? 'done' : 'error', artifact: artifact ?? undefined } : f)),
+        }));
+        // 文件夹里的失败合起来提示一次，不刷屏
+        if (!artifact && (failed += 1) === 1) toast(`${entry.path ?? entry.name} 上传失败`, { tone: 'danger' });
+      });
+    });
+    textRef.current?.focus();
+  }, [draftBytes, sessionId]);
+
+  const removeFiles = (ids: string[]) => {
+    for (const id of ids) removedRef.current.add(id);
+    setDraft((d) => ({ ...d, files: d.files.filter((f) => !ids.includes(f.id)) }));
+  };
+
+  const addFiles = useCallback(async (files: File[]) => {
+    // 能直接给模型看的图片走图片通道，其余一律当文件
+    const images = files.filter((f) => ACCEPTED_IMAGE_TYPES.split(',').includes(f.type));
+    const room = Math.max(0, MAX_IMAGES - draft.images.length);
+    const overflow = images.slice(room);
+    attachFiles([...files.filter((f) => !images.includes(f)), ...overflow].map((file) => ({ file })));
+    if (overflow.length > 0) toast(`图片一次最多 ${MAX_IMAGES} 张直接给模型看，其余 ${overflow.length} 张作为文件上传了，它需要时会去看`);
+    if (room === 0 || images.length === 0) return;
     const urls = await Promise.all(images.slice(0, room).map((f) => compressImage(f)));
     setDraft((d) => ({ ...d, images: [...d.images, ...urls].slice(0, MAX_IMAGES) }));
     textRef.current?.focus();
-  }, [draft.images.length]);
+  }, [attachFiles, draft.images.length]);
 
   useImperativeHandle(handleRef, () => ({
     focus: () => textRef.current?.focus(),
@@ -146,16 +222,28 @@ export function Composer({
       window.requestAnimationFrame(() => textRef.current?.focus());
     },
     addFiles: (files: File[]) => void addFiles(files),
+    addPicked: (files: PickedFile[]) => attachFiles(files),
     setText: (text: string) => {
       setDraft((d) => ({ ...d, text }));
       window.requestAnimationFrame(() => textRef.current?.focus());
     },
-  }), [addFiles]);
+    restore: (previous: ComposerDraft) => {
+      setDraft((d) => (d.text || d.images.length || d.files.length || d.quotes.length || d.pastes.length ? d : previous));
+      window.requestAnimationFrame(() => textRef.current?.focus());
+    },
+  }), [addFiles, attachFiles]);
 
   const reset = () => setDraft(EMPTY_DRAFT);
 
+  const draftState = draft;
   const submit = (mode: 'auto' | 'steer' = 'auto') => {
     if (empty || voice.recording) return;
+    if (uploading) {
+      toast('附件还在上传，传完再发');
+      return;
+    }
+    // 上传失败的附件不带
+    const draft = { ...draftState, files: draftState.files.filter((f) => f.status === 'done') };
     if (busy) {
       if (mode === 'steer') onSteer(draft);
       else onQueue(draft);
@@ -185,7 +273,7 @@ export function Composer({
   };
 
   const onPaste = (e: ClipboardEvent<HTMLTextAreaElement>) => {
-    const files = Array.from(e.clipboardData?.files ?? []).filter((f) => f.type.startsWith('image/'));
+    const files = Array.from(e.clipboardData?.files ?? []);
     if (files.length > 0) {
       e.preventDefault();
       void addFiles(files);
@@ -244,8 +332,29 @@ export function Composer({
           focused ? 'border-line-strong shadow-pop' : 'border-line shadow-float',
         )}
       >
-        {(draft.images.length > 0 || draft.quotes.length > 0 || draft.pastes.length > 0) && (
+        {(draft.images.length > 0 || draft.quotes.length > 0 || draft.pastes.length > 0 || draft.files.length > 0) && (
           <div className="flex flex-wrap gap-2 px-3 pt-3">
+            {[...draftGroups.folders].map(([name, list]) => (
+              <div key={`dir-${name}`} className="animate-pop">
+                <FolderChip
+                  name={name}
+                  total={list.length}
+                  done={list.filter((f) => f.status === 'done').length}
+                  failed={list.filter((f) => f.status === 'error').length}
+                  size={list.reduce((sum, f) => sum + f.size, 0)}
+                  onRemove={() => removeFiles(list.map((f) => f.id))}
+                />
+              </div>
+            ))}
+            {draftGroups.loose.map((file) => (
+              <div key={file.id} className="animate-pop">
+                <FileChip
+                  file={file.artifact ?? { name: file.name, size: file.size }}
+                  status={file.status}
+                  onRemove={() => removeFiles([file.id])}
+                />
+              </div>
+            ))}
             {draft.quotes.map((quote, i) => (
               <div key={`q-${i}`} className="flex max-w-full items-start gap-2 rounded-2xl bg-surface-2 py-1.5 pl-2.5 pr-1.5 text-[13px] text-fg-soft animate-pop">
                 <CornerDownRight className="mt-0.5 h-3.5 w-3.5 shrink-0 text-accent" />
@@ -316,6 +425,29 @@ export function Composer({
         )}
 
         <input
+          ref={attachRef}
+          type="file"
+          multiple
+          hidden
+          onChange={(e) => {
+            // "上传文件"选的一律当文件，图片也不进上下文
+            attachFiles(Array.from(e.target.files ?? []).map((file) => ({ file })));
+            e.target.value = '';
+          }}
+        />
+        <input
+          ref={(el) => {
+            folderRef.current = el;
+            el?.setAttribute('webkitdirectory', '');
+          }}
+          type="file"
+          hidden
+          onChange={(e) => {
+            attachFiles(fromDirectoryInput(Array.from(e.target.files ?? [])));
+            e.target.value = '';
+          }}
+        />
+        <input
           ref={fileRef}
           type="file"
           accept={ACCEPTED_IMAGE_TYPES}
@@ -346,11 +478,31 @@ export function Composer({
             <MenuItem
               icon={<ImagePlus className="h-4 w-4" />}
               label="上传图片"
+              description="直接给它看"
               hint={`${draft.images.length}/${MAX_IMAGES}`}
               disabled={draft.images.length >= MAX_IMAGES}
               onSelect={() => {
                 setPlusMenu(false);
                 fileRef.current?.click();
+              }}
+            />
+            <MenuItem
+              icon={<Paperclip className="h-4 w-4" />}
+              label="上传文件"
+              description="文档、表格、图片、音视频都行，数量不限，让它帮你处理"
+              hint={draft.files.length ? `${draft.files.length} 个` : undefined}
+              onSelect={() => {
+                setPlusMenu(false);
+                attachRef.current?.click();
+              }}
+            />
+            <MenuItem
+              icon={<FolderUp className="h-4 w-4" />}
+              label="上传文件夹"
+              description="整个文件夹传上去，目录结构保持不变"
+              onSelect={() => {
+                setPlusMenu(false);
+                folderRef.current?.click();
               }}
             />
             <MenuItem

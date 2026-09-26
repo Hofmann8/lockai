@@ -61,12 +61,14 @@ function appendAutoClosedMarker(text: string, marker: string, markerIndex: numbe
  * 使用 Unicode property escape \p{P} 匹配所有 Unicode 标点（包括 CJK、全角、ASCII 括号等），
  * 避免手动维护字符范围遗漏。
  */
+// * 和 ~ 本身也属于 \p{P}，必须排除，否则会把 ** 拆成 *​*，粗体整个失效
+const PUNCT = '((?![*~])\\p{P})';
 const EMPHASIS_FLANKING_RE = new RegExp(
   // 标点紧跟在 opening marker 前面
-  `(\\p{P})(\\*{1,3}|~~)(?=[^\\s*~])` +
+  `${PUNCT}(\\*{1,3}|~~)(?=[^\\s*~])` +
   '|' +
   // closing marker 紧跟标点
-  `(?<=[^\\s*~])(\\*{1,3}|~~)(\\p{P})`,
+  `(?<=[^\\s*~])(\\*{1,3}|~~)${PUNCT}`,
   'gu',
 );
 const ZWS = '\u200B';

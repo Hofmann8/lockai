@@ -7,11 +7,13 @@
 
 from __future__ import annotations
 
+import base64
 import importlib
 import json
 import os
 import sys
 import tempfile
+import types
 import uuid
 
 import pytest
@@ -46,7 +48,7 @@ class _Client:
             from fastapi.testclient import TestClient
             self._c = TestClient(app)
 
-    def call(self, method, path, *, json_body=None, content=None, params=None, headers=None, files=None):
+    def call(self, method, path, *, json_body=None, content=None, params=None, headers=None, files=None, data=None):
         headers = dict(headers or {})
         if self._flask:
             kwargs = {"method": method, "headers": headers, "query_string": params}
@@ -54,7 +56,7 @@ class _Client:
                 kwargs["json"] = json_body
             elif files is not None:
                 import io
-                kwargs["data"] = {k: (io.BytesIO(v[1]), v[0]) for k, v in files.items()}
+                kwargs["data"] = {**(data or {}), **{k: (io.BytesIO(v[1]), v[0]) for k, v in files.items()}}
                 kwargs["content_type"] = "multipart/form-data"
             elif content is not None:
                 kwargs["data"] = content
@@ -65,6 +67,8 @@ class _Client:
             kwargs["json"] = json_body
         elif files is not None:
             kwargs["files"] = files
+            if data:
+                kwargs["data"] = data
         elif content is not None:
             kwargs["content"] = content
         r = self._c.request(method, path, **kwargs)
@@ -284,6 +288,49 @@ def test_upload_image_validation(client):
     bad = client.post("/api/upload-image", json_body={"image": "not-a-data-url"})
     assert bad.status == 400
     assert bad.json()["error"] == "无效的图片数据"
+    svg = client.post("/api/upload-image", json_body={"image": "data:image/svg+xml;base64,PHN2Zz4="})
+    assert svg.status == 400
+    big = "data:image/png;base64," + base64.b64encode(b"x" * (12 * 1024 * 1024 + 1)).decode()
+    assert client.post("/api/upload-image", json_body={"image": big}).status == 413
+
+
+class _FakeStorage:
+    available = True
+    bucket = "b"
+    public_url = "https://b.example"
+
+    def __init__(self):
+        self.keys = []
+        self._client = types.SimpleNamespace(upload_fileobj=lambda _f, _b, key, ExtraArgs=None: self.keys.append(key))
+
+
+def test_upload_file_keeps_folder_path(client, app_module, monkeypatch):
+    storage = _FakeStorage()
+    monkeypatch.setattr(app_module, "storage_service", storage)
+    r = client.post(
+        "/api/upload-file",
+        files={"file": ("a.jpg", b"jpg")},
+        data={"user_id": "u1", "session_id": "s1", "path": "../活动照片/day1/a.jpg"},
+    )
+    assert r.status == 200
+    body = r.json()
+    assert body["name"] == "a.jpg" and body["path"] == "活动照片/day1/a.jpg"
+    assert storage.keys[0].endswith("/活动照片/day1/a.jpg") and ".." not in storage.keys[0]
+
+    plain = client.post("/api/upload-file", files={"file": ("b.pdf", b"pdf")}).json()
+    assert "path" not in plain
+
+
+def test_messages_keep_many_attachments_and_cap_images(client, app_module, monkeypatch):
+    monkeypatch.setattr(app_module, "storage_service", _FakeStorage())
+    sid = client.post("/api/sessions", json_body={"user_id": _uid()}).json()["id"]
+    files = [{"name": f"{i}.jpg", "path": f"照片/{i}.jpg", "url": f"https://b.example/u/{i}.jpg", "size": 1} for i in range(150)]
+    images = [f"https://b.example/img{i}.png" for i in range(12)]
+    r = client.post(f"/api/sessions/{sid}/messages", json_body={"role": "user", "content": "挑图", "files": files, "images": images})
+    assert r.status == 201
+    stored = client.get(f"/api/sessions/{sid}").json()["messages"][0]
+    assert len(stored["files"]) == 150 and stored["files"][3]["path"] == "照片/3.jpg"
+    assert len(stored["images"]) == 8
 
 
 # ------------------------------------------------------------------
@@ -427,12 +474,14 @@ def test_reasoning_round_trips_through_messages(client):
     sid = client.post("/api/sessions", json_body={"user_id": _uid()}).json()["id"]
     r = client.post(
         f"/api/sessions/{sid}/messages",
-        json_body={"role": "assistant", "content": "答案", "reasoning": "先想一想", "reasoning_seconds": 3},
+        json_body={"role": "assistant", "content": "答案", "reasoning": "先想一想", "reasoning_seconds": 3, "reasoning_tokens": 120},
     )
     assert r.status == 201
     stored = client.get(f"/api/sessions/{sid}").json()["messages"][0]
-    assert stored["reasoning"] == "先想一想"
+    # 思考文字只存库不下发，界面只要用时和 token 数
+    assert "reasoning" not in stored
     assert stored["reasoning_seconds"] == 3
+    assert stored["reasoning_tokens"] == 120
 
 
 def test_branch_copies_history_up_to_message(client):
@@ -452,6 +501,22 @@ def test_branch_copies_history_up_to_message(client):
     assert len(client.get(f"/api/sessions/{sid}").json()["messages"]) == 4
 
 
+def test_retry_branch_leaves_out_the_question_and_keeps_the_original(client):
+    uid = _uid()
+    sid = client.post("/api/sessions", json_body={"user_id": uid, "title": "原对话"}).json()["id"]
+    for i, role in enumerate(["user", "assistant", "user", "assistant"]):
+        client.post(f"/api/sessions/{sid}/messages", json_body={"id": f"r{i}-{sid[:6]}", "role": role, "content": f"第{i}条"})
+
+    r = client.post(f"/api/sessions/{sid}/branch", json_body={"message_id": f"r2-{sid[:6]}", "exclusive": True})
+    assert r.status == 201
+    branch = r.json()
+    assert branch["title"] == "原对话 · 重试"
+    copied = client.get(f"/api/sessions/{branch['id']}").json()["messages"]
+    assert [m["content"] for m in copied] == ["第0条", "第1条"]
+    # 原来那条（可能做了一半的）回答还在原对话里
+    assert [m["content"] for m in client.get(f"/api/sessions/{sid}").json()["messages"]] == ["第0条", "第1条", "第2条", "第3条"]
+
+
 def test_suggestions_skip_empty_input(client):
     r = client.post("/api/chat/suggestions", json_body={"user_message": "", "assistant_message": "x"})
     assert r.status == 200
@@ -462,3 +527,30 @@ def test_suggestions_use_service(client, app_module, monkeypatch):
     monkeypatch.setattr(app_module.ai_service, "suggest_followups", lambda q, a: ["再简单点", "举个例子"])
     r = client.post("/api/chat/suggestions", json_body={"user_message": "问", "assistant_message": "答"})
     assert r.json() == {"suggestions": ["再简单点", "举个例子"]}
+
+
+def test_delete_session_keeps_images_shared_with_branches(client, app_module, monkeypatch):
+    from services.storage import StorageService
+
+    monkeypatch.setenv("S3_PUBLIC_URL", "https://bucket.example.com")
+    storage = StorageService()
+    deleted = []
+    monkeypatch.setattr(storage, "delete_object", lambda key: deleted.append(key) or True)
+    uid = _uid()
+    base = f"users/{uid}/sessions"
+
+    sid = client.post("/api/sessions", json_body={"user_id": uid, "title": "原对话"}).json()["id"]
+    shared, own, orphan = (f"{base}/{sid}/images/{name}.png" for name in ("shared", "own", "orphan"))
+    monkeypatch.setattr(storage, "list_keys", lambda prefix: {orphan} if prefix == f"{base}/{sid}/" else set())
+    monkeypatch.setattr(app_module, "storage_service", storage)
+
+    client.post(f"/api/sessions/{sid}/messages", json_body={
+        "id": f"s0-{sid[:6]}", "role": "user", "content": "看图", "images": [f"https://bucket.example.com/{shared}"],
+    })
+    client.post(f"/api/sessions/{sid}/messages", json_body={
+        "id": f"s1-{sid[:6]}", "role": "assistant", "content": f"![](https://bucket.example.com/{own}?x-oss-process=image/blur,r_30,s_30)",
+    })
+    client.post(f"/api/sessions/{sid}/branch", json_body={"message_id": f"s0-{sid[:6]}"})
+
+    assert client.delete(f"/api/sessions/{sid}").status == 200
+    assert sorted(deleted) == sorted([own, orphan])

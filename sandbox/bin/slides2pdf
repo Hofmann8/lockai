@@ -1,0 +1,133 @@
+#!/usr/bin/env python3
+"""
+把 HTML 幻灯片（每页一个 <section class="slide">，1280×720）导出成 PDF，顺便检查每页有没有内容溢出。
+
+    slides2pdf deck.html [-o outputs/演示.pdf] [--png /tmp/pages] [--pptx outputs/演示.pptx]
+
+--png 会把每页转成小图（给 shell 的 show 自检用）。
+--pptx 另出一份图片版 PPTX（每页一张 1920×1080 的图，外观和 PDF 一模一样但不能改字），
+用户必须交 PPT 文件时用。
+"""
+
+import argparse
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+CHROMIUM = shutil.which("chromium") or "/usr/bin/chromium"
+FLAGS = ["--headless=new", "--no-sandbox", "--disable-gpu", "--hide-scrollbars", "--run-all-compositor-stages-before-draw",
+         "--virtual-time-budget=15000", "--font-render-hinting=none"]
+
+# 注入到页面里的检查：每页的子元素超出页面边界就打标记，--dump-dom 读回来
+PROBE = """
+<script>
+window.addEventListener('load', () => {
+  document.querySelectorAll('section.slide').forEach((slide, i) => {
+    const box = slide.getBoundingClientRect();
+    const over = [];
+    slide.querySelectorAll('*').forEach((el) => {
+      if (el.closest('.foot')) return;
+      const r = el.getBoundingClientRect();
+      if (r.width === 0 || r.height === 0) return;
+      if (r.bottom > box.bottom + 2 || r.right > box.right + 2) over.push(el.tagName.toLowerCase() + (el.className ? '.' + String(el.className).split(' ')[0] : ''));
+    });
+    if (slide.scrollHeight > slide.clientHeight + 2 || over.length) slide.setAttribute('data-overflow', over.slice(0, 3).join(',') || 'content');
+  });
+  document.body.setAttribute('data-probed', '1');
+});
+</script>
+"""
+
+
+def run(args: list[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(args, capture_output=True, text=True, timeout=180)
+
+
+def check_overflow(html: Path) -> tuple[int, list[str]]:
+    source = html.read_text(encoding="utf-8")
+    probed = source.replace("</body>", PROBE + "</body>") if "</body>" in source else source + PROBE
+    with tempfile.NamedTemporaryFile("w", suffix=".html", dir=html.parent, delete=False, encoding="utf-8") as tmp:
+        tmp.write(probed)
+        path = Path(tmp.name)
+    try:
+        dom = run([CHROMIUM, *FLAGS, "--window-size=1280,720", "--dump-dom", path.as_uri()]).stdout
+    finally:
+        path.unlink(missing_ok=True)
+    problems = []
+    sections = re.findall(r"<section[^>]*class=\"[^\"]*\bslide\b[^\"]*\"[^>]*>", dom)
+    for index, section in enumerate(sections, start=1):
+        found = re.search(r'data-overflow="([^"]*)"', section)
+        if found:
+            problems.append(f"第 {index} 页内容超出了页面（{found.group(1)}），删减文字或调小字号")
+    return len(sections), problems
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="HTML 幻灯片 → PDF")
+    parser.add_argument("html")
+    parser.add_argument("-o", "--output")
+    parser.add_argument("--png", help="同时把每页转成 PNG 放到这个目录（自检用）")
+    parser.add_argument("--pptx", help="另出一份图片版 PPTX 到这个路径")
+    args = parser.parse_args()
+
+    html = Path(args.html).resolve()
+    out = Path(args.output).resolve() if args.output else html.with_suffix(".pdf")
+    out.parent.mkdir(parents=True, exist_ok=True)
+
+    if not html.is_file():
+        print(f"找不到 {html}", file=sys.stderr)
+        return 1
+    slides, problems = check_overflow(html)
+    if slides == 0:
+        # 空文件或写坏了的 HTML 不导出，免得交付一份空白 PDF
+        print(f'{html.name} 里没有 <section class="slide">，没有导出。先确认 HTML 已经写好', file=sys.stderr)
+        return 1
+    for problem in problems:
+        print("注意:", problem)
+
+    result = run([CHROMIUM, *FLAGS, "--no-pdf-header-footer", f"--print-to-pdf={out}", html.as_uri()])
+    if result.returncode != 0 or not out.exists():
+        sys.stderr.write(result.stderr[-2000:])
+        return 1
+
+    pages = run(["pdfinfo", str(out)]).stdout
+    count = re.search(r"Pages:\s+(\d+)", pages)
+    size = re.search(r"Page size:\s+([\d.]+) x ([\d.]+)", pages)
+    if size and abs(float(size.group(1)) / float(size.group(2)) - 16 / 9) > 0.02:
+        print("注意: 页面不是 16:9，检查 base.css 是否正确引用")
+    print(f"{out}（{count.group(1) if count else '?'} 页）")
+
+    if args.png:
+        target = Path(args.png)
+        target.mkdir(parents=True, exist_ok=True)
+        for old in target.glob("p-*.png"):
+            old.unlink()
+        run(["pdftoppm", "-png", "-r", "48", str(out), str(target / "p")])
+        print("预览图:", " ".join(sorted(str(p) for p in target.glob("p-*.png"))))
+
+    if args.pptx:
+        from pptx import Presentation
+        from pptx.util import Emu
+
+        pptx_path = Path(args.pptx).resolve()
+        pptx_path.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory() as tmp:
+            # 1280px 的页面按 108dpi 出图正好 1920 宽
+            run(["pdftoppm", "-png", "-r", "108", str(out), f"{tmp}/s"])
+            deck = Presentation()
+            deck.slide_width, deck.slide_height = Emu(12192000), Emu(6858000)
+            title = re.search(r"<title>(.*?)</title>", html.read_text(encoding="utf-8"), re.S)
+            deck.core_properties.title = title.group(1).strip() if title else html.stem
+            for image in sorted(Path(tmp).glob("s-*.png")):
+                slide = deck.slides.add_slide(deck.slide_layouts[6])
+                slide.shapes.add_picture(str(image), 0, 0, width=deck.slide_width, height=deck.slide_height)
+            deck.save(str(pptx_path))
+        print(f"{pptx_path}（图片版，不能改字）")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -219,6 +219,17 @@ function SessionItem({
       >
         <span className="pair-rule" data-active={active}>{title}</span>
       </button>
+      {session.running && (
+        <span
+          role="status"
+          aria-label="正在回答"
+          title="正在回答"
+          className={cn(
+            'pointer-events-none absolute right-[15px] top-1/2 -mt-[3px] h-1.5 w-1.5 rounded-full bg-accent animate-breathe transition-opacity duration-150',
+            menu ? 'opacity-0' : 'group-hover/item:opacity-0 max-md:hidden',
+          )}
+        />
+      )}
       <button
         ref={anchor}
         type="button"

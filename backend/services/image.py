@@ -16,6 +16,7 @@ from math import gcd
 import httpx
 
 from .http_client import build_http_client
+from .storage import strip_image_processing
 
 from .tool_contracts import (
     DEFAULT_IMAGE_ASPECT_RATIO,
@@ -592,12 +593,10 @@ class ImageService:
             content_type=mime_type or "image/png",
         )
         if result:
-            # 水印按图片实际尺寸的比例贴（mark-pct），由前端容器负责缩放整张图
-            watermark_url = (
-                f"{result['url']}?mark=public/watermark2.svg"
-                f"&mark-pos=0.97,0.97&mark-pct=0.15&mark-alpha=0.4"
-            )
-            blurred_url = f"{watermark_url}&blur=30"
+            # 水印按图片实际尺寸的比例贴，由前端容器负责缩放整张图
+            width, height = image_metadata.get("width"), image_metadata.get("height")
+            watermark_url = self.storage.watermarked_url(result["url"], width, height)
+            blurred_url = self.storage.watermarked_url(result["url"], width, height, blur=True)
             return {
                 "success": True,
                 "image": watermark_url,
@@ -948,9 +947,7 @@ class ImageService:
         clean = self._clean_optional_string(url)
         if not clean:
             return clean
-        if "?mark=" in clean:
-            return clean.split("?", 1)[0]
-        return clean
+        return strip_image_processing(clean)
 
     def _collect_edit_source_candidates(
         self,
@@ -1211,7 +1208,7 @@ class ImageService:
 
     def _download_source_image(self, url: str) -> tuple[bytes | None, str | None]:
         try:
-            fetch_url = url.split("?", 1)[0] if "?mark=" in url else url
+            fetch_url = strip_image_processing(url)
             with build_http_client(IMAGE_GEN_TIMEOUT) as client:
                 resp = client.get(fetch_url)
             if resp.status_code != 200:

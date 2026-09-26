@@ -1,0 +1,217 @@
+#!/usr/bin/env python3
+"""
+apply_patch：按 Codex 的补丁格式改文件。GPT 系模型习惯用它做局部修改，
+沙盒里没有的话它会把整份文件重写一遍，又慢又容易出错。
+
+用法（两种都行）：
+  apply_patch <<'PATCH'
+  *** Begin Patch
+  ...
+  *** End Patch
+  PATCH
+
+  apply_patch '*** Begin Patch ... *** End Patch'
+
+支持的段落：
+  *** Add File: <path>       后面每行以 + 开头，是新文件的内容
+  *** Delete File: <path>
+  *** Update File: <path>    可跟一行 *** Move to: <new path>，
+                             然后是若干个以 @@ 开头的块，块里 ' ' 是上下文，'-' 删，'+' 加
+  *** End of File            （可选）表示这个块贴着文件结尾
+"""
+
+import os
+import sys
+
+BEGIN = "*** Begin Patch"
+END = "*** End Patch"
+ADD = "*** Add File: "
+DELETE = "*** Delete File: "
+UPDATE = "*** Update File: "
+MOVE = "*** Move to: "
+EOF_MARK = "*** End of File"
+
+
+class PatchError(Exception):
+    pass
+
+
+def parse(text):
+    lines = text.replace("\r\n", "\n").split("\n")
+    # 允许前后有空行，或者整段被 <<EOF 之类包着
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines or lines[0].strip() != BEGIN:
+        raise PatchError(f"补丁要以 '{BEGIN}' 开头")
+    if lines[-1].strip() != END:
+        raise PatchError(f"补丁要以 '{END}' 结尾")
+    body = lines[1:-1]
+    ops = []
+    i = 0
+    while i < len(body):
+        line = body[i]
+        if line.startswith(ADD):
+            path = line[len(ADD):].strip()
+            i += 1
+            content = []
+            while i < len(body) and not body[i].startswith("*** "):
+                if not body[i].startswith("+"):
+                    raise PatchError(f"新文件 {path} 的每一行都要以 + 开头：{body[i]!r}")
+                content.append(body[i][1:])
+                i += 1
+            ops.append({"kind": "add", "path": path, "content": content})
+        elif line.startswith(DELETE):
+            ops.append({"kind": "delete", "path": line[len(DELETE):].strip()})
+            i += 1
+        elif line.startswith(UPDATE):
+            path = line[len(UPDATE):].strip()
+            i += 1
+            move_to = None
+            if i < len(body) and body[i].startswith(MOVE):
+                move_to = body[i][len(MOVE):].strip()
+                i += 1
+            chunks = []
+            current = None
+            while i < len(body) and not (body[i].startswith("*** ") and body[i].strip() != EOF_MARK):
+                raw = body[i]
+                if raw.startswith("@@"):
+                    current = {"header": raw[2:].strip(), "old": [], "new": [], "eof": False}
+                    chunks.append(current)
+                elif raw.strip() == EOF_MARK:
+                    if current is None:
+                        raise PatchError(f"{path}：{EOF_MARK} 前面没有块")
+                    current["eof"] = True
+                else:
+                    if current is None:
+                        # 第一块可以不写 @@
+                        current = {"header": "", "old": [], "new": [], "eof": False}
+                        chunks.append(current)
+                    tag, rest = (raw[:1], raw[1:]) if raw else (" ", "")
+                    if tag == " ":
+                        current["old"].append(rest)
+                        current["new"].append(rest)
+                    elif tag == "-":
+                        current["old"].append(rest)
+                    elif tag == "+":
+                        current["new"].append(rest)
+                    else:
+                        raise PatchError(f"{path}：看不懂这一行（要以空格、- 或 + 开头）：{raw!r}")
+                i += 1
+            if not chunks and move_to is None:
+                raise PatchError(f"{path}：Update File 下面没有任何改动")
+            ops.append({"kind": "update", "path": path, "move_to": move_to, "chunks": chunks})
+        elif not line.strip():
+            i += 1
+        else:
+            raise PatchError(f"看不懂这一行：{line!r}")
+    if not ops:
+        raise PatchError("补丁里没有任何改动")
+    return ops
+
+
+def _find(lines, pattern, start, eof):
+    """在 lines[start:] 里找 pattern，先精确匹配，再忽略行尾空白，再忽略两端空白。"""
+    norms = (lambda s: s, lambda s: s.rstrip(), lambda s: s.strip())
+    for norm in norms:
+        target = [norm(p) for p in pattern]
+        candidates = range(start, len(lines) - len(pattern) + 1)
+        if eof:
+            # 贴着结尾的块优先从结尾找
+            candidates = [len(lines) - len(pattern)] + list(candidates)
+        for pos in candidates:
+            if pos < 0:
+                continue
+            if [norm(x) for x in lines[pos:pos + len(pattern)]] == target:
+                return pos
+    return -1
+
+
+def apply_update(text, chunks, path):
+    had_newline = text.endswith("\n")
+    lines = text.split("\n") if text else []
+    if had_newline:
+        lines.pop()
+    cursor = 0
+    for n, chunk in enumerate(chunks, 1):
+        if chunk["header"]:
+            at = _find(lines, [chunk["header"]], cursor, False)
+            if at < 0:
+                raise PatchError(f"{path}：第 {n} 块找不到定位行 @@ {chunk['header']}")
+            cursor = at + 1
+        old, new = chunk["old"], chunk["new"]
+        if not old:
+            # 纯新增：有定位行就插在定位行后面，没有就接在文件末尾
+            pos = cursor if chunk["header"] else len(lines)
+            lines[pos:pos] = new
+            cursor = pos + len(new)
+            continue
+        pos = _find(lines, old, cursor, chunk["eof"])
+        if pos < 0 and old and not old[-1].strip():
+            # 模型常在块尾多带一行空上下文
+            old, new = old[:-1], new[:-1] if new and not new[-1].strip() else new
+            pos = _find(lines, old, cursor, chunk["eof"])
+        if pos < 0:
+            preview = "\n".join(chunk["old"][:6])
+            raise PatchError(f"{path}：第 {n} 块在文件里找不到要改的原文：\n{preview}")
+        lines[pos:pos + len(old)] = new
+        cursor = pos + len(new)
+    return "\n".join(lines) + ("\n" if had_newline or not text else "")
+
+
+def read(path):
+    with open(path, encoding="utf-8", newline="") as f:
+        return f.read()
+
+
+def write(path, content):
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(content)
+
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] in ("-h", "--help"):
+        print(__doc__.strip())
+        return 0
+    text = " ".join(sys.argv[1:]) if len(sys.argv) > 1 else sys.stdin.read()
+    try:
+        ops = parse(text)
+        # 先全部算好再落盘，任何一块失败都不留下改了一半的文件
+        planned = []
+        for op in ops:
+            path = op["path"]
+            if op["kind"] == "add":
+                planned.append(("A", path, "\n".join(op["content"]) + "\n", None))
+            elif op["kind"] == "delete":
+                if not os.path.exists(path):
+                    raise PatchError(f"要删除的文件不存在：{path}")
+                planned.append(("D", path, None, None))
+            else:
+                if not os.path.exists(path):
+                    raise PatchError(f"要修改的文件不存在：{path}（新建文件请用 *** Add File:）")
+                content = apply_update(read(path), op["chunks"], path) if op["chunks"] else read(path)
+                planned.append(("M", path, content, op["move_to"]))
+    except PatchError as e:
+        print(f"apply_patch 失败，没有改动任何文件：{e}", file=sys.stderr)
+        return 1
+
+    for tag, path, content, move_to in planned:
+        if tag == "D":
+            os.remove(path)
+        elif move_to:
+            write(move_to, content)
+            os.remove(path)
+        else:
+            write(path, content)
+    print("Success. Updated the following files:")
+    for tag, path, _, move_to in planned:
+        print(f"{tag} {move_to or path}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

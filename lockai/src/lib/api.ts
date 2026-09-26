@@ -2,9 +2,10 @@ import {
   ChatModel,
   ChatRequest,
   ChatResponse,
+  FileArtifact,
   RealtimeAsrEvent,
   RealtimeAsrSessionResponse,
-  StreamEvent,
+  TimedStreamEvent,
 } from '@/types';
 
 const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:5000';
@@ -30,6 +31,26 @@ export async function uploadImage(
     if (!res.ok) return null;
     const data = await res.json();
     return data.url || null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 上传任意附件（文档、表格、音视频…），给沙箱处理。返回 {name, path?, url, size, mime}
+ * path 是文件夹上传时在文件夹里的相对路径，沙箱 inputs/ 里按它还原目录结构。
+ */
+export async function uploadFile(file: File, userId?: string, sessionId?: string, path?: string): Promise<FileArtifact | null> {
+  try {
+    const form = new FormData();
+    form.append('file', file, file.name);
+    if (userId) form.append('user_id', userId);
+    if (sessionId) form.append('session_id', sessionId);
+    if (path) form.append('path', path);
+    const res = await fetch(`${API_BASE_URL}/api/upload-file`, { method: 'POST', body: form });
+    if (!res.ok) return null;
+    const data = await res.json();
+    return data.url ? (data as FileArtifact) : null;
   } catch {
     return null;
   }
@@ -143,13 +164,13 @@ export async function fetchSuggestions(userMessage: string, assistantMessage: st
   }
 }
 
-export type StreamCallback = (event: StreamEvent) => void;
+export type StreamCallback = (event: TimedStreamEvent) => void;
 
-function parseSSEChunk(buffer: string): { events: StreamEvent[]; rest: string } {
+function parseSSEChunk(buffer: string): { events: TimedStreamEvent[]; rest: string } {
   const normalized = buffer.replace(/\r/g, '');
   const blocks = normalized.split('\n\n');
   const rest = blocks.pop() || '';
-  const events: StreamEvent[] = [];
+  const events: TimedStreamEvent[] = [];
 
   for (const eventBlock of blocks) {
     if (!eventBlock.trim()) continue;
@@ -160,7 +181,7 @@ function parseSSEChunk(buffer: string): { events: StreamEvent[]; rest: string } 
     if (!dataLine || dataLine === '[DONE]') continue;
 
     try {
-      events.push(JSON.parse(dataLine) as StreamEvent);
+      events.push(JSON.parse(dataLine) as TimedStreamEvent);
     } catch {
       // ignore malformed chunks
     }
@@ -185,10 +206,12 @@ export async function sendChatMessageStream(
     body: JSON.stringify({
       message: request.message,
       images: request.images,
+      files: request.files,
       history: request.history?.map((msg) => ({
         role: msg.role,
         content: msg.content,
         images: msg.images,
+        files: msg.files,
         tool_trace: msg.tool_trace,
       })),
       model_id: request.model_id,
@@ -198,6 +221,8 @@ export async function sendChatMessageStream(
       reasoning_effort: request.reasoning_effort,
       current_message_id: request.current_message_id,
       image_quality: request.image_quality,
+      delivery: request.delivery,
+      evict: request.evict,
     }),
     signal,
   });
@@ -207,7 +232,11 @@ export async function sendChatMessageStream(
     onEvent({ type: 'error', message: errorData.error || '请求失败' });
     return;
   }
+  await readEventStream(response, onEvent);
+}
 
+/** 逐条读出 SSE 事件 */
+async function readEventStream(response: Response, onEvent: StreamCallback): Promise<void> {
   const reader = response.body?.getReader();
   if (!reader) {
     onEvent({ type: 'error', message: '无法读取响应' });
@@ -240,6 +269,53 @@ export async function sendChatMessageStream(
     for (const event of events) {
       onEvent(event);
     }
+  }
+}
+
+/**
+ * 接上一段正在后台回答的对话：先重放已有的事件（resume … replay_done），再接实时的。
+ * 这段对话已经没有在回答时返回 false。
+ */
+export async function resumeChatStream(sessionId: string, onEvent: StreamCallback, signal?: AbortSignal): Promise<boolean> {
+  const response = await fetch(`${API_BASE_URL}/api/chat/runs/${sessionId}/events`, { signal });
+  if (response.status === 404) return false;
+  if (!response.ok) {
+    onEvent({ type: 'error', message: '没能接上正在进行的回答' });
+    return true;
+  }
+  await readEventStream(response, onEvent);
+  return true;
+}
+
+/** 停止正在后台回答的对话；discard 时连已写的部分也不保存（重新生成、编辑前用） */
+export async function stopChatRun(sessionId: string, discard = false): Promise<void> {
+  try {
+    await fetch(`${API_BASE_URL}/api/chat/runs/${sessionId}/stop`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ discard }),
+      keepalive: true,
+    });
+  } catch {
+    // 没停下来也不要紧：回答做完照样落库
+  }
+}
+
+export interface RunningChat {
+  session_id: string;
+  title: string;
+  /** 开始时间（毫秒时间戳） */
+  started_at: number;
+}
+
+/** 正在后台回答的对话（跑得最久的在前）和同时回答的上限 */
+export async function getRunningChats(userId: string): Promise<{ limit: number; runs: RunningChat[] }> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/api/chat/runs?user_id=${encodeURIComponent(userId)}`);
+    if (!res.ok) return { limit: 3, runs: [] };
+    return await res.json();
+  } catch {
+    return { limit: 3, runs: [] };
   }
 }
 

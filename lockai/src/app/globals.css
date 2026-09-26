@@ -133,6 +133,7 @@
   --animate-rise: rise 0.42s var(--ease-out) both;
   --animate-fade: fade 0.24s var(--ease-out) both;
   --animate-pop: pop 0.18s var(--ease-lock) both;
+  --animate-breathe: breathe 2s var(--ease-in-out) infinite;
 }
 
 /* ==========================================================================
@@ -234,6 +235,12 @@
   to { transform: rotate(360deg); }
 }
 
+/* 后台还在回答的对话：小圆点缓慢呼吸 */
+@keyframes breathe {
+  0%, 100% { opacity: 0.35; transform: scale(0.8); }
+  50% { opacity: 1; transform: scale(1); }
+}
+
 /* 状态文字上的流光（思考中 / 搜索中） */
 .shimmer-text {
   background: linear-gradient(
@@ -287,6 +294,86 @@
 .pair-rule[data-active="true"]::after {
   transition-delay: 0.05s;
 }
+
+/* 思考指示：两道并行细竖线（锁孔），想的时候按"抬—停—落—停"起伏，后一道晚半拍 */
+.think-bars {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 12px;
+}
+.think-bars > span {
+  width: 2px;
+  height: 12px;
+  border-radius: 2px;
+  background: var(--fg-faint);
+  transform-origin: 50% 100%;
+  transform: scaleY(0.62);
+}
+.think-bars > span:last-child {
+  background: var(--accent);
+}
+.think-bars[data-active="true"] > span {
+  animation: think-bar 1.15s var(--ease-lock) infinite;
+}
+.think-bars[data-active="true"] > span:last-child {
+  animation-delay: 0.14s;
+}
+@keyframes think-bar {
+  0%, 100% { transform: scaleY(0.45); }
+  18%, 42% { transform: scaleY(1); }
+  58%, 82% { transform: scaleY(0.45); }
+}
+
+/* PDF 阅读器的文字层（pdf.js TextLayer）：透明文字盖在画布上，能选中、复制 */
+.pdf-page {
+  --user-unit: 1;
+  --total-scale-factor: calc(var(--scale-factor) * var(--user-unit));
+  --scale-round-x: 1px;
+  --scale-round-y: 1px;
+}
+.textLayer {
+  position: absolute;
+  inset: 0;
+  overflow: clip;
+  line-height: 1;
+  text-align: initial;
+  text-size-adjust: none;
+  forced-color-adjust: none;
+  transform-origin: 0 0;
+  z-index: 0;
+  --min-font-size: 1;
+  --text-scale-factor: calc(var(--total-scale-factor) * var(--min-font-size));
+  --min-font-size-inv: calc(1 / var(--min-font-size));
+}
+.textLayer :is(span, br) {
+  color: transparent;
+  position: absolute;
+  white-space: pre;
+  cursor: text;
+  transform-origin: 0% 0%;
+}
+.textLayer > :not(.markedContent),
+.textLayer .markedContent span:not(.markedContent) {
+  z-index: 1;
+  --font-height: 0;
+  font-size: calc(var(--text-scale-factor) * var(--font-height));
+  --scale-x: 1;
+  --rotate: 0deg;
+  transform: rotate(var(--rotate)) scaleX(var(--scale-x)) scale(var(--min-font-size-inv));
+}
+.textLayer .markedContent { display: contents; }
+.textLayer ::selection { background: color-mix(in oklch, var(--accent) 32%, transparent); }
+.textLayer br::selection { background: transparent; }
+.textLayer .endOfContent {
+  display: block;
+  position: absolute;
+  inset: 100% 0 0;
+  z-index: 0;
+  cursor: default;
+  user-select: none;
+}
+.textLayer.selecting .endOfContent { top: 0; }
 
 /* ==========================================================================
    Markdown（助手回答的排版）

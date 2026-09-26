@@ -13,6 +13,7 @@ bind = os.environ.get("GUNICORN_BIND", "0.0.0.0:5003")
 # Worker 配置
 # 小内存机器用 1 个 worker。并发靠事件循环 + 线程池：普通接口在线程池里跑，
 # SSE 流由后台线程生产、事件循环转发，长连接不会占满 worker。
+# 后台回答的注册表（services/runs.py）在进程内存里，必须保持 1 个 worker，否则回来接不上正在跑的回答。
 workers = int(os.environ.get("GUNICORN_WORKERS", 1))
 worker_class = "uvicorn_worker.UvicornWorker"
 

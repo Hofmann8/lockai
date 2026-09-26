@@ -1,10 +1,16 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState, type CSSProperties } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties } from 'react';
 import { createPortal } from 'react-dom';
+import gsap from 'gsap';
+import { useGSAP } from '@gsap/react';
 import { ChevronDown, Download, Globe, ImageIcon, Loader2, Maximize2, X } from 'lucide-react';
 import type { ImageGenToolTrace, SearchSource, SearchToolTrace } from '@/types';
 import { cn } from '@/lib/cn';
+import { Collapse } from '@/components/ui/Collapse';
+import { useHoldAnchor } from '@/lib/hooks/useScrollAnchor';
+
+gsap.registerPlugin(useGSAP);
 
 /* ------------------------------------------------------------------ */
 
@@ -13,6 +19,8 @@ export function useElapsed(startedAtMs: number | undefined, running: boolean) {
   const [now, setNow] = useState(() => Date.now());
   useEffect(() => {
     if (!running) return;
+    // 重新开始计时时先对一下表，不然第一帧用的是上次停下时的旧时间
+    setNow(Date.now());
     const timer = window.setInterval(() => setNow(Date.now()), 1000);
     return () => window.clearInterval(timer);
   }, [running]);
@@ -20,9 +28,49 @@ export function useElapsed(startedAtMs: number | undefined, running: boolean) {
   return Math.max(0, Math.floor((now - startedAtMs) / 1000));
 }
 
+/** 42s · 3m32s · 1h05m */
+export function formatSeconds(value: number): string {
+  const s = Math.max(0, Math.round(value));
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m${String(s % 60).padStart(2, '0')}s`;
+  return `${Math.floor(s / 3600)}h${String(Math.floor((s % 3600) / 60)).padStart(2, '0')}m`;
+}
+
 export function Seconds({ value }: { value: number }) {
   if (value <= 0) return null;
-  return <span className="tabular-nums text-fg-faint">{value}s</span>;
+  return <span className="tabular-nums text-fg-faint">{formatSeconds(value)}</span>;
+}
+
+const playedPreambles = new Set<string>();
+
+/**
+ * 模型调工具前说的那句"我去查一下…"。流式时它先以正文出现，工具一开始就在原地
+ * 从正文字号缩成卡片上方的一行说明。翻历史消息时直接是收好的样子。
+ */
+export function ToolPreamble({ text, live }: { text: string; live: boolean }) {
+  const ref = useRef<HTMLParagraphElement>(null);
+  // 同一句只演一次：单张卡片变成"搜索了 N 次"一组时会换组件重挂载，不能再演一遍
+  const [play] = useState(() => live && !playedPreambles.has(text));
+  useGSAP(() => {
+    if (!play || !ref.current) return;
+    playedPreambles.add(text);
+    if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+    // 起点和正文 .md 一致（15.5px / 1.78 行高 / 不透明），所以看起来是同一句话在收拢
+    gsap.from(ref.current, {
+      fontSize: '15.5px',
+      lineHeight: '27.6px',
+      opacity: 1,
+      paddingLeft: 0,
+      borderLeftWidth: 0,
+      duration: 0.6,
+      ease: 'power3.inOut',
+    });
+  }, { scope: ref });
+  return (
+    <p ref={ref} className="mb-1.5 border-l-2 border-line pl-2.5 text-[12.5px] leading-5 text-fg opacity-55">
+      {text}
+    </p>
+  );
 }
 
 /* ------------------------------------------------------------------ */
@@ -54,67 +102,77 @@ export function SearchCard({ trace, settlingLabel }: { trace: SearchToolTrace; s
   const running = trace.status === 'running';
   const elapsed = useElapsed(trace.startedAtMs, running);
   const [open, setOpen] = useState(false);
+  const holdAnchor = useHoldAnchor();
   const sources = trace.sources ?? [];
   const query = trace.query.trim();
 
   return (
-    <div className="my-3 animate-rise">
-      <div className="flex min-h-7 flex-wrap items-center gap-x-2 gap-y-1 text-[13.5px]">
-        {running ? (
-          <Loader2 className="h-3.5 w-3.5 animate-spin text-accent" />
-        ) : (
-          <Globe className={cn('h-3.5 w-3.5', trace.success === false ? 'text-danger' : 'text-fg-faint')} />
-        )}
-        <span className={cn(running || settlingLabel ? 'shimmer-text' : 'text-fg-soft')}>
-          {running
-            ? '正在搜索'
-            : settlingLabel
-              ? settlingLabel
-              : trace.success === false
-                ? '搜索没有成功'
-                : '搜索了'}
-        </span>
-        {query && <span className="max-w-[22rem] truncate text-fg">{query}</span>}
-        <Seconds value={running ? elapsed : trace.durationSeconds ?? 0} />
-        {sources.length > 0 && (
-          <button
-            type="button"
-            onClick={() => setOpen((v) => !v)}
-            aria-expanded={open}
-            className="group/src ml-0.5 flex items-center gap-1.5 rounded-full border border-line py-0.5 pl-1 pr-2 text-xs text-fg-soft transition-colors hover:border-line-strong hover:text-fg"
-          >
-            <span className="flex -space-x-1.5">
-              {sources.slice(0, 4).map((s, i) => (
-                <SourceIcon key={`${s.url}-${i}`} source={s} />
-              ))}
-            </span>
-            <span>{sources.length} 个来源</span>
-            <ChevronDown className={cn('h-3 w-3 transition-transform duration-200', open && 'rotate-180')} />
-          </button>
-        )}
-      </div>
-      {open && sources.length > 0 && (
-        <div className="mt-2 grid gap-1.5 sm:grid-cols-2 animate-fade">
-          {sources.map((s, i) => (
-            <a
-              key={`${s.url}-${i}`}
-              href={s.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="group/link flex min-w-0 items-start gap-2.5 rounded-xl border border-line bg-surface px-3 py-2 transition-colors hover:border-line-strong hover:bg-surface-2"
+    <div className="my-3">
+      {trace.preamble && <ToolPreamble text={trace.preamble} live={running} />}
+      <div className="animate-rise">
+        <div className="flex min-h-7 flex-wrap items-center gap-x-2 gap-y-1 text-[13.5px]">
+          {running ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin text-accent" />
+          ) : (
+            <Globe className={cn('h-3.5 w-3.5', trace.success === false ? 'text-danger' : 'text-fg-faint')} />
+          )}
+          <span className={cn(running || settlingLabel ? 'shimmer-text' : 'text-fg-soft')}>
+            {running
+              ? '正在搜索'
+              : settlingLabel
+                ? settlingLabel
+                : trace.success === false
+                  ? '搜索没有成功'
+                  : '搜索了'}
+          </span>
+          {query && <span className="max-w-[22rem] truncate text-fg">{query}</span>}
+          {trace.engine && (
+            <span className="rounded-full border border-line px-1.5 text-[11px] leading-4.5 text-fg-faint">{trace.engine}</span>
+          )}
+          <Seconds value={running ? elapsed : trace.durationSeconds ?? 0} />
+          {sources.length > 0 && (
+            <button
+              type="button"
+              onClick={(e) => {
+                holdAnchor(e.currentTarget);
+                setOpen((v) => !v);
+              }}
+              aria-expanded={open}
+              className="group/src ml-0.5 flex items-center gap-1.5 rounded-full border border-line py-0.5 pl-1 pr-2 text-xs text-fg-soft transition-colors hover:border-line-strong hover:text-fg"
             >
-              <span className="mt-0.5 text-[11px] tabular-nums text-fg-faint">{i + 1}</span>
-              <span className="min-w-0 flex-1">
-                <span className="line-clamp-1 text-[13px] text-fg">{s.title || s.url}</span>
-                <span className="mt-0.5 flex items-center gap-1.5 text-[11.5px] text-fg-faint">
-                  <SourceIcon source={s} className="h-3 w-3 ring-0" />
-                  <span className="truncate">{s.site}</span>
-                </span>
+              <span className="flex -space-x-1.5">
+                {sources.slice(0, 4).map((s, i) => (
+                  <SourceIcon key={`${s.url}-${i}`} source={s} />
+                ))}
               </span>
-            </a>
-          ))}
+              <span>{sources.length} 个来源</span>
+              <ChevronDown className={cn('h-3 w-3 transition-transform duration-200', open && 'rotate-180')} />
+            </button>
+          )}
         </div>
-      )}
+        <Collapse open={open && sources.length > 0}>
+          <div className="mt-2 grid gap-1.5 sm:grid-cols-2">
+            {sources.map((s, i) => (
+              <a
+                key={`${s.url}-${i}`}
+                href={s.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="group/link flex min-w-0 items-start gap-2.5 rounded-xl border border-line bg-surface px-3 py-2 transition-colors hover:border-line-strong hover:bg-surface-2"
+              >
+                <span className="mt-0.5 text-[11px] tabular-nums text-fg-faint">{i + 1}</span>
+                <span className="min-w-0 flex-1">
+                  <span className="line-clamp-1 text-[13px] text-fg">{s.title || s.url}</span>
+                  <span className="mt-0.5 flex items-center gap-1.5 text-[11.5px] text-fg-faint">
+                    <SourceIcon source={s} className="h-3 w-3 ring-0" />
+                    <span className="truncate">{s.site}</span>
+                  </span>
+                </span>
+              </a>
+            ))}
+          </div>
+        </Collapse>
+      </div>
     </div>
   );
 }
@@ -122,6 +180,7 @@ export function SearchCard({ trace, settlingLabel }: { trace: SearchToolTrace; s
 /** 连续多次搜索：收成一行"搜索了 N 次 · M 个来源"，点开看每一次 */
 export function SearchGroup({ traces, settlingLabel }: { traces: SearchToolTrace[]; settlingLabel?: string }) {
   const [open, setOpen] = useState(false);
+  const holdAnchor = useHoldAnchor();
   const running = traces.find((t) => t.status === 'running');
   const elapsed = useElapsed(running?.startedAtMs, Boolean(running));
   const sources = useMemo(() => {
@@ -130,53 +189,61 @@ export function SearchGroup({ traces, settlingLabel }: { traces: SearchToolTrace
   }, [traces]);
   const totalSeconds = traces.reduce((sum, t) => sum + (t.durationSeconds ?? 0), 0);
   const allFailed = traces.every((t) => t.status === 'done' && t.success === false);
+  // 收起时显示最新一步的说明；展开后每张卡片各自带着
+  const preamble = [...traces].reverse().find((t) => t.preamble)?.preamble;
 
   return (
-    <div className="my-3 animate-rise">
-      <button
-        type="button"
-        onClick={() => setOpen((v) => !v)}
-        aria-expanded={open}
-        className="group/sg flex min-h-7 max-w-full flex-wrap items-center gap-x-2 gap-y-1 text-left text-[13.5px]"
-      >
-        {running ? (
-          <Loader2 className="h-3.5 w-3.5 animate-spin text-accent" />
-        ) : (
-          <Globe className={cn('h-3.5 w-3.5', allFailed ? 'text-danger' : 'text-fg-faint')} />
-        )}
-        {running ? (
-          <>
-            <span className="shimmer-text">正在搜索</span>
-            <span className="max-w-[20rem] truncate text-fg">{running.query}</span>
-            <Seconds value={elapsed} />
-          </>
-        ) : (
-          <>
-            <span className={cn(settlingLabel ? 'shimmer-text' : 'text-fg-soft group-hover/sg:text-fg')}>
-              {settlingLabel ?? `搜索了 ${traces.length} 次`}
+    <div className="my-3">
+      {!open && preamble && <ToolPreamble key={preamble} text={preamble} live={Boolean(running)} />}
+      <div className="animate-rise">
+        <button
+          type="button"
+          onClick={(e) => {
+            holdAnchor(e.currentTarget);
+            setOpen((v) => !v);
+          }}
+          aria-expanded={open}
+          className="group/sg flex min-h-7 max-w-full flex-wrap items-center gap-x-2 gap-y-1 text-left text-[13.5px]"
+        >
+          {running ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin text-accent" />
+          ) : (
+            <Globe className={cn('h-3.5 w-3.5', allFailed ? 'text-danger' : 'text-fg-faint')} />
+          )}
+          {running ? (
+            <>
+              <span className="shimmer-text">正在搜索</span>
+              <span className="max-w-[20rem] truncate text-fg">{running.query}</span>
+              <Seconds value={elapsed} />
+            </>
+          ) : (
+            <>
+              <span className={cn(settlingLabel ? 'shimmer-text' : 'text-fg-soft group-hover/sg:text-fg')}>
+                {settlingLabel ?? `搜索了 ${traces.length} 次`}
+              </span>
+              <Seconds value={totalSeconds} />
+            </>
+          )}
+          {sources.length > 0 && (
+            <span className="flex items-center gap-1.5 rounded-full border border-line py-0.5 pl-1 pr-2 text-xs text-fg-soft">
+              <span className="flex -space-x-1.5">
+                {sources.slice(0, 4).map((s, i) => (
+                  <SourceIcon key={`${s.url}-${i}`} source={s} />
+                ))}
+              </span>
+              {sources.length} 个来源
             </span>
-            <Seconds value={totalSeconds} />
-          </>
-        )}
-        {sources.length > 0 && (
-          <span className="flex items-center gap-1.5 rounded-full border border-line py-0.5 pl-1 pr-2 text-xs text-fg-soft">
-            <span className="flex -space-x-1.5">
-              {sources.slice(0, 4).map((s, i) => (
-                <SourceIcon key={`${s.url}-${i}`} source={s} />
-              ))}
-            </span>
-            {sources.length} 个来源
-          </span>
-        )}
-        <ChevronDown className={cn('h-3.5 w-3.5 text-fg-faint transition-transform duration-200', open && 'rotate-180')} />
-      </button>
-      {open && (
-        <div className="mt-1 border-l-2 border-line pl-4 animate-fade">
-          {traces.map((t, i) => (
-            <SearchCard key={`${t.query}-${i}`} trace={t} />
-          ))}
-        </div>
-      )}
+          )}
+          <ChevronDown className={cn('h-3.5 w-3.5 text-fg-faint transition-transform duration-200', open && 'rotate-180')} />
+        </button>
+        <Collapse open={open}>
+          <div className="mt-1 border-l-2 border-line pl-4">
+            {traces.map((t, i) => (
+              <SearchCard key={`${t.query}-${i}`} trace={t} />
+            ))}
+          </div>
+        </Collapse>
+      </div>
     </div>
   );
 }
@@ -476,52 +543,55 @@ export function ImageCard({ trace, settlingLabel }: { trace: ImageGenToolTrace; 
   const hasDetails = core.length + visual.length + avoid.length > 0;
 
   return (
-    <div className="my-3 animate-rise">
-      <div className="flex min-h-7 flex-wrap items-center gap-x-2 gap-y-1 text-[13.5px]">
-        {running ? (
-          <Loader2 className="h-3.5 w-3.5 animate-spin text-accent" />
-        ) : (
-          <ImageIcon className={cn('h-3.5 w-3.5', trace.success === false ? 'text-danger' : 'text-fg-faint')} />
-        )}
-        <span className={cn(running || settlingLabel ? 'shimmer-text' : 'text-fg-soft')}>{status}</span>
-        <Seconds value={running || settlingLabel ? (trace.durationSeconds ?? 0) + elapsed : trace.durationSeconds ?? 0} />
-        {trace.modelLabel && (
-          <span className="rounded-md border border-line px-1.5 py-px text-[10.5px] text-fg-faint">{trace.modelLabel}</span>
-        )}
-      </div>
-      <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[13px]">
-        <span className="line-clamp-2 text-fg">{subject}</span>
-        {chips.map((chip) => (
-          <span key={chip} className="rounded-full bg-surface-2 px-2 py-px text-[11.5px] text-fg-soft">{chip}</span>
-        ))}
-        {hasDetails && (
-          <button
-            type="button"
-            onClick={() => setShowDetails((v) => !v)}
-            className="flex items-center gap-0.5 text-[12px] text-fg-faint transition-colors hover:text-fg"
-          >
-            {showDetails ? '收起参数' : '参数'}
-            <ChevronDown className={cn('h-3 w-3 transition-transform', showDetails && 'rotate-180')} />
-          </button>
-        )}
-      </div>
-      {showDetails && (
-        <div className="mt-2 rounded-2xl border border-line bg-surface px-4 py-3 animate-fade">
-          <DetailGroup title="内容" rows={core} />
-          <DetailGroup title="画面" rows={visual} />
-          <DetailGroup title="约束" rows={avoid} />
+    <div className="my-3">
+      {trace.preamble && <ToolPreamble text={trace.preamble} live={running} />}
+      <div className="animate-rise">
+        <div className="flex min-h-7 flex-wrap items-center gap-x-2 gap-y-1 text-[13.5px]">
+          {running ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin text-accent" />
+          ) : (
+            <ImageIcon className={cn('h-3.5 w-3.5', trace.success === false ? 'text-danger' : 'text-fg-faint')} />
+          )}
+          <span className={cn(running || settlingLabel ? 'shimmer-text' : 'text-fg-soft')}>{status}</span>
+          <Seconds value={running || settlingLabel ? (trace.durationSeconds ?? 0) + elapsed : trace.durationSeconds ?? 0} />
+          {trace.modelLabel && (
+            <span className="rounded-md border border-line px-1.5 py-px text-[10.5px] text-fg-faint">{trace.modelLabel}</span>
+          )}
         </div>
-      )}
-      {(running || trace.url) && (
-        <ImagePreview
-          url={trace.url}
-          blurredUrl={trace.blurredUrl}
-          alt={subject || '生成的图片'}
-          blur={Boolean(trace.url && settlingLabel)}
-          ratioStyle={ratioStyle}
-          placeholder={running ? (isEdit ? '正在渲染修改' : '正在显影') : settlingLabel || '加载中'}
-        />
-      )}
+        <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[13px]">
+          <span className="line-clamp-2 text-fg">{subject}</span>
+          {chips.map((chip) => (
+            <span key={chip} className="rounded-full bg-surface-2 px-2 py-px text-[11.5px] text-fg-soft">{chip}</span>
+          ))}
+          {hasDetails && (
+            <button
+              type="button"
+              onClick={() => setShowDetails((v) => !v)}
+              className="flex items-center gap-0.5 text-[12px] text-fg-faint transition-colors hover:text-fg"
+            >
+              {showDetails ? '收起参数' : '参数'}
+              <ChevronDown className={cn('h-3 w-3 transition-transform', showDetails && 'rotate-180')} />
+            </button>
+          )}
+        </div>
+        {showDetails && (
+          <div className="mt-2 rounded-2xl border border-line bg-surface px-4 py-3 animate-fade">
+            <DetailGroup title="内容" rows={core} />
+            <DetailGroup title="画面" rows={visual} />
+            <DetailGroup title="约束" rows={avoid} />
+          </div>
+        )}
+        {(running || trace.url) && (
+          <ImagePreview
+            url={trace.url}
+            blurredUrl={trace.blurredUrl}
+            alt={subject || '生成的图片'}
+            blur={Boolean(trace.url && settlingLabel)}
+            ratioStyle={ratioStyle}
+            placeholder={running ? (isEdit ? '正在渲染修改' : '正在显影') : settlingLabel || '加载中'}
+          />
+        )}
+      </div>
     </div>
   );
 }

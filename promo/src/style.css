@@ -1,0 +1,272 @@
+/* LockAI 宣传片样式：设计变量逐字取自 lockai/src/app/globals.css，保证界面和产品一模一样 */
+@import "tailwindcss";
+@source "./";
+
+/* 中文字体在 src/lib/fonts.ts 里用 FontFace 加载（staticFile 路径渲染时才确定） */
+
+:root {
+  --font-geist-sans: "Geist Variable";
+  --font-geist-mono: "Geist Mono Variable";
+  --font-fraunces: "Fraunces Variable";
+  --font-serif-sc: "Noto Serif SC";
+}
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ==========================================================================
+   LockAI design tokens
+   暖调中性色 + 一个克制的强调色。强调色只用在"锁"的瞬间：焦点、进行中、激活态。
+   ========================================================================== */
+
+:root,
+.light {
+  color-scheme: light;
+  --bg: oklch(0.984 0.003 80);
+  --surface: oklch(0.998 0.001 80);
+  --surface-2: oklch(0.968 0.004 78);
+  --sunken: oklch(0.952 0.005 78);
+  --fg: oklch(0.225 0.008 60);
+  --fg-soft: oklch(0.43 0.008 60);
+  --fg-faint: oklch(0.6 0.007 70);
+  --line: oklch(0.912 0.005 78);
+  --line-strong: oklch(0.855 0.006 78);
+  --accent: oklch(0.665 0.152 48);
+  --accent-ink: oklch(0.52 0.135 45);
+  --accent-soft: oklch(0.665 0.152 48 / 0.11);
+  --danger: oklch(0.58 0.19 27);
+  --danger-soft: oklch(0.58 0.19 27 / 0.1);
+  --ok: oklch(0.6 0.12 155);
+  --ink: oklch(0.225 0.008 60);
+  --ink-fg: oklch(0.984 0.003 80);
+  --scrim: oklch(0.2 0.01 60 / 0.28);
+  --shadow-sm: 0 1px 2px oklch(0.3 0.01 60 / 0.06);
+  --shadow-md: 0 1px 2px oklch(0.3 0.01 60 / 0.05), 0 6px 18px -6px oklch(0.3 0.01 60 / 0.12);
+  --shadow-lg: 0 2px 6px oklch(0.3 0.01 60 / 0.05), 0 24px 48px -16px oklch(0.3 0.01 60 / 0.22);
+  --code-bg: oklch(0.968 0.004 78);
+
+  /* 兼容旧组件（论文工作区）使用的变量名 */
+  --background: var(--bg);
+  --foreground: var(--fg);
+  --card: var(--surface);
+  --card-foreground: var(--fg);
+  --muted: var(--surface-2);
+  --muted-foreground: var(--fg-faint);
+  --primary: var(--ink);
+  --primary-foreground: var(--ink-fg);
+  --secondary: var(--surface-2);
+  --secondary-foreground: var(--fg);
+  --destructive: var(--danger);
+  --destructive-foreground: oklch(0.99 0 0);
+  --border: var(--line);
+  --input: var(--line);
+  --ring: var(--accent);
+}
+
+.dark {
+  color-scheme: dark;
+  --bg: oklch(0.172 0.005 60);
+  --surface: oklch(0.2 0.005 60);
+  --surface-2: oklch(0.232 0.006 60);
+  --sunken: oklch(0.152 0.005 60);
+  --fg: oklch(0.935 0.006 80);
+  --fg-soft: oklch(0.76 0.006 80);
+  --fg-faint: oklch(0.57 0.006 70);
+  --line: oklch(0.275 0.006 60);
+  --line-strong: oklch(0.335 0.007 60);
+  --accent: oklch(0.745 0.138 56);
+  --accent-ink: oklch(0.8 0.12 62);
+  --accent-soft: oklch(0.745 0.138 56 / 0.13);
+  --danger: oklch(0.7 0.16 25);
+  --danger-soft: oklch(0.7 0.16 25 / 0.14);
+  --ok: oklch(0.72 0.12 155);
+  --ink: oklch(0.935 0.006 80);
+  --ink-fg: oklch(0.172 0.005 60);
+  --scrim: oklch(0.08 0.005 60 / 0.55);
+  --shadow-sm: 0 1px 2px oklch(0 0 0 / 0.3);
+  --shadow-md: 0 1px 2px oklch(0 0 0 / 0.3), 0 8px 22px -8px oklch(0 0 0 / 0.5);
+  --shadow-lg: 0 2px 8px oklch(0 0 0 / 0.35), 0 28px 56px -18px oklch(0 0 0 / 0.65);
+  --code-bg: oklch(0.2 0.005 60);
+}
+
+@theme inline {
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-sunken: var(--sunken);
+  --color-fg: var(--fg);
+  --color-fg-soft: var(--fg-soft);
+  --color-fg-faint: var(--fg-faint);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-accent: var(--accent);
+  --color-accent-ink: var(--accent-ink);
+  --color-accent-soft: var(--accent-soft);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+  --color-ok: var(--ok);
+  --color-ink: var(--ink);
+  --color-ink-fg: var(--ink-fg);
+  --color-scrim: var(--scrim);
+
+  /* 旧名映射，论文工作区仍在用 */
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-destructive: var(--destructive);
+  --color-destructive-foreground: var(--destructive-foreground);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+
+  --font-sans: var(--font-geist-sans), "Noto Sans SC", "PingFang SC", system-ui, sans-serif;
+  --font-mono: var(--font-geist-mono), ui-monospace, "SFMono-Regular", Menlo, Consolas, monospace;
+  --font-display: var(--font-fraunces), var(--font-serif-sc), "Songti SC", "STSong", serif;
+  --font-serif: var(--font-serif-sc), "Songti SC", "STSong", serif;
+
+  --shadow-soft: var(--shadow-sm);
+  --shadow-float: var(--shadow-md);
+  --shadow-pop: var(--shadow-lg);
+
+  --ease-out: cubic-bezier(0.22, 1, 0.36, 1);
+  /* "锁"：快速抵达，轻微回弹后立刻定住 */
+  --ease-lock: cubic-bezier(0.2, 1.25, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.65, 0, 0.35, 1);
+
+  --animate-shimmer-text: shimmer-text 2.2s linear infinite;
+  --animate-lock-in: lock-in 0.32s var(--ease-lock) both;
+  --animate-rise: rise 0.42s var(--ease-out) both;
+  --animate-fade: fade 0.24s var(--ease-out) both;
+  --animate-pop: pop 0.18s var(--ease-lock) both;
+  --animate-breathe: breathe 2s var(--ease-in-out) infinite;
+}
+.logo-text {
+  font-family: var(--font-display);
+}
+/* 思考指示：两道并行细竖线（锁孔），想的时候按"抬—停—落—停"起伏，后一道晚半拍 */
+.think-bars {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 12px;
+}
+.think-bars > span {
+  width: 2px;
+  height: 12px;
+  border-radius: 2px;
+  background: var(--fg-faint);
+  transform-origin: 50% 100%;
+  transform: scaleY(0.62);
+}
+.think-bars > span:last-child {
+  background: var(--accent);
+}
+.think-bars[data-active="true"] > span {
+  animation: think-bar 1.15s var(--ease-lock) infinite;
+}
+.think-bars[data-active="true"] > span:last-child {
+  animation-delay: 0.14s;
+}
+@keyframes think-bar {
+  0%, 100% { transform: scaleY(0.45); }
+  18%, 42% { transform: scaleY(1); }
+  58%, 82% { transform: scaleY(0.45); }
+}
+.md {
+  font-size: 15.5px;
+  line-height: 1.78;
+  color: var(--fg);
+  overflow-wrap: anywhere;
+}
+.md > :first-child { margin-top: 0; }
+.md > :last-child { margin-bottom: 0; }
+.md p { margin: 0.7em 0; }
+.md h1, .md h2, .md h3, .md h4 {
+  font-weight: 600;
+  line-height: 1.35;
+  letter-spacing: -0.01em;
+  margin: 1.5em 0 0.55em;
+}
+.md h1 { font-size: 1.45em; }
+.md h2 { font-size: 1.25em; }
+.md h3 { font-size: 1.08em; }
+.md h4 { font-size: 1em; color: var(--fg-soft); }
+.md strong { font-weight: 600; }
+.md em { font-style: italic; }
+.md a {
+  color: var(--accent-ink);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in oklch, var(--accent) 40%, transparent);
+  text-underline-offset: 3px;
+  transition: text-decoration-color 0.15s;
+}
+.md a:hover { text-decoration-color: var(--accent); }
+.md ul, .md ol { margin: 0.6em 0; padding-left: 1.4em; }
+.md ul { list-style: disc; }
+.md ol { list-style: decimal; }
+.md li { margin: 0.28em 0; padding-left: 0.2em; }
+.md li::marker { color: var(--fg-faint); }
+.md ul ul, .md ol ol, .md ul ol, .md ol ul { margin: 0.2em 0; }
+.md blockquote {
+  margin: 0.9em 0;
+  padding: 0.1em 0 0.1em 1em;
+  border-left: 2px solid var(--line-strong);
+  color: var(--fg-soft);
+}
+.md hr {
+  border: 0;
+  height: 1px;
+  background: var(--line);
+  margin: 1.6em 0;
+}
+.md :not(pre) > code {
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  padding: 0.12em 0.38em;
+  border-radius: 6px;
+  background: var(--surface-2);
+  border: 1px solid var(--line);
+}
+.md img { border-radius: 12px; max-width: 100%; height: auto; margin: 0.8em 0; }
+.md table { width: 100%; border-collapse: collapse; font-size: 0.92em; }
+.md th {
+  text-align: left;
+  font-weight: 600;
+  color: var(--fg-soft);
+  background: var(--surface-2);
+}
+.md th, .md td { padding: 0.55em 0.85em; border-bottom: 1px solid var(--line); }
+.md tr:last-child td { border-bottom: 0; }
+.md kbd {
+  font-family: var(--font-mono);
+  font-size: 0.8em;
+  padding: 0.1em 0.4em;
+  border-radius: 5px;
+  border: 1px solid var(--line-strong);
+  border-bottom-width: 2px;
+  background: var(--surface);
+}
+.md details {
+  margin: 0.8em 0;
+  padding: 0.6em 0.9em;
+  border: 1px solid var(--line);
+  border-radius: 12px;
+}
+.md summary { cursor: pointer; font-weight: 500; }
+.md .katex-display { overflow-x: auto; overflow-y: hidden; padding: 0.3em 0; }
+
+/* 用户消息里的 markdown 更紧凑 */
+.md-compact { font-size: 15px; line-height: 1.7; }
+.md-compact p { margin: 0.35em 0; }
+
+@layer base {
+  html, body { margin: 0; background: #000; }
+  * { border-color: var(--line); box-sizing: border-box; }
+}
+.font-feat { font-feature-settings: "ss01", "cv11"; -webkit-font-smoothing: antialiased; }

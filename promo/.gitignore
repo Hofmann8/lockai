@@ -1,0 +1,7 @@
+node_modules/
+out/
+# 分析用的音频分轨和配乐（体积大，且原曲有版权）
+analysis/*.wav
+analysis/*.mp3
+analysis/__pycache__/
+public/audio/

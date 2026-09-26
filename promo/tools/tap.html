@@ -1,0 +1,215 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>LockAI 宣传片 · 打点</title>
+<style>
+  :root { --bg: #16130f; --fg: #f1ece4; --soft: #a9a196; --faint: #6f685f; --line: #2c2721; --amber: #e8923a; --blue: #6ea8ff; }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.6 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif; }
+  header { padding: 18px 24px 8px; display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap; }
+  h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  .keys { color: var(--soft); font-size: 13px; }
+  kbd { background: #2a251f; border: 1px solid #3a342c; border-radius: 5px; padding: 0 6px; font: 12px ui-monospace, monospace; color: var(--fg); }
+  main { padding: 0 24px 24px; }
+  .row { display: flex; align-items: center; gap: 14px; margin: 10px 0; flex-wrap: wrap; }
+  .time { font: 600 28px ui-monospace, monospace; min-width: 150px; }
+  .scene { color: var(--amber); font-weight: 600; }
+  .lyric { color: var(--fg); font-style: italic; font-size: 16px; min-height: 26px; }
+  button { background: #2a251f; color: var(--fg); border: 1px solid #3a342c; border-radius: 8px; padding: 6px 12px; cursor: pointer; font: inherit; }
+  button:hover { border-color: var(--amber); }
+  button.on { background: var(--amber); color: #1a140d; border-color: var(--amber); }
+  canvas { display: block; width: 100%; border-radius: 10px; background: #1d1914; cursor: pointer; }
+  #zoom { height: 300px; margin-top: 8px; }
+  #overview { height: 56px; margin-top: 10px; }
+  .legend { color: var(--soft); font-size: 12px; display: flex; gap: 16px; flex-wrap: wrap; margin-top: 6px; }
+  .legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; vertical-align: -1px; }
+  #list { margin-top: 14px; max-height: 260px; overflow: auto; font: 13px ui-monospace, monospace; color: var(--soft); columns: 3; }
+  #list div { cursor: pointer; }
+  #list div:hover { color: var(--fg); }
+  #list .strong { color: var(--amber); }
+  .note { color: var(--faint); font-size: 12px; margin-top: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>LockAI 宣传片 · 打点</h1>
+  <span class="keys">
+    <kbd>空格</kbd> 播放/暂停
+    <kbd>J</kbd> 重点（必须卡）
+    <kbd>F</kbd> 次要（可以卡）
+    <kbd>←</kbd><kbd>→</kbd> 退/进 2 秒
+    <kbd>S</kbd> 切换 0.5 倍速
+    <kbd>⌫</kbd> 撤销上一个点
+  </span>
+</header>
+<main>
+  <div class="row">
+    <span class="time" id="time">0.00s</span>
+    <span class="scene" id="scene"></span>
+    <span class="lyric" id="lyric"></span>
+  </div>
+  <div class="row">
+    <button id="play">播放</button>
+    <button id="slow">0.5 倍速</button>
+    <button id="undo">撤销</button>
+    <button id="clear">清空</button>
+    <button id="export">导出（下载 + 复制）</button>
+    <span class="keys" id="count"></span>
+  </div>
+  <canvas id="zoom"></canvas>
+  <div class="legend">
+    <span><i style="background:var(--amber)"></i>你的重点</span>
+    <span><i style="background:var(--blue)"></i>你的次要</span>
+    <span><i style="background:#8b7f70"></i>拍子</span>
+    <span>下面四行：程序检测到的音头（人声 / 吉他铜管 / 贝斯 / 鼓），越亮越强</span>
+    <span>点画面跳转；点你的点可删除</span>
+  </div>
+  <canvas id="overview"></canvas>
+  <div id="list"></div>
+  <p class="note">
+    手按键一般会比声音晚几十毫秒，不用刻意抢拍。导出后我会把每个点吸附到附近最近的真实音头上，你标的是“卡哪一下”，精确时间交给我。
+    点会自动存在浏览器里，关掉页面再打开还在。
+  </p>
+</main>
+<audio id="audio" src="../public/audio/score.wav" preload="auto"></audio>
+<script src="tap-data.js"></script>
+<script>
+const D = window.TAP_DATA;
+const audio = document.getElementById('audio');
+const KEY = 'lockai-promo-taps-v2';
+let taps = JSON.parse(localStorage.getItem(KEY) || '[]');
+const save = () => { localStorage.setItem(KEY, JSON.stringify(taps)); renderList(); };
+const STEMS = [['vocals', '人声'], ['other', '吉他/铜管'], ['bass', '贝斯'], ['drums', '鼓']];
+const fmt = (t) => t.toFixed(2) + 's';
+
+function tap(kind) {
+  const t = Math.max(0, audio.currentTime);
+  taps.push({ t: +t.toFixed(3), kind });
+  taps.sort((a, b) => a.t - b.t);
+  save();
+}
+function toggle() { audio.paused ? audio.play() : audio.pause(); }
+document.addEventListener('keydown', (e) => {
+  if (e.repeat && (e.key === 'j' || e.key === 'f')) return;
+  if (e.code === 'Space') { e.preventDefault(); toggle(); }
+  else if (e.key === 'j' || e.key === 'J') tap('strong');
+  else if (e.key === 'f' || e.key === 'F') tap('minor');
+  else if (e.key === 'ArrowLeft') audio.currentTime = Math.max(0, audio.currentTime - 2);
+  else if (e.key === 'ArrowRight') audio.currentTime = Math.min(D.total, audio.currentTime + 2);
+  else if (e.key === 's' || e.key === 'S') setSlow(audio.playbackRate === 1);
+  else if (e.key === 'Backspace') { e.preventDefault(); undo(); }
+});
+function setSlow(on) { audio.playbackRate = on ? 0.5 : 1; document.getElementById('slow').classList.toggle('on', on); }
+function undo() {
+  // 撤销：删掉离当前时间最近、在它之前的那个点
+  let k = -1;
+  taps.forEach((p, i) => { if (p.t <= audio.currentTime + 0.05) k = i; });
+  if (k >= 0) { taps.splice(k, 1); save(); }
+}
+document.getElementById('play').onclick = toggle;
+document.getElementById('slow').onclick = () => setSlow(audio.playbackRate === 1);
+document.getElementById('undo').onclick = undo;
+document.getElementById('clear').onclick = () => { if (confirm('清空所有点？')) { taps = []; save(); } };
+document.getElementById('export').onclick = () => {
+  const text = JSON.stringify({ version: 2, audio: 'score.wav（v2 剪辑）', taps }, null, 1);
+  navigator.clipboard?.writeText(text).catch(() => {});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(new Blob([text], { type: 'application/json' }));
+  a.download = 'lockai-promo-taps.json';
+  a.click();
+};
+audio.addEventListener('play', () => document.getElementById('play').textContent = '暂停');
+audio.addEventListener('pause', () => document.getElementById('play').textContent = '播放');
+
+function renderList() {
+  const el = document.getElementById('list');
+  el.innerHTML = taps.map((p, i) => `<div data-i="${i}" class="${p.kind}">${p.kind === 'strong' ? '●' : '○'} ${fmt(p.t)}</div>`).join('');
+  el.querySelectorAll('div').forEach((d) => d.onclick = () => { audio.currentTime = Math.max(0, taps[+d.dataset.i].t - 1.5); });
+  document.getElementById('count').textContent = `已打 ${taps.length} 个点（重点 ${taps.filter((p) => p.kind === 'strong').length}）`;
+}
+renderList();
+
+const zc = document.getElementById('zoom');
+const oc = document.getElementById('overview');
+const SPAN = 6; // 放大视图显示的秒数
+function fit(c) { const r = c.getBoundingClientRect(); const dpr = devicePixelRatio || 1; if (c.width !== r.width * dpr) { c.width = r.width * dpr; c.height = r.height * dpr; } return [c.getContext('2d'), c.width, c.height, dpr]; }
+function view() { const t = audio.currentTime; return [t - SPAN * 0.35, t + SPAN * 0.65]; }
+
+zc.addEventListener('click', (e) => {
+  const [t0, t1] = view();
+  const r = zc.getBoundingClientRect();
+  const t = t0 + (e.clientX - r.left) / r.width * (t1 - t0);
+  const y = (e.clientY - r.top) / r.height;
+  // 点在自己的点上（上半部分）→ 删除；否则跳转
+  if (y < 0.3) {
+    let best = -1, bd = 0.08;
+    taps.forEach((p, i) => { const d = Math.abs(p.t - t); if (d < bd) { bd = d; best = i; } });
+    if (best >= 0) { taps.splice(best, 1); save(); return; }
+  }
+  audio.currentTime = Math.max(0, Math.min(D.total, t));
+});
+oc.addEventListener('click', (e) => { const r = oc.getBoundingClientRect(); audio.currentTime = (e.clientX - r.left) / r.width * D.total; });
+
+function draw() {
+  const now = audio.currentTime;
+  document.getElementById('time').textContent = fmt(now);
+  let sc = ''; for (const [t, n] of D.scenes) if (now >= t) sc = n;
+  document.getElementById('scene').textContent = sc;
+  let ly = ''; for (const l of D.lyrics) if (now >= l.t - 0.05) ly = l.text;
+  document.getElementById('lyric').textContent = ly ? '“' + ly + '”' : '';
+
+  // 放大视图
+  let [ctx, W, H, dpr] = fit(zc);
+  const [t0, t1] = view();
+  const X = (t) => (t - t0) / (t1 - t0) * W;
+  ctx.clearRect(0, 0, W, H);
+  // 段落
+  ctx.font = `${12 * dpr}px sans-serif`;
+  for (const [t, n] of D.scenes) if (t > t0 && t < t1) { ctx.fillStyle = '#e8923a55'; ctx.fillRect(X(t), 0, 2 * dpr, H); ctx.fillStyle = '#e8923a'; ctx.fillText(n, X(t) + 6 * dpr, 16 * dpr); }
+  // 拍子与十六分音符
+  const beats = D.beats;
+  for (let i = 0; i < beats.length - 1; i++) {
+    const a = beats[i], b = beats[i + 1];
+    if (b < t0 || a > t1) continue;
+    for (let k = 1; k < 4; k++) { ctx.fillStyle = '#ffffff0d'; ctx.fillRect(X(a + (b - a) * k / 4), H * 0.3, 1 * dpr, H * 0.7); }
+    ctx.fillStyle = i % 4 === 0 ? '#8b7f70' : '#5a5148';
+    ctx.fillRect(X(a), H * 0.3, (i % 4 === 0 ? 2 : 1) * dpr, H * 0.7);
+    ctx.fillStyle = '#6f685f'; ctx.fillText(String(i), X(a) + 3 * dpr, H * 0.3 + 12 * dpr);
+  }
+  // 检测到的音头
+  const laneH = H * 0.7 / 4;
+  STEMS.forEach(([k, label], j) => {
+    const y = H * 0.3 + j * laneH;
+    ctx.fillStyle = '#a9a19655'; ctx.fillText(label, 6 * dpr, y + laneH - 6 * dpr);
+    for (const [t, s] of D.onsets[k]) {
+      if (t < t0 || t > t1) continue;
+      ctx.fillStyle = `rgba(241,236,228,${Math.min(1, 0.15 + s * 0.6)})`;
+      ctx.fillRect(X(t) - 1.5 * dpr, y + laneH * 0.2, 3 * dpr, laneH * 0.6);
+    }
+  });
+  // 歌词
+  for (const l of D.lyrics) if (l.t > t0 - 4 && l.t < t1) { ctx.fillStyle = '#f1ece4aa'; ctx.fillText('♪ ' + l.text, Math.max(X(l.t), 4), 36 * dpr); }
+  // 你的点
+  for (const p of taps) {
+    if (p.t < t0 || p.t > t1) continue;
+    ctx.fillStyle = p.kind === 'strong' ? '#e8923a' : '#6ea8ff';
+    ctx.fillRect(X(p.t) - 2 * dpr, 44 * dpr, 4 * dpr, H - 44 * dpr);
+    ctx.beginPath(); ctx.arc(X(p.t), 52 * dpr, 7 * dpr, 0, Math.PI * 2); ctx.fill();
+  }
+  // 播放头
+  ctx.fillStyle = '#fff'; ctx.fillRect(X(now) - 1 * dpr, 0, 2 * dpr, H);
+
+  // 全局视图
+  [ctx, W, H] = fit(oc);
+  ctx.clearRect(0, 0, W, H);
+  const OX = (t) => t / D.total * W;
+  for (const [t, n] of D.scenes) { ctx.fillStyle = '#e8923a44'; ctx.fillRect(OX(t), 0, 1 * dpr, H); ctx.fillStyle = '#a9a196'; ctx.font = `${11 * dpr}px sans-serif`; ctx.fillText(n, OX(t) + 3 * dpr, 13 * dpr); }
+  for (const p of taps) { ctx.fillStyle = p.kind === 'strong' ? '#e8923a' : '#6ea8ff'; ctx.fillRect(OX(p.t), H * 0.45, 2 * dpr, H * 0.55); }
+  ctx.fillStyle = '#fff'; ctx.fillRect(OX(now), 0, 2 * dpr, H);
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>

@@ -69,6 +69,51 @@ function Row({ title, description, children }: { title: string; description?: Re
   );
 }
 
+/** 两三个互斥选项、每个都需要一句解释时用：比分段按钮多一行说明 */
+function ChoiceCards<T extends string>({
+  value,
+  options,
+  onChange,
+}: {
+  value: T;
+  options: Array<{ value: T; label: string; description: string }>;
+  onChange: (value: T) => void;
+}) {
+  return (
+    <div role="radiogroup" className="grid grid-cols-2 gap-2">
+      {options.map((o) => {
+        const active = value === o.value;
+        return (
+          <button
+            key={o.value}
+            type="button"
+            role="radio"
+            aria-checked={active}
+            onClick={() => onChange(o.value)}
+            className={cn(
+              'relative rounded-2xl border px-3.5 py-3 text-left transition-[border-color,background-color,box-shadow] duration-150',
+              active ? 'border-line-strong bg-surface shadow-soft' : 'border-line hover:border-line-strong hover:bg-surface/60',
+            )}
+          >
+            <span className="flex items-center gap-2 text-[13px] font-medium text-fg">
+              <span
+                className={cn(
+                  'flex h-3.5 w-3.5 shrink-0 items-center justify-center rounded-full border transition-colors',
+                  active ? 'border-ink bg-ink' : 'border-line-strong',
+                )}
+              >
+                {active && <span className="h-1.5 w-1.5 rounded-full bg-ink-fg animate-pop" />}
+              </span>
+              {o.label}
+            </span>
+            <span className="mt-1.5 block text-[11.5px] leading-relaxed text-fg-faint">{o.description}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 function Meter({ label, used, limit }: { label: string; used: number | null; limit: number }) {
   const loading = used === null;
   const pct = !loading && limit > 0 ? Math.min(100, (used / limit) * 100) : 0;
@@ -148,7 +193,20 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
           </Row>
         </section>
 
-        <section className="mt-3 rounded-2xl border border-line p-4">
+        <section className="border-t border-line pb-4 pt-3">
+          <div className="text-[13.5px] text-fg">文档和幻灯片</div>
+          <div className="mb-2.5 mt-0.5 text-xs leading-relaxed text-fg-faint">写文档、做演示时更看重哪一点；对话里另有要求时以对话为准</div>
+          <ChoiceCards
+            value={settings.delivery}
+            options={[
+              { value: 'quality', label: '排版质量优先', description: '版面精致考究，拿来就能提交、展示' },
+              { value: 'editable', label: '方便编辑优先', description: '拿到就能动手改，适合还要打磨的稿子' },
+            ]}
+            onChange={(value) => saveSettings({ delivery: value })}
+          />
+        </section>
+
+        <section className="mt-1 rounded-2xl border border-line p-4">
           <div className="mb-3 text-[13.5px] font-medium text-fg">Campbell 用量</div>
           <div className="space-y-3.5">
             <Meter label="今天" used={usage?.today.credits ?? null} limit={usage?.limits.daily ?? 100} />
@@ -160,7 +218,7 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
         </section>
 
         <section className="mt-5 flex items-center justify-between text-[11.5px] text-fg-faint">
-          <span>LockAI 0.9 · Funk&amp;Love</span>
+          <span>LockAI 1.0 · Funk&amp;Love</span>
           <a href="mailto:link-ai@zju.edu.cn" className="transition-colors hover:text-fg">link-ai@zju.edu.cn</a>
         </section>
       </div>

@@ -105,6 +105,7 @@ class ChatSession(db.Model):
     title = db.Column(db.String(100), default='新对话')
     model_id = db.Column(db.String(100), nullable=False, default='campbell')
     pinned = db.Column(db.Boolean, nullable=False, default=False)
+    sandbox_id = db.Column(db.String(80), nullable=True)  # 当前云沙箱，回收后下次用时重建
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -131,9 +132,11 @@ class ChatMessage(db.Model):
     role = db.Column(db.String(20), nullable=False)  # 'user' or 'assistant'
     content = db.Column(db.Text, nullable=False)
     images = db.Column(db.Text, nullable=True)  # JSON: S3 URL 列表
+    files = db.Column(db.Text, nullable=True)  # JSON: 用户附件 [{name, url, size, mime}]
     tool_trace = db.Column(db.Text, nullable=True)  # JSON: 工具调用记录
     reasoning = db.Column(db.Text, nullable=True)  # 模型的思考过程（上游返回时才有）
     reasoning_seconds = db.Column(db.Integer, nullable=True)
+    reasoning_tokens = db.Column(db.Integer, nullable=True)
     created_at = db.Column(db.DateTime, default=datetime.utcnow)
     
     def to_dict(self):
@@ -160,13 +163,27 @@ class ChatMessage(db.Model):
         }
         if images_list:
             result['images'] = images_list
+        files_list = self.files_list()
+        if files_list:
+            result['files'] = files_list
         if trace:
             result['tool_trace'] = trace
-        if self.reasoning:
-            result['reasoning'] = self.reasoning
-            if self.reasoning_seconds is not None:
-                result['reasoning_seconds'] = self.reasoning_seconds
+        # 思考文字只存不发：界面只显示用时和 token 数
+        if self.reasoning_seconds is not None:
+            result['reasoning_seconds'] = self.reasoning_seconds
+        if self.reasoning_tokens is not None:
+            result['reasoning_tokens'] = self.reasoning_tokens
         return result
+
+
+    def files_list(self) -> list:
+        if not self.files:
+            return []
+        try:
+            parsed = json.loads(self.files)
+            return parsed if isinstance(parsed, list) else []
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
 
 
 class GeneratedImage(db.Model):

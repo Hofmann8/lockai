@@ -1,5 +1,6 @@
 import type { ChatMessage } from '@/types';
 import { stripToolMarkers } from './traces';
+import { generatedImageUrl } from '@/lib/watermark';
 
 /** 整段对话导出成 markdown：用户说的话引用起来，回答原样保留，工具结果附在下面 */
 export function conversationToMarkdown(title: string, messages: ChatMessage[]): string {
@@ -16,7 +17,10 @@ export function conversationToMarkdown(title: string, messages: ChatMessage[]): 
     if (body) lines.push(body, '');
     for (const trace of message.tool_trace ?? []) {
       if (trace.kind === 'image_gen' && trace.url) {
-        lines.push(`![${trace.prompt.replace(/[\[\]]/g, '')}](${trace.url})`, '');
+        lines.push(`![${trace.prompt.replace(/[\[\]]/g, '')}](${generatedImageUrl(trace.url)})`, '');
+      }
+      if (trace.kind === 'music') {
+        for (const file of trace.files ?? []) if (file.url) lines.push(`[${file.name}](${file.url})`, '');
       }
       if (trace.kind === 'search' && trace.sources?.length) {
         lines.push('来源：', ...trace.sources.map((s, i) => `${i + 1}. [${s.title || s.site}](${s.url})`), '');

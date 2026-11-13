@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { ChatMessage, ChatModel, ChatSession, FileArtifact, ShellToolTrace, ThinkingLevel, TimedStreamEvent, ToolTrace } from '@/types';
+import type { ChatMessage, ChatModel, ChatSession, FileArtifact, MusicToolTrace, ShellToolTrace, ThinkingLevel, TimedStreamEvent, ToolTrace } from '@/types';
 import {
   fetchSuggestions, getModels, getRunningChats, resumeChatStream, sendChatMessageStream, stopChatRun, uploadImage,
   type RunningChat,
@@ -18,8 +18,10 @@ import {
   finalizeInterruptedToolTrace,
   finalizeSearchTrace,
   patchLatestImageTrace,
+  patchMusicTrace,
   patchShellTrace,
   patchTaskTrace,
+  startMusicTrace,
   startShellTrace,
   startTaskTrace,
   stripToolMarkers,
@@ -89,6 +91,13 @@ interface ShellLive {
   end?: (step: ShellToolTrace) => Partial<ShellToolTrace>;
 }
 
+/** 作曲卡片排队还没建出来时先到的进度 / 结果 */
+interface MusicLive {
+  started: boolean;
+  patch?: Partial<MusicToolTrace>;
+  end?: (music: MusicToolTrace) => Partial<MusicToolTrace>;
+}
+
 interface ControllerDeps {
   currentSessionId: string | null;
   setCurrentSessionId: (id: string | null) => void;
@@ -140,6 +149,7 @@ export function useChatController({ currentSessionId, setCurrentSessionId, loadS
   const lastUserTextRef = useRef('');
   const dispatchingQueueRef = useRef(false);
   const shellLiveRef = useRef(new Map<string, ShellLive>());
+  const musicLiveRef = useRef(new Map<string, MusicLive>());
   /** 正在重放后台回答已有的部分：一次性铺出来，不走逐字和工具卡片的最短停留 */
   const replayingRef = useRef(false);
   /** 接上后台回答时，本机时钟减服务端时钟；事件时间戳加上它就是本机时间 */
@@ -644,6 +654,65 @@ export function useChatController({ currentSessionId, setCurrentSessionId, loadS
         queueToolFinalization((trace) => patchShellTrace(trace, event.id, finish));
         break;
       }
+      case 'music_start': {
+        pauseReasoning(at);
+        const live: MusicLive = { started: false };
+        musicLiveRef.current.set(event.id, live);
+        scheduleToolAction(() => {
+          live.started = true;
+          const { content: base, preamble } = takePreamble(commitBufferedAssistantContent(), event.preamble);
+          updateStreamTargetMessage((msg) => {
+            let nextTrace: ToolTrace[] | undefined = startMusicTrace(msg.tool_trace, {
+              id: event.id,
+              action: event.action,
+              source: event.source,
+              title: event.title,
+              style: event.style,
+              instrumental: event.instrumental,
+              modelLabel: event.modelLabel,
+              preamble,
+              startedAtMs: at,
+            });
+            const markerIndex = nextTrace.length - 1;
+            if (live.patch) nextTrace = patchMusicTrace(nextTrace, event.id, () => live.patch ?? {});
+            if (live.end) nextTrace = patchMusicTrace(nextTrace, event.id, live.end);
+            const nextContent = appendToolMarker(base, markerIndex);
+            streamCommittedContentRef.current = nextContent;
+            return { ...msg, content: nextContent, tool_trace: nextTrace };
+          });
+        });
+        break;
+      }
+      case 'music_progress': {
+        const live = musicLiveRef.current.get(event.id);
+        const progress = { tracks: event.tracks, phase: event.phase };
+        if (live && !live.started) {
+          live.patch = progress;
+          break;
+        }
+        updateStreamTargetMessage((msg) => ({
+          ...msg, tool_trace: patchMusicTrace(msg.tool_trace, event.id, () => progress),
+        }));
+        break;
+      }
+      case 'music_end': {
+        const finish = (music: MusicToolTrace): Partial<MusicToolTrace> => ({
+          status: 'done',
+          success: event.success,
+          phase: undefined,
+          tracks: event.tracks ?? music.tracks,
+          files: event.files,
+          error: event.error,
+          durationSeconds: Math.max(1, Math.round((at - (music.startedAtMs ?? at)) / 1000)),
+        });
+        const live = musicLiveRef.current.get(event.id);
+        if (live && !live.started) {
+          live.end = finish;
+          break;
+        }
+        queueToolFinalization((trace) => patchMusicTrace(trace, event.id, finish));
+        break;
+      }
       case 'task_start':
         // 派给执行助手的一块工作：卡片先出来，它的每一步随后带着 taskId 进来
         pauseReasoning(at);
@@ -671,6 +740,7 @@ export function useChatController({ currentSessionId, setCurrentSessionId, loadS
         pauseReasoning(at);
         // 中途停下（被新回答挤掉、超时）：还亮着的步骤一并收尾
         if (event.stopped) queueToolFinalization((trace) => finalizeInterruptedToolTrace(trace));
+        if (event.silent) updateStreamTargetMessage((msg) => ({ ...msg, silent: true }));
         replayingRef.current = false;
         streamEndedRef.current = true;
         processPendingStreamTransitions();
@@ -690,6 +760,7 @@ export function useChatController({ currentSessionId, setCurrentSessionId, loadS
     clearPendingToolQueues();
     resetReasoning(thinking);
     shellLiveRef.current.clear();
+    musicLiveRef.current.clear();
     serverMessageIdRef.current = null;
     replayingRef.current = false;
     clockOffsetRef.current = null;
@@ -829,7 +900,6 @@ export function useChatController({ currentSessionId, setCurrentSessionId, loadS
           thinking: thinking.effective,
           reasoning_effort: thinking.effort,
           current_message_id: userMessage.id,
-          image_quality: getSettings().imageQuality,
           delivery: getSettings().delivery,
           ...(evict ? { evict } : {}),
         },

@@ -4,7 +4,7 @@
   "private": true,
   "scripts": {
     "predev": "node scripts/copy-pdfjs-assets.mjs",
-    "dev": "set NODE_OPTIONS=--max-old-space-size=4096 && next dev",
+    "dev": "set NODE_OPTIONS=--max-old-space-size=4096 && next dev -p 3001",
     "prebuild": "node scripts/copy-pdfjs-assets.mjs",
     "build": "set NODE_OPTIONS=--max-old-space-size=4096 && next build",
     "start": "next start",

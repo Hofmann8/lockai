@@ -68,10 +68,15 @@ export async function getModels(): Promise<ChatModel[]> {
 }
 
 export interface CampbellUsage {
+  /** 额度档位：1 标准 / 2 加量 / 3 畅用，由管理员设置 */
+  tier: { level: number; name: string; weekly: number };
+  /** 当前周期：上个周期结束后第一次扣费时开始，7 天后重置；还没开始时两个时间都是 null */
+  week: { units: number; credits: number; started_at: string | null; resets_at: string | null };
   today: { day: string; chat_calls: number; image_calls: number; units: number; credits: number };
   month: { month: string; chat_calls: number; image_calls: number; units: number; credits: number };
-  limits: { daily: number; monthly: number; tokens_per_credit: number; image_min_credits: number };
-  remaining: { daily: number; monthly: number };
+  limits: { weekly: number; tokens_per_credit: number; image_min_credits: number };
+  remaining: { weekly: number };
+  resets_at: string | null;
 }
 
 export async function getUsage(userId: string): Promise<CampbellUsage | null> {
@@ -81,6 +86,20 @@ export async function getUsage(userId: string): Promise<CampbellUsage | null> {
     return (await res.json()) as CampbellUsage;
   } catch {
     return null;
+  }
+}
+
+/** 记下开关图片水印；记成功才算数（关闭水印要依法留存记录） */
+export async function recordWatermarkChoice(userId: string, enabled: boolean): Promise<boolean> {
+  try {
+    const res = await fetch(`${API_BASE_URL}/api/settings/watermark`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user_id: userId, enabled }),
+    });
+    return res.ok;
+  } catch {
+    return false;
   }
 }
 
@@ -213,6 +232,7 @@ export async function sendChatMessageStream(
         images: msg.images,
         files: msg.files,
         tool_trace: msg.tool_trace,
+        silent: msg.silent,
       })),
       model_id: request.model_id,
       user_id: request.user_id,
@@ -220,7 +240,6 @@ export async function sendChatMessageStream(
       thinking: request.thinking,
       reasoning_effort: request.reasoning_effort,
       current_message_id: request.current_message_id,
-      image_quality: request.image_quality,
       delivery: request.delivery,
       evict: request.evict,
     }),
@@ -336,6 +355,7 @@ export async function sendChatMessage(request: ChatRequest): Promise<ChatRespons
         content: msg.content,
         images: msg.images,
         tool_trace: msg.tool_trace,
+        silent: msg.silent,
       })),
       model_id: request.model_id,
       user_id: request.user_id,
@@ -343,7 +363,6 @@ export async function sendChatMessage(request: ChatRequest): Promise<ChatRespons
       thinking: request.thinking,
       reasoning_effort: request.reasoning_effort,
       current_message_id: request.current_message_id,
-      image_quality: request.image_quality,
     }),
   });
 

@@ -1,4 +1,4 @@
-import type { ChatMessage, ImageGenToolTrace, SearchSource, ShellToolTrace, TaskToolTrace, ToolTrace } from '@/types';
+import type { ChatMessage, ImageGenToolTrace, MusicToolTrace, SearchSource, ShellToolTrace, TaskToolTrace, ToolTrace } from '@/types';
 
 export const TOOL_MARKER_RE = /<!--tool:(\d+)-->/g;
 
@@ -183,6 +183,29 @@ export function patchTaskTrace(
   const next = [...trace];
   const task = next[idx] as TaskToolTrace;
   next[idx] = { ...task, ...patch(task) };
+  return next;
+}
+
+export function startMusicTrace(
+  trace: ToolTrace[] | undefined,
+  music: Omit<MusicToolTrace, 'kind' | 'status'>,
+): ToolTrace[] {
+  const next = Array.isArray(trace) ? [...trace] : [];
+  next.push({ kind: 'music', ...music, status: 'running' });
+  return next;
+}
+
+export function patchMusicTrace(
+  trace: ToolTrace[] | undefined,
+  id: string,
+  patch: (music: MusicToolTrace) => Partial<MusicToolTrace>,
+): ToolTrace[] | undefined {
+  if (!Array.isArray(trace)) return trace;
+  const idx = trace.findIndex((t) => t.kind === 'music' && t.id === id);
+  if (idx < 0) return trace;
+  const next = [...trace];
+  const music = next[idx] as MusicToolTrace;
+  next[idx] = { ...music, ...patch(music) };
   return next;
 }
 

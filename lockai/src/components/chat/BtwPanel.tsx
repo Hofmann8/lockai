@@ -6,6 +6,7 @@ import type { ChatMessage } from '@/types';
 import { sendChatMessageStream } from '@/lib/api';
 import { getAuthState } from '@/lib/auth';
 import { cn } from '@/lib/cn';
+import { generatedImageUrl } from '@/lib/watermark';
 import { Markdown } from './Markdown';
 import { LockMark } from '@/components/brand/LockMark';
 
@@ -112,7 +113,8 @@ export function BtwPanel({ open, onClose, context, onClearContext, history, mode
           else if (event.type === 'search_end') patch(id, (e) => ({ ...e, note: undefined }));
           else if (event.type === 'image_gen_start') patch(id, (e) => ({ ...e, note: '正在画图' }));
           else if (event.type === 'image_gen_end' && event.success && event.url) {
-            patch(id, (e) => ({ ...e, answer: `${e.answer}\n\n![图片](${event.url})\n\n`, note: undefined }));
+            const image = generatedImageUrl(event.url);
+            patch(id, (e) => ({ ...e, answer: `${e.answer}\n\n![图片](${image})\n\n`, note: undefined }));
           } else if (event.type === 'error') patch(id, (e) => ({ ...e, status: 'error', note: event.message }));
           else if (event.type === 'message_end') patch(id, (e) => (e.status === 'streaming' ? { ...e, status: 'done' } : e));
         },

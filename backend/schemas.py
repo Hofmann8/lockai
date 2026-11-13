@@ -37,6 +37,11 @@ class GenerateTitleBody(Body):
     assistant_message: str | None = ""
 
 
+class WatermarkBody(Body):
+    user_id: str | None = None
+    enabled: bool | None = None
+
+
 class TruncateBody(Body):
     message_id: str | None = None
     # 分支：True 时不含这条消息本身（重试 / 改写重发：从这条用户消息之前分出去，再重新发）
@@ -78,7 +83,7 @@ class ChatBody(Body):
     thinking: bool | None = None
     reasoning_effort: str | None = None
     current_message_id: str | None = None
-    image_quality: str | None = None
+    image_quality: str | None = None  # 已停用（只剩一个绘图模型）；旧前端还会发，收下不用
     files: list[dict[str, Any]] | None = None  # 当前这条消息的附件
     delivery: str | None = None  # 交付偏好：quality（排版质量优先）/ editable（方便编辑优先）
     evict: str | None = None  # 同时回答已满时，用户选了要停下的那段对话（不填就停跑得最久的）

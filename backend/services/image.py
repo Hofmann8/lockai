@@ -1,9 +1,8 @@
 """
 图像生成与编辑服务
 
-通过代理 (vectorengine.ai 等) 调用 OpenAI 兼容的图片生成接口：
-- Campbell 2.5 Image (默认): gpt-image-2.5-flare，出图较快
-- Campbell 3.0 Image (hd):  gpt-image-2.5-sunburst，高清但较慢
+通过中转站调用 OpenAI 兼容的图片接口，模型见 models.json 的 image_generator（只有一个）。
+配了 fallback 时，主供应商失败（should_fall_back）就用回退把同一个请求再发一次。
 """
 
 import base64
@@ -11,11 +10,14 @@ import json
 import mimetypes
 import os
 import re
+import uuid
 from math import gcd
 
 import httpx
 
 from .http_client import build_http_client
+from .llm import should_fall_back
+from .media_label import label_media
 from .storage import strip_image_processing
 
 from .tool_contracts import (
@@ -28,7 +30,8 @@ from .tool_contracts import (
 )
 
 IMAGE_GEN_TIMEOUT = httpx.Timeout(connect=10.0, read=180.0, write=10.0, pool=10.0)
-IMAGE_GEN_HD_TIMEOUT = httpx.Timeout(connect=10.0, read=900.0, write=10.0, pool=10.0)
+# gpt-image 出图 / 修图：sunburst 一般 30～75 秒，大尺寸更久
+IMAGE_RENDER_TIMEOUT = httpx.Timeout(connect=10.0, read=900.0, write=10.0, pool=10.0)
 
 
 class ImageService:
@@ -38,13 +41,30 @@ class ImageService:
         self.llm = llm_service
         self.storage = storage_service
 
-    def _get_image_model_config(self, hd: bool = False) -> dict:
-        model_id = "image_generator_hd" if hd else "image_generator"
-        return self.llm.get_model_config(model_id)
+    def _get_image_model_config(self) -> dict:
+        return self.llm.get_model_config("image_generator")
 
-    @staticmethod
-    def model_label(hd: bool) -> str:
-        return "Campbell 3.0 Image" if hd else "Campbell 2.5 Image"
+    def model_label(self) -> str:
+        return str(self._get_image_model_config().get("name") or "Campbell Image")
+
+    def _image_fallback(self, cfg: dict) -> tuple[dict, str] | None:
+        """models.json 里 fallback 的配置和 key：地址和 key 整组换成回退的。没配或没有 key 时返回 None。"""
+        merged = self.llm.fallback_config(cfg)
+        if not merged:
+            return None
+        key = self._resolve_image_api_key(merged)
+        return (merged, key) if key else None
+
+    def _image_candidates(self, cfg: dict) -> list[tuple[dict, str]]:
+        """依次要试的 (配置, key)：主供应商、回退。没配 key 的跳过。"""
+        candidates = []
+        key = self._resolve_image_api_key(cfg)
+        if key:
+            candidates.append((cfg, key))
+        fallback = self._image_fallback(cfg)
+        if fallback:
+            candidates.append(fallback)
+        return candidates
 
     def build_request_prompt(self, request_or_prompt) -> str:
         request = self._normalize_image_request(request_or_prompt)
@@ -69,7 +89,6 @@ class ImageService:
         session_id: str = None,
         current_user_image_urls: list[str] = None,
         current_user_message_id: str = None,
-        hd: bool = False,
     ) -> dict:
         """生成图片并上传到存储。"""
         image_request = self._normalize_image_request(request_or_prompt)
@@ -77,10 +96,10 @@ class ImageService:
         if not prompt:
             return {"success": False, "error": "缺少绘图描述"}
 
-        cfg = self._get_image_model_config(hd=hd)
-        api_key = self._resolve_image_api_key(cfg)
-        if not api_key:
+        candidates = self._image_candidates(self._get_image_model_config())
+        if not candidates:
             return {"success": False, "error": "API 密钥未配置"}
+        cfg, api_key = candidates[0]
 
         reference_sources, ref_error = self._resolve_reference_sources(
             image_request.get("referenceImageIds") or [],
@@ -91,7 +110,7 @@ class ImageService:
         if ref_error:
             return {"success": False, "error": ref_error}
 
-        print(f"\n[Image] 绘图({self.model_label(hd)}): {prompt[:80]}...")
+        print(f"\n[Image] 绘图({self.model_label()}): {prompt[:80]}...")
         if reference_sources:
             print(f"[Image] 使用参考图 {len(reference_sources)} 张")
 
@@ -99,13 +118,11 @@ class ImageService:
             extracted, failure, api_usage = self._gemini_generate(
                 cfg, api_key, image_request, prompt,
                 reference_sources=reference_sources,
-                hd=hd,
             )
         else:
             extracted, failure, api_usage = self._openai_generate(
                 cfg, api_key, image_request, prompt,
                 reference_sources=reference_sources,
-                hd=hd,
             )
         if not extracted:
             return {"success": False, "error": failure or "未能生成图片，请重试"}
@@ -119,7 +136,7 @@ class ImageService:
             session_id=session_id,
         )
         if result.get("success"):
-            result["model_label"] = self.model_label(hd)
+            result["model_label"] = self.model_label()
             result["usage"] = api_usage
         return result
 
@@ -130,7 +147,6 @@ class ImageService:
         session_id: str = None,
         current_user_image_urls: list[str] = None,
         current_user_message_id: str = None,
-        hd: bool = False,
     ) -> dict:
         """编辑已有图片并上传到存储。"""
         edit_request = self._normalize_image_edit_request(request_or_prompt)
@@ -157,14 +173,14 @@ class ImageService:
         if not prompt:
             return {"success": False, "error": "缺少图片编辑要求"}
 
-        cfg = self._get_image_model_config(hd=hd)
-        api_key = self._resolve_image_api_key(cfg)
-        if not api_key:
+        candidates = self._image_candidates(self._get_image_model_config())
+        if not candidates:
             return {"success": False, "error": "API 密钥未配置"}
+        cfg, api_key = candidates[0]
 
         source_url_clean = self._strip_watermark_query(source_candidate["url"])
 
-        print(f"\n[Image] 编辑图片({self.model_label(hd)}): {prompt[:80]}...")
+        print(f"\n[Image] 编辑图片({self.model_label()}): {prompt[:80]}...")
 
         if self._is_gemini_model(cfg.get("edit_model") or cfg.get("model")):
             extracted, failure, api_usage = self._gemini_edit(
@@ -172,7 +188,6 @@ class ImageService:
                 source_url=source_url_clean,
                 source_bytes=source_bytes,
                 source_mime=source_mime_type,
-                hd=hd,
             )
         else:
             extracted, failure, api_usage = self._openai_edit(
@@ -180,7 +195,6 @@ class ImageService:
                 source_url=source_url_clean,
                 source_bytes=source_bytes,
                 source_mime=source_mime_type,
-                hd=hd,
             )
         if not extracted:
             return {"success": False, "error": failure or "未能生成编辑后的图片，请重试"}
@@ -194,7 +208,7 @@ class ImageService:
             session_id=session_id,
         )
         if result.get("success"):
-            result["model_label"] = self.model_label(hd)
+            result["model_label"] = self.model_label()
             result["usage"] = api_usage
             result["source_image_id"] = source_candidate["assetId"]
             result["source_image_url"] = source_candidate["url"]
@@ -263,72 +277,81 @@ class ImageService:
             stripped = stripped[:-3]
         return f"{stripped}/v1/images/edits"
 
+    def _with_fallback(self, cfg: dict, api_key: str, send, *, edit: bool):
+        """先用 (cfg, api_key) 发；失败且 should_fall_back 时用回退再发一次（模型名换成回退配置里的）。
+        send(attempt_cfg, key, model) -> (extracted, failure, usage, status)，status 为 None 表示连不上 / 超时 / 没拿到图。"""
+        attempts = [(cfg, api_key)]
+        fallback = self._image_fallback(cfg)
+        if fallback:
+            attempts.append(fallback)
+        for index, (attempt, key) in enumerate(attempts):
+            model = self._clean_optional_string(attempt.get("edit_model") if edit else None) or self._clean_optional_string(attempt.get("model"))
+            extracted, failure, usage, status = send(attempt, key, model)
+            if extracted or index == len(attempts) - 1 or not should_fall_back(status):
+                return extracted, failure, usage
+            nxt = attempts[index + 1][0]
+            print(f"[Image] {model} 失败（{failure}），改用回退 {nxt.get('api_base')}")
+        return None, "未能生成图片，请重试", None
+
     def _request_openai_image_edit(
         self,
         cfg: dict,
         api_key: str,
         files: list,
         data: dict,
-        hd: bool = False,
     ) -> tuple[tuple[bytes, str] | None, str | None, dict | None]:
-        url = self._build_openai_image_edit_url(cfg)
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Accept": "application/json",
-        }
-        timeout = IMAGE_GEN_HD_TIMEOUT if hd else IMAGE_GEN_TIMEOUT
-        try:
-            with build_http_client(timeout) as client:
-                resp = client.post(url, headers=headers, files=files, data=data)
-            print(f"[Image] openai_image_edit: HTTP {resp.status_code}")
-            if resp.status_code != 200:
-                error_text = self._format_http_error(resp)
-                print(f"[Image] openai_image_edit 错误: {error_text}")
-                return None, self._translate_openai_error(resp.status_code, error_text), None
-            data = resp.json()
-            extracted = self._extract_openai_image(data)
-            if not extracted:
-                return None, "上游未返回图片数据", None
-            return extracted, None, data.get("usage")
-        except httpx.TimeoutException:
-            return None, "图片服务超时，请稍后重试", None
-        except Exception as exc:
-            print(f"[Image] openai_image_edit 异常: {type(exc).__name__}: {exc}")
-            return None, f"图片服务请求异常: {type(exc).__name__}", None
+        def send(attempt: dict, key: str, model: str):
+            body = {**data, "model": model} if model and attempt is not cfg else data
+            return self._send_openai_image(
+                self._build_openai_image_edit_url(attempt), key, "openai_image_edit", files=files, data=body,
+            )
+        return self._with_fallback(cfg, api_key, send, edit=True)
 
     def _request_openai_image(
         self,
         cfg: dict,
         api_key: str,
         payload: dict,
-        hd: bool = False,
     ) -> tuple[tuple[bytes, str] | None, str | None, dict | None]:
-        url = self._build_openai_image_url(cfg)
-        headers = {
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-        timeout = IMAGE_GEN_HD_TIMEOUT if hd else IMAGE_GEN_TIMEOUT
+        def send(attempt: dict, key: str, model: str):
+            body = {**payload, "model": model} if model and attempt is not cfg else payload
+            return self._send_openai_image(
+                self._build_openai_image_url(attempt), key, "openai_image", json_body=body,
+            )
+        return self._with_fallback(cfg, api_key, send, edit=False)
+
+    def _send_openai_image(
+        self,
+        url: str,
+        api_key: str,
+        label: str,
+        *,
+        json_body: dict | None = None,
+        files: list | None = None,
+        data: dict | None = None,
+    ) -> tuple[tuple[bytes, str] | None, str | None, dict | None, int | None]:
+        headers = {"Authorization": f"Bearer {api_key}", "Accept": "application/json"}
         try:
-            with build_http_client(timeout) as client:
-                resp = client.post(url, headers=headers, json=payload)
-            print(f"[Image] openai_image: HTTP {resp.status_code}")
+            with build_http_client(IMAGE_RENDER_TIMEOUT) as client:
+                if json_body is not None:
+                    resp = client.post(url, headers=headers, json=json_body)
+                else:
+                    resp = client.post(url, headers=headers, files=files, data=data)
+            print(f"[Image] {label}: HTTP {resp.status_code}")
             if resp.status_code != 200:
                 error_text = self._format_http_error(resp)
-                print(f"[Image] openai_image 错误: {error_text}")
-                return None, self._translate_openai_error(resp.status_code, error_text), None
-
-            data = resp.json()
-            extracted = self._extract_openai_image(data)
+                print(f"[Image] {label} 错误: {error_text}")
+                return None, self._translate_openai_error(resp.status_code, error_text), None, resp.status_code
+            body = resp.json()
+            extracted = self._extract_openai_image(body)
             if not extracted:
-                return None, "上游未返回图片数据", None
-            return extracted, None, data.get("usage")
+                return None, "上游未返回图片数据", None, None
+            return extracted, None, body.get("usage"), 200
         except httpx.TimeoutException:
-            return None, "图片服务超时，请稍后重试", None
+            return None, "图片服务超时，请稍后重试", None, None
         except Exception as exc:
-            print(f"[Image] openai_image 异常: {type(exc).__name__}: {exc}")
-            return None, f"图片服务请求异常: {type(exc).__name__}", None
+            print(f"[Image] {label} 异常: {type(exc).__name__}: {exc}")
+            return None, f"图片服务请求异常: {type(exc).__name__}", None, None
 
     @staticmethod
     def _is_gemini_model(model_id) -> bool:
@@ -361,16 +384,15 @@ class ImageService:
         image_request: dict,
         prompt: str,
         reference_sources: list[dict] | None = None,
-        hd: bool = False,
     ) -> tuple[tuple[bytes, str] | None, str | None, dict | None]:
         # gpt-image 系列的 /v1/images/generations 不接受图片输入。
         # 当传了参考图时，统一走 /v1/images/edits 的 multipart 路径，把所有参考图作为 image 字段一起上传。
         if reference_sources:
-            return self._openai_generate_with_refs(cfg, api_key, image_request, prompt, reference_sources, hd=hd)
+            return self._openai_generate_with_refs(cfg, api_key, image_request, prompt, reference_sources)
         payload = self._build_openai_image_payload(cfg, image_request, prompt)
         if not payload:
             return None, "缺少绘图描述", None
-        return self._request_openai_image(cfg, api_key, payload, hd=hd)
+        return self._request_openai_image(cfg, api_key, payload)
 
     def _openai_generate_with_refs(
         self,
@@ -379,7 +401,6 @@ class ImageService:
         image_request: dict,
         prompt: str,
         reference_sources: list[dict],
-        hd: bool = False,
     ) -> tuple[tuple[bytes, str] | None, str | None, dict | None]:
         prompt_clean = self._clean_optional_string(prompt)
         if not prompt_clean:
@@ -410,7 +431,7 @@ class ImageService:
         }
         if not model_id.startswith("gemini"):
             data["quality"] = quality
-        return self._request_openai_image_edit(cfg, api_key, files, data, hd=hd)
+        return self._request_openai_image_edit(cfg, api_key, files, data)
 
     def _openai_edit(
         self,
@@ -421,7 +442,6 @@ class ImageService:
         source_url: str | None = None,
         source_bytes: bytes | None = None,
         source_mime: str | None = None,
-        hd: bool = False,
     ) -> tuple[tuple[bytes, str] | None, str | None, dict | None]:
         if not source_bytes:
             if not self._clean_optional_string(source_url):
@@ -453,7 +473,7 @@ class ImageService:
         }
         if not model_id.startswith("gemini"):
             data["quality"] = quality
-        return self._request_openai_image_edit(cfg, api_key, files, data, hd=hd)
+        return self._request_openai_image_edit(cfg, api_key, files, data)
 
     def _gemini_generate(
         self,
@@ -462,7 +482,6 @@ class ImageService:
         image_request: dict,
         prompt: str,
         reference_sources: list[dict] | None = None,
-        hd: bool = False,
     ) -> tuple[tuple[bytes, str] | None, str | None, dict | None]:
         model_id = self._clean_optional_string(cfg.get("model")) or "gpt-image-2.5-flare"
         parts: list[dict] = [{"text": prompt[:4000]}]
@@ -489,7 +508,6 @@ class ImageService:
         source_url: str | None = None,
         source_bytes: bytes | None = None,
         source_mime: str | None = None,
-        hd: bool = False,
     ) -> tuple[tuple[bytes, str] | None, str | None, dict | None]:
         model_id = self._clean_optional_string(cfg.get("edit_model")) or self._clean_optional_string(cfg.get("model")) or "gpt-image-2.5-flare"
         mime = source_mime or "image/png"
@@ -585,12 +603,16 @@ class ImageService:
         user_id: str = None,
         session_id: str = None,
     ) -> dict:
+        # 去掉上游写进文件的信息（OpenAI 的 C2PA 凭证等），换成 LockAI 的 AIGC 标识；内容编号就是图片编号
+        image_id = uuid.uuid4().hex
+        image_bytes = label_media(image_bytes, image_id)
         image_metadata = self._inspect_image_bytes(image_bytes, mime_type)
         result = self.storage.upload_image(
             image_bytes,
             user_id=user_id,
             session_id=session_id,
             content_type=mime_type or "image/png",
+            image_id=image_id,
         )
         if result:
             # 水印按图片实际尺寸的比例贴，由前端容器负责缩放整张图

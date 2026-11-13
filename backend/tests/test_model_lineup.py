@@ -36,10 +36,14 @@ def test_models_json_keeps_only_campbell_and_scooby_visible():
 def test_models_json_backend_models():
     registry = _models_json()
     assert registry["campbell"]["model"] == "gpt-6-astra"
+    assert registry["campbell"]["fallback"]["model"] == "gpt-6-astra"
     assert registry["scooby"]["model"] == "deepseek-flash"
     assert registry["title_generator"]["model"] == "deepseek-flash"
-    assert registry["image_generator"]["model"] == "gpt-image-2.5-flare"
-    assert registry["image_generator_hd"]["model"] == "gpt-image-2.5-sunburst"
+    # 只有一个绘图模型；flare 和搜索备用通道已下线
+    assert registry["image_generator"]["model"] == "gpt-image-2.5-sunburst"
+    assert registry["image_generator"]["fallback"]["image_api_key_env"] == "RELAY_API_KEY"
+    assert "image_generator_hd" not in registry
+    assert "search_builtin" not in registry
 
 
 def test_retired_leo_falls_back_to_scooby():

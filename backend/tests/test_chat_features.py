@@ -199,9 +199,65 @@ def test_length_cut_mid_answer_continues_from_where_it_stopped():
     assert second[-1]["role"] == "user"
 
 
-def test_empty_answer_gets_a_visible_fallback():
-    _, _, content = _run_rounds([[{"delta": {"reasoning_content": "想了想"}, "finish_reason": "stop"}]])
-    assert "没能生成回答" in "".join(content)
+_USAGE = {"type": "usage", "usage": {"prompt_tokens": 10, "completion_tokens": 4}}
+
+
+def test_empty_answer_ending_normally_is_a_deliberate_silence():
+    """正常结束 + 有用量 + 没正文没工具：模型自己选择不回复，不补错误说明"""
+    turn = {"pending_images": []}
+    service = AIService.__new__(AIService)
+    service.llm = _StreamingLLM([{"delta": {"content": ""}, "finish_reason": "stop"}, _USAGE])
+    service.max_tool_rounds = 1
+    content_parts = []
+    events = list(service._chat_with_stream(
+        llm_messages=[], model_id="scooby", effective_thinking=True, reasoning_effort=None,
+        assistant_message_id="a1", user_id=None, session_id=None, current_user_images=[],
+        current_user_message_id=None, tool_trace=[], content_parts=content_parts,
+        reasoning_state={"parts": [], "started": None, "ended": None, "seconds": 0.0, "tokens": 0}, turn=turn,
+    ))
+    assert content_parts == []
+    assert not [e for e in events if e["type"] == "content_delta"]
+    assert turn.get("silent") is True
+
+
+def test_whitespace_only_answer_is_also_silence():
+    _, _, content = _run_rounds([[{"delta": {"content": "\n "}, "finish_reason": "stop"}, _USAGE]])
+    assert content == []
+
+
+@pytest.mark.parametrize("chunks, expected", [
+    # 正常结束但没有用量：拿不准是不是主动的，按意外处理
+    ([{"delta": {"reasoning_content": "想了想"}, "finish_reason": "stop"}], "没能生成回答"),
+    # 没有结束原因：流断了
+    ([{"delta": {"reasoning_content": "想了想"}}, _USAGE], "连接中途断开"),
+    ([{"delta": {}, "finish_reason": "content_filter"}, _USAGE], "没能生成回答，可以直接重试"),
+])
+def test_accidental_empty_answer_gets_a_visible_note(chunks, expected):
+    _, _, content = _run_rounds([chunks])
+    assert expected in "".join(content)
+
+
+def test_length_cut_that_never_writes_says_so():
+    rounds = [[{"delta": {"reasoning_content": "想"}, "finish_reason": "length"}, _USAGE]] * 4
+    _, _, content = _run_rounds(rounds)
+    assert "篇幅用完" in "".join(content)
+
+
+def test_silent_reply_stays_visible_to_the_model_in_history():
+    service = AIService.__new__(AIService)
+    service.llm = type("L", (), {"get_model_config": lambda self, _id: {}})()
+    service.image = type("I", (), {"build_asset_catalog_message": lambda self, *a, **k: ""})()
+    service.sandbox = None
+    history = [
+        {"role": "user", "content": "这条不用回"},
+        {"role": "assistant", "content": "", "silent": True},
+        {"role": "user", "content": "上一条出错了"},
+        {"role": "assistant", "content": ""},
+    ]
+    messages = service._build_messages(message="现在说话", history=history, model_id="scooby", session_id=None,
+                                       images=[], current_user_message_id=None)
+    assistant = [m["content"] for m in messages if m["role"] == "assistant"]
+    assert assistant == ["[这条没有回复]"]
 
 
 def test_no_reasoning_means_no_seconds():
@@ -221,42 +277,9 @@ def test_search_sources_are_normalized_and_deduped():
     assert [s["url"] for s in sources] == ["https://a.com/1", "https://b.org/x"]
     assert sources[1]["site"] == "b.org"
 
-
-def test_search_response_parsing_keeps_citations_and_cleans_links():
-    data = {"output": [
-        {"type": "web_search_call", "status": "completed"},
-        {"type": "message", "content": [{
-            "type": "output_text",
-            "text": "杭州今天多云，最高 31℃（[中国天气网](https://www.weather.com.cn/hz?utm_source=openai)）。",
-            "annotations": [{
-                "type": "url_citation",
-                "url": "https://www.weather.com.cn/hz?utm_source=openai",
-                "title": "杭州天气预报",
-            }],
-        }]},
-    ]}
-    text, sources = SearchService._parse_response(data)
-    assert "（中国天气网（weather.com.cn））" in text and "utm_source" not in text
+    # 来源链接里的追踪参数去掉
+    sources = SearchService._normalize_sources([{"url": "https://www.weather.com.cn/hz?utm_source=x", "title": "杭州天气预报"}])
     assert sources == [{"title": "杭州天气预报", "url": "https://www.weather.com.cn/hz", "site": "weather.com.cn", "icon": "https://www.weather.com.cn/favicon.ico"}]
-
-
-def test_search_falls_back_to_consulted_pages_when_nothing_is_cited():
-    data = {"output": [
-        {"type": "web_search_call", "action": {"type": "search", "sources": [
-            {"type": "url", "url": "https://news.sciencenet.cn/a.shtm"},
-            {"type": "url", "url": "https://www.itsdw.cn/news/1.html?utm_source=openai"},
-        ]}},
-        {"type": "message", "content": [{"type": "output_text", "text": "本月科技要闻……", "annotations": []}]},
-    ]}
-    text, sources = SearchService._parse_response(data)
-    assert text == "本月科技要闻……"
-    assert [s["site"] for s in sources] == ["news.sciencenet.cn", "itsdw.cn"]
-    assert sources[1]["url"] == "https://www.itsdw.cn/news/1.html"
-
-    # 有引用时只展示引用过的，不把看过的网页全堆上去
-    data["output"][1]["content"][0]["annotations"] = [{"type": "url_citation", "url": "https://a.com/x", "title": "A"}]
-    _, sources = SearchService._parse_response(data)
-    assert [s["url"] for s in sources] == ["https://a.com/x"]
 
 
 def test_time_context_uses_beijing_date():
@@ -470,10 +493,17 @@ def test_cleversee_weather_scene_becomes_compact_text(monkeypatch):
     assert "结果较少" not in text  # 有结构化数据就不催补搜
 
 
-def test_cleversee_failure_falls_back_to_relay(monkeypatch):
-    service, _ = _cleversee(monkeypatch, [None])
-    monkeypatch.setattr(service, "_search_relay", lambda query: (f"中转:{query}", []))
-    assert service.search_with_sources("杭州天气") == ("中转:杭州天气", [])
+def test_cleversee_failure_reports_failed(monkeypatch):
+    service, sent = _cleversee(monkeypatch, [None])
+    assert service.search_with_sources("杭州天气") == (SearchService.FAILED, [])
+    assert len(sent) == 1
+
+
+def test_search_without_cleversee_key_reports_failed(monkeypatch):
+    monkeypatch.delenv("CLEVERSEE_API_KEY", raising=False)
+    service = SearchService(llm_service=None)
+    monkeypatch.setattr(service, "_post", lambda body: pytest.fail("没配 key 不该发请求"))
+    assert service.search_with_sources("杭州天气") == (SearchService.FAILED, [])
 
 
 def test_web_search_tool_args_reach_the_search_service():
@@ -686,7 +716,7 @@ class _QuotaUsage:
 
     def check(self, user_id, cost):
         self.checks += 1
-        return (self.checks == 1, "daily", "今日 Campbell 额度已用完")
+        return (self.checks == 1, "weekly", "本周 Campbell 额度已用完")
 
     def record_chat_call(self, *args, **kwargs):
         return 0
@@ -729,7 +759,7 @@ def test_answer_cut_by_quota_keeps_what_was_done(monkeypatch):
     events = list(service.chat_stream("做一整套", model_id="campbell", user_id="u1", session_id="s1"))
 
     # 第二轮开始前额度用完：报错照发，做过的那一步和产物存下来，末尾说明怎么接着做
-    assert events[-1]["type"] == "error" and events[-1]["code"] == "quota_daily"
+    assert events[-1]["type"] == "error" and events[-1]["code"] == "quota_weekly"
     assert saved["tool_trace"][0]["files"][0]["name"] == "poster.png"
     assert saved["content"].startswith("<!--tool:0-->") and "额度用完了" in saved["content"] and "继续" in saved["content"]
 

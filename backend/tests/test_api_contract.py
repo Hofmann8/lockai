@@ -145,12 +145,27 @@ def test_usage_summary_shape(client):
     assert body["today"]["credits"] == 0
 
 
+def test_watermark_choice_is_recorded(client, app_module):
+    uid = _uid()
+    assert client.post("/api/settings/watermark", json_body={"user_id": uid}).status == 400
+    r = client.post("/api/settings/watermark", json_body={"user_id": uid, "enabled": False},
+                    headers={"User-Agent": "contract-test", "X-Forwarded-For": "1.2.3.4, 10.0.0.1"})
+    assert r.status == 200 and r.json() == {"enabled": False}
+    client.post("/api/settings/watermark", json_body={"user_id": uid, "enabled": True})
+    from database import db
+    from models import WatermarkChoice
+    with db.scope():
+        rows = WatermarkChoice.query.filter_by(user_id=uid).order_by(WatermarkChoice.id).all()
+        assert [(r.enabled, r.ip, r.user_agent) for r in rows][0] == (False, "1.2.3.4", "contract-test")
+        assert [r.enabled for r in rows] == [False, True]
+
+
 def test_cors_allows_dev_origin_only(client):
     ok = client.options(
         "/api/models",
-        headers={"Origin": "http://localhost:3000", "Access-Control-Request-Method": "GET"},
+        headers={"Origin": "http://localhost:3001", "Access-Control-Request-Method": "GET"},
     )
-    assert ok.headers.get("access-control-allow-origin") == "http://localhost:3000"
+    assert ok.headers.get("access-control-allow-origin") == "http://localhost:3001"
     bad = client.options(
         "/api/models",
         headers={"Origin": "https://evil.example", "Access-Control-Request-Method": "GET"},

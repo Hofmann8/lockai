@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import queue
 import re
 import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Generator
 from urllib.parse import unquote, urlsplit
@@ -27,6 +29,26 @@ from models import (
 
 from .image import ImageService
 from .llm import LLMService
+from .music import (
+    ACTION_TASKS,
+    EDIT_ACTIONS,
+    POLL_SECONDS as MUSIC_POLL_SECONDS,
+    TIMEOUT_SECONDS as MUSIC_TIMEOUT_SECONDS,
+    MusicError,
+    MusicService,
+    build_edit_body,
+    build_reference_body,
+    build_submit_body,
+    clip_from_url,
+    full_stems,
+    media_kind,
+    normalize_edit_args,
+    normalize_music_args,
+    normalize_separate_args,
+    normalize_sound_args,
+    notes_to_midi,
+    stem_label,
+)
 from .prompts import current_time_context, get_identity_reminder, get_system_prompt
 from .runs import MAX_PER_USER as MAX_RUNS_PER_USER, MAX_SECONDS as MAX_RUN_SECONDS
 from .sandbox import INPUTS_DIR, SandboxService, input_relpath, safe_filename
@@ -39,6 +61,7 @@ from .tool_contracts import (
     CHAT_TOOLS_WITH_SHELL,
     DELEGATE_INSTRUCTION,
     DELEGATE_TOOL,
+    MUSIC_TOOLS,
     SANDBOX_INSTRUCTION,
     WORKER_INSTRUCTION,
     WORKER_TOOLS,
@@ -72,7 +95,12 @@ WRAP_UP_NUDGE = (
 MAX_CONTINUATIONS = 3
 CONTINUE_NUDGE = "（输出在上面断开了。紧接着断开处继续写完，不要重复已经写过的内容，不要加开场白或说明。）"
 DIRECT_ANSWER_NUDGE = "思考已经足够了。现在不要再思考，直接输出给用户的完整回答。"
+# 没写正文也没调工具：正常结束（finish_reason=stop 且有用量）是模型自己选择不回复，原样存空；其余按原因补一句说明
 EMPTY_ANSWER_FALLBACK = "（这次没能生成回答，可能是思考太长把篇幅用完了。可以直接重试，或切换到「快速」再试。）"
+EMPTY_ANSWER_CUT = "（连接中途断开，这次没有收到回答。可以直接重试。）"
+EMPTY_ANSWER_OTHER = "（这次没能生成回答，可以直接重试。）"
+# 历史里选择不回复的那条：空消息会被跳过，模型下一轮就不知道自己上次没说话
+SILENT_HISTORY_NOTE = "[这条没有回复]"
 TOOL_LIMIT_FALLBACK = "\n\n（这次查了很多资料还没理清，可以换个问法或把问题拆小一点再试。）"
 
 # 统筹模型派给执行助手的一块工作：最多这么多轮（执行助手是免费的 Scooby，不计费）
@@ -106,6 +134,7 @@ class AIService:
     # 没配沙箱时的默认值（测试里也会绕过 __init__ 直接构造）
     tools = CHAT_TOOLS
     sandbox: SandboxService | None = None
+    music: MusicService | None = None
 
     def __init__(self):
         self.llm = LLMService()
@@ -115,6 +144,9 @@ class AIService:
         self.title = TitleService(self.llm)
         self.sandbox = SandboxService(self.storage)
         self.tools = CHAT_TOOLS_WITH_SHELL if self.sandbox.available else CHAT_TOOLS
+        self.music = MusicService(self.llm, self.storage)
+        if self.music.available:
+            self.tools = self.tools + MUSIC_TOOLS
         from .usage import UsageService
         self.usage = UsageService()
         # 沙箱任务一步一个命令，做个 PPT 要十几轮，一次要一整套物料的能到八九十轮。
@@ -161,7 +193,6 @@ class AIService:
         thinking: bool | None = None,
         reasoning_effort: str | None = None,
         current_message_id: str | None = None,
-        image_quality: str | None = None,
         files: list | None = None,
         delivery: str | None = None,
         control: Any = None,
@@ -181,7 +212,6 @@ class AIService:
         cfg = self.llm.get_model_config(runtime_model_id)
 
         effective_thinking = self._resolve_thinking(cfg, thinking)
-        hd_image = str(image_quality or "").strip().lower() == "hd"
         assistant_message_id = str(uuid.uuid4())
 
         billable = self._is_billable_chat(cfg)
@@ -234,7 +264,6 @@ class AIService:
                     current_user_message_id=current_message_id,
                     tool_trace=tool_trace,
                     content_parts=content_parts,
-                    hd_image=hd_image,
                     billable=billable,
                     turn=turn,
                 ))
@@ -251,7 +280,6 @@ class AIService:
                     current_user_message_id=current_message_id,
                     tool_trace=tool_trace,
                     content_parts=content_parts,
-                    hd_image=hd_image,
                     billable=billable,
                     turn=turn,
                 ))
@@ -286,7 +314,10 @@ class AIService:
                 reasoning_tokens=reasoning_state.get("tokens") or None,
             )
 
-            yield {"type": "message_end", "message_id": assistant_message_id}
+            end: dict[str, Any] = {"type": "message_end", "message_id": assistant_message_id}
+            if turn.get("silent"):
+                end["silent"] = True
+            yield end
 
             if session and session.title == "新对话":
                 title = self.title.generate(message)
@@ -541,6 +572,17 @@ class AIService:
         finally:
             events.close()
 
+    @staticmethod
+    def _empty_answer_note(finish_reason: str, usage: dict[str, Any] | None) -> str:
+        """空回答的说明：正常结束且有用量是模型主动不回复（返回空），其余是意外"""
+        if finish_reason == "stop" and usage:
+            return ""
+        if finish_reason == "length":
+            return EMPTY_ANSWER_FALLBACK
+        if not finish_reason:
+            return EMPTY_ANSWER_CUT
+        return EMPTY_ANSWER_OTHER
+
     def _should_stream_chat(self, cfg: dict[str, Any]) -> bool:
         transport = str(cfg.get("transport") or cfg.get("provider") or "").strip().lower()
         if transport.startswith("anthropic"):
@@ -561,9 +603,9 @@ class AIService:
         except Exception as exc:
             print(f"[Usage] record_chat_call failed: {type(exc).__name__}: {exc}")
 
-    def _record_image_usage(self, user_id: str, raw_usage: dict[str, Any] | None, hd: bool) -> None:
+    def _record_image_usage(self, user_id: str, raw_usage: dict[str, Any] | None) -> None:
         try:
-            cfg = self.llm.get_model_config("image_generator_hd" if hd else "image_generator")
+            cfg = self.llm.get_model_config("image_generator")
             spent = self.usage.record_image_call(user_id, raw_usage, cfg)
             print(f"[Usage] image {cfg.get('model')} 扣 {spent:g} credits (usage={raw_usage})")
         except Exception as exc:
@@ -587,7 +629,6 @@ class AIService:
         current_user_message_id: str | None,
         tool_trace: list[dict[str, Any]],
         content_parts: list[str],
-        hd_image: bool = False,
         billable: bool = False,
         reasoning_state: dict[str, Any] | None = None,
         turn: dict[str, Any] | None = None,
@@ -752,8 +793,15 @@ class AIService:
                         llm_messages.append({"role": "system", "content": DIRECT_ANSWER_NUDGE})
                     continue
                 if not "".join(content_parts).strip() and not tool_trace:
-                    content_parts.append(EMPTY_ANSWER_FALLBACK)
-                    yield {"type": "content_delta", "delta": EMPTY_ANSWER_FALLBACK}
+                    note = self._empty_answer_note(finish_reason, round_usage)
+                    if not note:
+                        print("[Chat] 模型选择不回复")
+                        content_parts.clear()
+                        turn["silent"] = True
+                        return True
+                    print(f"[Chat] 空回答（finish_reason={finish_reason or '无'}，用量{'有' if round_usage else '无'}）")
+                    content_parts.append(note)
+                    yield {"type": "content_delta", "delta": note}
                 return True
 
             used_tools = True
@@ -778,7 +826,6 @@ class AIService:
                     current_user_message_id=current_user_message_id,
                     llm_messages=llm_messages,
                     content_parts=content_parts,
-                    hd_image=hd_image,
                     turn=turn,
                 )
             # shell 的 show：工具结果只能是文字，图片放在这一轮所有工具结果之后单独给模型看
@@ -808,7 +855,6 @@ class AIService:
         current_user_message_id: str | None,
         tool_trace: list[dict[str, Any]],
         content_parts: list[str],
-        hd_image: bool = False,
         billable: bool = False,
         turn: dict[str, Any] | None = None,
     ) -> Generator[dict[str, Any], None, None]:
@@ -874,7 +920,6 @@ class AIService:
                     current_user_images=current_user_images,
                     current_user_message_id=current_user_message_id,
                     content_parts=content_parts,
-                    hd_image=hd_image,
                     turn=turn,
                 )
                 turn["pending_images"] = []  # 这条通道的工具结果只收文字
@@ -913,7 +958,6 @@ class AIService:
         current_user_message_id: str | None,
         llm_messages: list[dict[str, Any]],
         content_parts: list[str],
-        hd_image: bool = False,
         turn: dict[str, Any] | None = None,
     ) -> Generator[dict[str, Any], None, None]:
         tool_response = self._execute_tool_call(
@@ -924,7 +968,6 @@ class AIService:
             session_id=session_id,
             current_user_images=current_user_images,
             current_user_message_id=current_user_message_id,
-            hd_image=hd_image,
             turn=turn,
         )
         while True:
@@ -959,7 +1002,6 @@ class AIService:
         current_user_images: list[str],
         current_user_message_id: str | None,
         content_parts: list[str],
-        hd_image: bool = False,
         turn: dict[str, Any] | None = None,
     ) -> Generator[dict[str, Any], None, str]:
         tool_response = self._execute_tool_call(
@@ -970,7 +1012,6 @@ class AIService:
             session_id=session_id,
             current_user_images=current_user_images,
             current_user_message_id=current_user_message_id,
-            hd_image=hd_image,
             turn=turn,
         )
         while True:
@@ -995,7 +1036,6 @@ class AIService:
         session_id: str | None,
         current_user_images: list[str],
         current_user_message_id: str | None,
-        hd_image: bool = False,
         turn: dict[str, Any] | None = None,
     ):
         name = str(call.get("name") or "").strip()
@@ -1021,6 +1061,17 @@ class AIService:
                 user_id=user_id,
                 session_id=session_id,
                 turn=turn,
+            ))
+
+        if name in MUSIC_TOOL_NAMES:
+            return (yield from self._run_music(
+                arguments,
+                tool_trace=tool_trace,
+                assistant_message_id=assistant_message_id,
+                user_id=user_id,
+                session_id=session_id,
+                turn=turn if turn is not None else {},
+                tool=name,
             ))
 
         if name == "web_search":
@@ -1061,7 +1112,7 @@ class AIService:
             request = self.image._normalize_image_request(arguments)
             prompt = self.image.build_request_prompt(arguments) or request.get("subject") or "生成图片"
             asset_id = self.image.build_conversation_asset_id("latest_tool_image", assistant_message_id, len(tool_trace) + 1)
-            current_model_label = self.image.model_label(hd_image)
+            current_model_label = self.image.model_label()
             trace = {
                 "kind": "image_gen",
                 "assetId": asset_id,
@@ -1104,7 +1155,7 @@ class AIService:
                         "mode": "generate",
                         "assetId": asset_id,
                         "message": quota_msg,
-                        "assistantInstruction": "请用中文向用户说明 Campbell 出图额度已用完，建议明天/下月再试，或先用文字回答。不要再尝试调用 generate_image。",
+                        "assistantInstruction": "请用中文向用户说明 Campbell 本周额度已用完（错误信息里有重置时间），或先用文字回答。不要再尝试调用 generate_image。",
                         "error": quota_msg,
                     }, ensure_ascii=False)
             result = self.image.generate(
@@ -1113,7 +1164,6 @@ class AIService:
                 session_id=session_id,
                 current_user_image_urls=current_user_images,
                 current_user_message_id=current_user_message_id,
-                hd=hd_image,
             )
             success = bool(result.get("success") and result.get("image"))
             trace["status"] = "done"
@@ -1138,7 +1188,7 @@ class AIService:
                 )
                 if user_id:
                     try:
-                        self._record_image_usage(user_id, result.get("usage"), hd_image)
+                        self._record_image_usage(user_id, result.get("usage"))
                     except Exception as exc:
                         print(f"[Usage] record_image_call failed: {type(exc).__name__}: {exc}")
             yield {
@@ -1182,7 +1232,7 @@ class AIService:
             request = self.image._normalize_image_edit_request(arguments)
             prompt = self.image.build_edit_prompt(arguments) or request.get("instruction") or "编辑图片"
             asset_id = self.image.build_conversation_asset_id("latest_tool_image", assistant_message_id, len(tool_trace) + 1)
-            current_model_label = self.image.model_label(hd_image)
+            current_model_label = self.image.model_label()
             trace = {
                 "kind": "image_gen",
                 "assetId": asset_id,
@@ -1225,7 +1275,7 @@ class AIService:
                         "mode": "edit",
                         "assetId": asset_id,
                         "message": quota_msg,
-                        "assistantInstruction": "请用中文向用户说明 Campbell 出图额度已用完，建议明天/下月再试。不要再尝试调用 edit_image。",
+                        "assistantInstruction": "请用中文向用户说明 Campbell 本周额度已用完（错误信息里有重置时间）。不要再尝试调用 edit_image。",
                         "error": quota_msg,
                     }, ensure_ascii=False)
             result = self.image.edit(
@@ -1234,7 +1284,6 @@ class AIService:
                 session_id=session_id,
                 current_user_image_urls=current_user_images,
                 current_user_message_id=current_user_message_id,
-                hd=hd_image,
             )
             success = bool(result.get("success") and result.get("image"))
             trace["status"] = "done"
@@ -1267,7 +1316,7 @@ class AIService:
                 )
                 if user_id:
                     try:
-                        self._record_image_usage(user_id, result.get("usage"), hd_image)
+                        self._record_image_usage(user_id, result.get("usage"))
                     except Exception as exc:
                         print(f"[Usage] record_image_call failed: {type(exc).__name__}: {exc}")
             yield {
@@ -1315,6 +1364,417 @@ class AIService:
             }, ensure_ascii=False)
 
         return "不支持的工具调用。"
+
+    # ------------------------------------------------------------------
+    # 音乐（Suno）：作曲、编辑、分轨、音效共用一套流程
+    # ------------------------------------------------------------------
+
+    def _run_music(
+        self,
+        arguments: dict[str, Any],
+        *,
+        tool_trace: list[dict[str, Any]],
+        assistant_message_id: str,
+        user_id: str | None,
+        session_id: str | None,
+        turn: dict[str, Any],
+        tool: str = "generate_music",
+    ):
+        """
+        提交给 Suno → 轮询各版本的进度推给前端 → 完成后转存 OSS、放进会话沙箱的 inputs/music/ → 按动作计费。
+        编辑、分轨要先把源音频变成 Suno 的 clip：生成的歌直接用存下的 clipId，用户上传的先（免费）上传一次。
+        失败、停止都不扣费。
+        """
+        args = arguments if isinstance(arguments, dict) else {}
+        if tool == "edit_music":
+            request = normalize_edit_args(args)
+            action = request["action"]
+        elif tool == "separate_music":
+            request = normalize_separate_args(args)
+            action = "stems_all" if request["full"] else "stems"
+        elif tool == "generate_sound":
+            request = normalize_sound_args(args)
+            action = "sound"
+        else:
+            request = normalize_music_args(args)
+            action = "generate"
+        billing = action if action in ("sound", "stems", "stems_all") else "generate"
+        tool_label = MUSIC_TOOL_LABELS.get(tool, tool)
+
+        # 先在本地（数据库、这一轮的附件）找到要用的文件：不联网，找不到就直接报错
+        error = ""
+        source = second = reference = None
+        candidates = self._music_candidates(session_id, turn, tool_trace) if (
+            request.get("source") or request.get("reference")) else []
+        if request.get("source"):
+            source = _match_session_file(candidates, request["source"])
+            if source is None:
+                error = f"找不到文件 {request['source']}"
+        if not error and request.get("second_source"):
+            second = _match_session_file(candidates, request["second_source"])
+            if second is None:
+                error = f"找不到文件 {request['second_source']}"
+        if not error and request.get("reference"):
+            reference = _match_session_file(candidates, request["reference"])
+            if reference is None:
+                error = f"找不到文件 {request['reference']}"
+            elif media_kind(reference) not in ("image", "video"):
+                error = "参考文件要是图片或视频"
+        for item in (source, second):
+            if not error and item is not None and media_kind(item) != "audio":
+                error = f"{item.get('name')} 不是音频，可以先用 shell 里的 ffmpeg 提取音轨到 outputs/ 再用"
+
+        source_meta = _music_meta(source) if source is not None else {}
+        if action in EDIT_ACTIONS:
+            if not request["title"]:
+                request["title"] = f"{source_meta.get('title') or '未命名'}（{EDIT_ACTIONS[action]}）"
+            if not request["style"] and action != "hum_to_song":
+                request["style"] = source_meta.get("style") or ""
+            if not request["instrumental_given"] and action not in ("add_vocals", "add_backing", "hum_to_song"):
+                request["instrumental"] = bool(source_meta.get("instrumental"))
+        elif action in ("stems", "stems_all"):
+            request["title"] = source_meta.get("title") or "未命名"
+
+        step_id = uuid.uuid4().hex[:8]
+        label = self.music.model_label() if self.music else "Campbell Music"
+        trace: dict[str, Any] = {
+            "kind": "music", "id": step_id, "action": action, "title": request["title"] or "未命名",
+            "style": request["style"], "instrumental": request["instrumental"], "status": "running", "tracks": [],
+            "modelLabel": label,
+        }
+        if source is not None:
+            trace["source"] = input_relpath(source)
+        tool_trace.append(trace)
+        yield {"_append_marker": True, "type": "music_start", "message_id": assistant_message_id, "id": step_id,
+               "action": action, "title": trace["title"], "style": request["style"],
+               "instrumental": request["instrumental"], "modelLabel": label,
+               **({"source": trace["source"]} if source is not None else {})}
+
+        def finish(success: bool, error: str = "", files: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+            trace.pop("phase", None)
+            trace.update({"status": "done", "success": success})
+            if error:
+                trace["error"] = error
+            if files:
+                trace["files"] = files
+            return {"type": "music_end", "message_id": assistant_message_id, "id": step_id, "success": success,
+                    "tracks": trace["tracks"], **({"error": error} if error else {}), **({"files": files} if files else {})}
+
+        def phase(text: str) -> dict[str, Any]:
+            trace["phase"] = text
+            return {"type": "music_progress", "message_id": assistant_message_id, "id": step_id,
+                    "tracks": trace["tracks"], "phase": text}
+
+        if self.music is None or not self.music.available:
+            yield finish(False, "音乐功能暂不可用")
+            return f"音乐功能暂不可用，请告诉用户稍后再试，不要再调用 {tool}。"
+        if sum(1 for item in tool_trace if item.get("kind") == "music") > MAX_MUSIC_JOBS_PER_ANSWER:
+            yield finish(False, "这次回答的音乐任务已到上限")
+            return (f"这次回答已经做了 {MAX_MUSIC_JOBS_PER_ANSWER} 个音乐任务，不要再调用音乐工具；"
+                    "请让用户先听已有的结果，需要继续再说。")
+        # 起止时间在上传之前补：上传的音频不知道时长时直接让模型先量，免得白等半分钟上传
+        invalid = _music_args_problem(tool, action, request) or error or (
+            _fill_edit_times(request, source_meta) if action in EDIT_ACTIONS else "")
+        if invalid:
+            yield finish(False, invalid)
+            return f"{tool} 没有执行：{invalid}。请修正参数后重试，或如实告诉用户。"
+
+        units = self.music.units_for(billing)
+        cost = self.usage.credits_of(units)
+        if user_id and units > 0:
+            ok, _scope, quota_msg = self.usage.check(user_id, cost)
+            if not ok:
+                yield finish(False, quota_msg or "额度不足")
+                return f"{tool_label}需要 {cost:g} credits，额度不够：{quota_msg}。请如实告诉用户，不要再调用音乐工具。"
+
+        try:
+            # 1. 源音频 → Suno clip
+            src = sec = None
+            if source is not None:
+                src = yield from self._music_clip(source, turn, phase)
+                if isinstance(src, str):
+                    yield finish(False, src)
+                    return f"{tool_label}失败：{src}。请如实告诉用户。"
+            if second is not None:
+                sec = yield from self._music_clip(second, turn, phase)
+                if isinstance(sec, str):
+                    yield finish(False, sec)
+                    return f"{tool_label}失败：{sec}。请如实告诉用户。"
+
+            # 2. 组装提交参数
+            if action in EDIT_ACTIONS:
+                persona_id = ""
+                if action == "same_voice":
+                    yield phase("正在提取歌手音色")
+                    state = yield from self._music_wait(self.music.persona(
+                        src["clipId"], request["style"] or src.get("style") or "", request["start"], request["end"],
+                    ), trace, step_id, assistant_message_id, turn, report=False)
+                    persona_id = str((state.get("result") or {}).get("persona_id") or "")
+                    if state["state"] == "stopped":
+                        yield finish(False, "已停止")
+                        return "音乐任务被中止（回答已停止）。"
+                    if not persona_id:
+                        error = state.get("error") or "没能提取歌手音色"
+                        yield finish(False, error)
+                        return f"沿用歌手失败：{error}。请如实告诉用户，可以换一段人声更清楚的时间段（start / end）再试。"
+                body = build_edit_body(request, src, self.music.model_for(ACTION_TASKS[action]),
+                                       second=sec, persona_id=persona_id)
+            elif action in ("stems", "stems_all"):
+                body = None
+            elif action == "sound":
+                body = None
+            elif reference is not None:
+                kind = media_kind(reference)
+                body = build_reference_body(request, self.music.model_for(f"{kind}_to_song"), kind, str(reference["url"]))
+            else:
+                body = build_submit_body(request, self.music.model_for())
+
+            # 3. 提交并等结果
+            trace.pop("phase", None)
+            if action in ("stems", "stems_all"):
+                task_id = self.music.stems(src["clipId"], full=action == "stems_all")
+            elif action == "sound":
+                task_id = self.music.sound(request["description"], request["loop"])
+            else:
+                task_id = self.music.submit_body(body)
+            state = yield from self._music_wait(task_id, trace, step_id, assistant_message_id, turn)
+        except MusicError as exc:
+            yield finish(False, str(exc))
+            return f"{tool_label}失败：{exc}。请告诉用户稍后再试。"
+
+        if state["state"] == "stopped":
+            yield finish(False, "已停止")
+            return "音乐任务被中止（回答已停止）。"
+        if state["state"] != "success":
+            error = state.get("error") or "生成失败"
+            yield finish(False, error)
+            return f"{tool_label}失败：{error}。请如实告诉用户，可以建议调整描述再试。"
+
+        tracks = state["tracks"]
+        notes: list[str] = []
+        # 续写只给接上的那一段：各自拼回原曲（免费）
+        if action == "extend":
+            yield phase("正在拼成完整一首")
+            tracks, joined = yield from self._music_concat(tracks, trace, step_id, assistant_message_id, turn)
+            if tracks is None:
+                yield finish(False, "已停止")
+                return "音乐任务被中止（回答已停止）。"
+            if not joined:
+                notes.append("没能拼成完整一首，交付的是接上的那一段")
+
+        # 4. 转存
+        taken = {rel for rel, _ in candidates} | {
+            str(f.get("path")) for t in tool_trace if t.get("kind") == "music" for f in t.get("files") or [] if f.get("path")}
+        if action in ("stems", "stems_all", "sound"):
+            yield phase("正在保存")
+            files = self._music_save_plain(action, state, tracks, request, src, task_id, user_id, session_id, taken, notes)
+        else:
+            extra = {"edit": action} if action in EDIT_ACTIONS else None
+            files = self.music.save(tracks, request, user_id, session_id, task_id=task_id, taken=taken, extra=extra)
+        saved = [f for f in files if f.get("url")]
+        if not saved:
+            yield finish(False, "保存失败", files)
+            return "音乐做好了但保存失败，请告诉用户稍后再试。"
+
+        if user_id and units > 0:
+            try:
+                spent = self.usage.record_fixed_call(user_id, units)
+                print(f"[Usage] music {action} 扣 {spent:g} credits")
+            except Exception as exc:
+                print(f"[Usage] record music failed: {type(exc).__name__}: {exc}")
+
+        # 放进会话沙箱：这一轮已经开着就立刻同步，之后再开沙箱时由 _session_attachments 带上
+        inputs = [{key: f[key] for key in ("name", "path", "url", "size", "mime", "music", "clipId", "duration") if key in f}
+                  for f in saved]
+        turn.setdefault("generated_inputs", []).extend(inputs)
+        sandbox = turn.get("sandbox")
+        if sandbox is not None and self.sandbox is not None:
+            try:
+                self.sandbox.sync_inputs(sandbox, inputs)
+            except Exception as exc:
+                print(f"[Music] 放进沙箱失败: {type(exc).__name__}: {exc}")
+
+        yield finish(True, files=files)
+        lines = []
+        for f in saved:
+            seconds = (f.get("music") or {}).get("duration") or f.get("duration")
+            length = f"，{int(seconds) // 60}:{int(seconds) % 60:02d}" if seconds else ""
+            lines.append(f"- {f['name']}{length}，沙箱路径 {INPUTS_DIR}/{f['path']}")
+        head = {
+            "generate": f"已生成 {len(saved)} 个版本",
+            "stems": "已分离出人声和伴奏",
+            "stems_all": f"已分离出 {len(saved)} 个文件（各分轨和一份合并的 MIDI）",
+            "sound": f"已生成 {len(saved)} 段音效",
+        }.get(action, f"已{EDIT_ACTIONS.get(action, '编辑')}，出了 {len(saved)} 个版本")
+        tail = (
+            "用一两句话介绍结果，不要贴链接；用户要剪辑、调速、混音、配视频时用 shell 处理上面的文件，"
+            "要继续改这首歌时用 edit_music，source 填上面的路径。"
+        )
+        return f"{head}，以音频卡片展示给用户：\n" + "\n".join(lines) + ("\n" + "；".join(notes) if notes else "") + "\n" + tail
+
+    def _music_wait(
+        self, task_id: str, trace: dict[str, Any], step_id: str, assistant_message_id: str, turn: dict[str, Any],
+        *, report: bool = True,
+    ):
+        """轮询一个 Suno 任务直到结束。report 时把各版本的进度推给前端。
+        返回 parse_fetch 的结果；用户点了停止时 state 是 stopped。"""
+        deadline = time.monotonic() + MUSIC_TIMEOUT_SECONDS
+        last_sent: list[tuple[int, bool]] = []
+        state: dict[str, Any] = {"state": "running", "tracks": [], "error": "", "result": {}}
+        failures = 0
+        while True:
+            try:
+                state = self.music.fetch(task_id)
+                failures = 0
+            except MusicError as exc:
+                failures += 1
+                print(f"[Music] 查询失败（第 {failures} 次）: {exc}")
+                if failures >= 5:
+                    return {"state": "failed", "error": str(exc), "tracks": [], "result": {}}
+            if report and state["tracks"]:
+                trace["tracks"] = [{"progress": t["progress"], "done": t["done"], **({"duration": t["duration"]} if t.get("duration") else {})}
+                                   for t in state["tracks"]]
+                snapshot = [(t["progress"], t["done"]) for t in trace["tracks"]]
+                if snapshot != last_sent:
+                    last_sent = snapshot
+                    yield {"type": "music_progress", "message_id": assistant_message_id, "id": step_id, "tracks": trace["tracks"]}
+            if state["state"] != "running":
+                return state
+            if time.monotonic() > deadline:
+                return {"state": "failed", "error": "等待超时", "tracks": state["tracks"], "result": {}}
+            # 分段睡，用户点停止时最多晚半秒响应
+            wake = time.monotonic() + MUSIC_POLL_SECONDS
+            while time.monotonic() < wake:
+                if self._stopped(turn):
+                    return {"state": "stopped", "error": "已停止", "tracks": [], "result": {}}
+                time.sleep(0.5)
+
+    def _music_clip(self, item: dict[str, Any], turn: dict[str, Any], phase):
+        """会话里的一个音频文件 → {clipId, uploaded, duration, lyrics, title, style, instrumental}；失败返回错误文字。
+        生成的歌直接用 clipId；用户上传的、沙箱里做出来的先上传给 Suno（免费，约半分钟），同一个地址只传一次。"""
+        meta = _music_meta(item)
+        if meta.get("clipId"):
+            return {**meta, "uploaded": False}
+        url = str(item.get("url") or "")
+        clip = self.music.uploaded.get(url)
+        if not clip:
+            yield phase("正在读取音频")
+            try:
+                task_id = self.music.upload(url, posixpath.splitext(str(item.get("name") or "audio"))[0])
+            except MusicError as exc:
+                return f"音频上传失败：{exc}"
+            state = yield from self._music_wait(task_id, {}, "", "", turn, report=False)
+            if state["state"] == "stopped":
+                return "已停止"
+            clip = next((t["clipId"] for t in state["tracks"] if t.get("clipId")), "") if state["state"] == "success" else ""
+            if not clip:
+                return f"音频上传失败：{state.get('error') or '没有拿到结果'}"
+            self.music.uploaded[url] = clip
+        return {**meta, "clipId": clip, "uploaded": True}
+
+    def _music_concat(self, tracks, trace, step_id, assistant_message_id, turn):
+        """续写的各版本拼回原曲：一起提交、一起等（上游排队时一次拼接要几分钟，挨个等会翻倍）。
+        返回 (tracks, 是否全部拼成)；用户停止时 tracks 为 None。"""
+        pending: dict[int, str] = {}
+        results: dict[int, dict[str, Any]] = {}
+        for index, track in enumerate(tracks):
+            try:
+                pending[index] = self.music.concat(track["clipId"])
+            except MusicError as exc:
+                print(f"[Music] 拼接提交失败 {track['clipId']}: {exc}")
+        deadline = time.monotonic() + MUSIC_TIMEOUT_SECONDS
+        failures: dict[int, int] = {}
+        while pending:
+            for index, task_id in list(pending.items()):
+                try:
+                    state = self.music.fetch(task_id)
+                except MusicError as exc:
+                    failures[index] = failures.get(index, 0) + 1
+                    print(f"[Music] 拼接查询失败（第 {failures[index]} 次）: {exc}")
+                    if failures[index] >= 5:
+                        pending.pop(index)
+                    continue
+                if state["state"] != "running":
+                    pending.pop(index)
+                    if state["state"] == "success" and state["tracks"]:
+                        results[index] = state["tracks"][0]
+                    else:
+                        print(f"[Music] 拼接失败 {tracks[index]['clipId']}: {state.get('error')}")
+            if not pending or time.monotonic() > deadline:
+                break
+            wake = time.monotonic() + MUSIC_POLL_SECONDS
+            while time.monotonic() < wake:
+                if self._stopped(turn):
+                    return None, False
+                time.sleep(0.5)
+            yield from ()
+        joined = []
+        for index, track in enumerate(tracks):
+            whole = results.get(index)
+            joined.append({**whole, "coverUrl": whole.get("coverUrl") or track.get("coverUrl")} if whole else track)
+        return joined, len(results) == len(tracks)
+
+    def _music_save_plain(self, action, state, tracks, request, src, task_id, user_id, session_id, taken, notes):
+        """分轨、音效：普通音频文件；全轨分离再附一份合并各分轨的 MIDI。"""
+        if action == "sound":
+            items = [{"label": str(i), "url": t["audioUrl"], "clipId": t["clipId"], "duration": t.get("duration")}
+                     for i, t in enumerate(tracks, 1)]
+            return self.music.save_plain(items, request["title"] or "音效", user_id, session_id, f"sound-{task_id}", taken=taken)
+        base = (src or {}).get("title") or request["title"] or "分轨"
+        if action == "stems":
+            items = [{"label": stem_label(t.get("title") or ""), "url": t["audioUrl"], "clipId": t["clipId"],
+                      "duration": t.get("duration")} for t in tracks]
+            return self.music.save_plain(items, base, user_id, session_id, f"stems-{task_id}", taken=taken)
+        stems = full_stems(state.get("result") or {})
+        if not stems:
+            notes.append("分离结果里没有分轨")
+            return []
+        files = self.music.save_plain(stems, base, user_id, session_id, f"stems-{task_id}", taken=taken)
+        stems_clip = next((t["clipId"] for t in tracks if t.get("clipId")), "")
+        instruments = []
+
+        def one(stem):
+            try:
+                data = self.music.midi(stems_clip, stem["id"])
+            except MusicError as exc:
+                print(f"[Music] MIDI {stem['label']} 失败: {exc}")
+                return []
+            found = []
+            for inst in data.get("instruments") or []:
+                if isinstance(inst, dict) and inst.get("notes"):
+                    found.append({**inst, "name": f"{stem['label']} {inst.get('name') or ''}".strip()})
+            return found
+
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            for found in pool.map(one, [s for s in stems if s.get("id")]):
+                instruments += found
+        if instruments:
+            midi = self.music.save_bytes(notes_to_midi(instruments), f"{base}-MIDI", ".mid", "audio/midi",
+                                         user_id, session_id, f"stems-{task_id}", taken=taken)
+            files.append(midi)
+        else:
+            notes.append("没有提取到 MIDI")
+        return files
+
+    def _music_candidates(self, session_id: str | None, turn: dict[str, Any], tool_trace: list[dict[str, Any]]) -> list[tuple[str, dict[str, Any]]]:
+        """会话里能拿来做音乐的文件：(沙箱里的路径, 文件)。inputs/ 下的写相对路径，outputs/ 下的带 outputs/ 前缀。"""
+        if session_id:
+            attachments = self._session_attachments(session_id, turn.get("files"), turn.get("images"), turn.get("generated_inputs"))
+        else:
+            attachments = list(turn.get("files") or []) + _image_attachments(turn.get("images")) + list(turn.get("generated_inputs") or [])
+        found = [(input_relpath(item), item) for item in attachments if isinstance(item, dict) and item.get("url")]
+        traces: list[dict[str, Any]] = []
+        if session_id:
+            for m in (ChatMessage.query
+                      .filter(ChatMessage.session_id == session_id, ChatMessage.role == "assistant")
+                      .filter(ChatMessage.tool_trace.like('%"shell"%')).all()):
+                traces += [t for t in m.to_dict().get("tool_trace") or [] if isinstance(t, dict)]
+        traces += tool_trace
+        for t in traces:
+            if t.get("kind") == "shell":
+                found += [(f"outputs/{f['path']}", f) for f in t.get("files") or []
+                          if isinstance(f, dict) and f.get("url") and f.get("path")]
+        return found
 
     def _run_shell(
         self,
@@ -1374,7 +1834,9 @@ class AIService:
         try:
             sandbox = turn.get("sandbox")
             if sandbox is None:
-                sandbox, env_state = self.sandbox.acquire(session, self._session_attachments(session.id, turn.get("files"), turn.get("images")))
+                sandbox, env_state = self.sandbox.acquire(session, self._session_attachments(
+                    session.id, turn.get("files"), turn.get("images"), turn.get("generated_inputs"),
+                ))
                 turn["sandbox"] = sandbox
                 if env_state != "reused":
                     trace["env"] = env_state
@@ -1503,8 +1965,10 @@ class AIService:
 
     def _session_attachments(
         self, session_id: str, current: list | None, current_images: list | None = None,
+        generated: list | None = None,
     ) -> list[dict[str, Any]]:
-        """会话里用户上传过的所有附件和图片（沙箱重建时要重新放进 inputs/）。"""
+        """会话里用户上传过的所有附件和图片，加上作曲生成的音乐（沙箱重建时要重新放进 inputs/）。
+        generated：这一轮刚生成、还没落库的（turn["generated_inputs"]）。"""
         seen: set[str] = set()
         items: list[dict[str, Any]] = []
         messages = (
@@ -1516,7 +1980,18 @@ class AIService:
         candidates: list[dict[str, Any]] = []
         for m in messages:
             candidates += m.files_list() + _image_attachments(m.to_dict().get("images"))
-        candidates += list(current or []) + _image_attachments(current_images)
+        music_messages = (
+            ChatMessage.query
+            .filter(ChatMessage.session_id == session_id, ChatMessage.role == "assistant")
+            .filter(ChatMessage.tool_trace.like('%"music"%'))
+            .all()
+        )
+        for m in music_messages:
+            for trace in m.to_dict().get("tool_trace") or []:
+                if isinstance(trace, dict) and trace.get("kind") == "music":
+                    candidates += [_with_legacy_music(f, trace, i) for i, f in enumerate(trace.get("files") or [])
+                                   if isinstance(f, dict) and f.get("url")]
+        candidates += list(current or []) + _image_attachments(current_images) + list(generated or [])
         for item in candidates:
             url = str(item.get("url") or "")
             if url and url not in seen:
@@ -1606,6 +2081,8 @@ class AIService:
                         if assistant_content
                         else f"[工具执行记录]\n{tool_summary}"
                     )
+                if not assistant_content and item.get("silent"):
+                    assistant_content = SILENT_HISTORY_NOTE
                 if assistant_content:
                     messages.append({"role": "assistant", "content": assistant_content})
             else:
@@ -1772,6 +2249,23 @@ class AIService:
                 result = "后台运行" if item.get("background") else (f"exit {code}" if code is not None else status)
                 suffix = f"；交付 {', '.join(files)}" if files else ""
                 lines.append(f"- shell: {command} → {result}{suffix}")
+                continue
+
+            if kind == "music":
+                files = [f.get("path") or f.get("name") for f in item.get("files") or [] if f.get("url")]
+                where = f"；沙箱 {INPUTS_DIR}/ 下的 {', '.join(files)}" if files else ""
+                action = item.get("action") or "generate"
+                title = json.dumps(item.get("title") or "", ensure_ascii=False)
+                source = json.dumps(item.get("source") or "", ensure_ascii=False)
+                if action in EDIT_ACTIONS:
+                    call = f"edit_music(action={action}, source={source}, title={title})"
+                elif action in ("stems", "stems_all"):
+                    call = f"separate_music(source={source}{', full=true' if action == 'stems_all' else ''})"
+                elif action == "sound":
+                    call = f"generate_sound(description={json.dumps(item.get('style') or '', ensure_ascii=False)})"
+                else:
+                    call = f"generate_music(title={title}, style={json.dumps(item.get('style') or '', ensure_ascii=False)})"
+                lines.append(f"- {call}: {status}{where}")
                 continue
 
             if kind == "image_gen":
@@ -1981,3 +2475,105 @@ def _human_size(size: int) -> str:
     if size >= 1024:
         return f"{size / 1024:.0f} KB"
     return f"{size} B"
+
+
+# ------------------------------------------------------------------
+# 音乐工具的小工具
+# ------------------------------------------------------------------
+
+MUSIC_TOOL_NAMES = ("generate_music", "edit_music", "separate_music", "generate_sound")
+MUSIC_TOOL_LABELS = {"generate_music": "作曲", "edit_music": "编辑音乐", "separate_music": "分轨", "generate_sound": "生成音效"}
+# 一次回答里最多几个音乐任务（作曲、编辑、分轨、音效都算）：都要几分钟、都花额度
+MAX_MUSIC_JOBS_PER_ANSWER = 2
+MEASURE_HINT = "先用 shell 跑 ffprobe 量出这段音频的时长（秒），再把它填进 {field}"
+
+
+def _match_session_file(candidates: list[tuple[str, dict[str, Any]]], source: str) -> dict[str, Any] | None:
+    """模型给的路径 → 会话里的文件。认 /home/user/inputs/x、inputs/x、x、outputs/x，最后按文件名找；同名取最新的。"""
+    wanted = source.strip().replace("\\", "/")
+    for prefix in (f"{INPUTS_DIR}/", "/home/user/", "inputs/", "./"):
+        if wanted.startswith(prefix):
+            wanted = wanted[len(prefix):]
+    exact = [item for rel, item in candidates if rel == wanted]
+    if exact:
+        return exact[-1]
+    name = posixpath.basename(wanted)
+    same = [item for rel, item in candidates if posixpath.basename(rel) == name]
+    return same[-1] if same else None
+
+
+def _music_meta(item: dict[str, Any]) -> dict[str, Any]:
+    """文件上能拿来编辑的信息：生成的歌在 music 里；分轨、音效的 clipId 在文件上；早期的歌只能从 OSS 路径认 clipId。"""
+    meta = item.get("music") if isinstance(item.get("music"), dict) else {}
+    name = str(item.get("name") or "")
+    return {
+        "clipId": str(meta.get("clipId") or item.get("clipId") or clip_from_url(str(item.get("url") or ""))),
+        "duration": meta.get("duration") or item.get("duration"),
+        "lyrics": str(meta.get("lyrics") or ""),
+        "title": str(meta.get("title") or posixpath.splitext(name)[0] or "未命名"),
+        "style": str(meta.get("style") or ""),
+        "instrumental": bool(meta.get("instrumental")),
+    }
+
+
+def _music_args_problem(tool: str, action: str, request: dict[str, Any]) -> str:
+    if tool == "generate_music":
+        return "" if request["title"] and request["style"] else "缺少歌名或风格"
+    if tool == "generate_sound":
+        return "" if request["description"] else "缺少音效描述"
+    if not request.get("source"):
+        return "缺少 source（要处理的音频路径）"
+    if tool != "edit_music":
+        return ""
+    if action not in EDIT_ACTIONS:
+        return f"action 只能是 {', '.join(EDIT_ACTIONS)}"
+    if action == "mashup" and not request["second_source"]:
+        return "混搭需要 second_source（第二首的路径）"
+    if action == "replace_section":
+        start, end = request["start"], request["end"]
+        if start is None or end is None or end <= start:
+            return "局部重写需要 start 和 end（秒），且 end 大于 start"
+    if action == "same_voice" and not (request["lyrics"] or request["style"]):
+        return "沿用歌手需要新歌的歌词或风格"
+    return ""
+
+
+def _fill_edit_times(request: dict[str, Any], src: dict[str, Any]) -> str:
+    """补齐编辑要的起止时间（秒），不能补时返回原因。上传的音频不知道时长，要模型先量。"""
+    try:
+        duration = float(src.get("duration")) if src.get("duration") else None
+    except (TypeError, ValueError):
+        duration = None
+    action, start, end = request["action"], request["start"], request["end"]
+    if action == "extend":
+        start = duration if start is None else start
+        if start is None:
+            return "不知道从哪一秒接着写：" + MEASURE_HINT.format(field="start")
+        if duration:
+            start = min(start, duration)
+    elif action in ("add_vocals", "add_backing"):
+        start = start or 0.0
+        end = duration if end is None else end
+        if end is None:
+            return "不知道音频多长：" + MEASURE_HINT.format(field="end")
+    elif action == "same_voice":
+        start = start or 0.0
+        end = start + 30 if end is None else end
+    if duration and end is not None:
+        end = min(end, duration)
+    if end is not None and start is not None and end <= start:
+        return "end 要大于 start"
+    request["start"], request["end"] = start, end
+    return ""
+
+
+def _with_legacy_music(item: dict[str, Any], trace: dict[str, Any], index: int) -> dict[str, Any]:
+    """2026-11 之前作曲的文件没有 music：歌名、风格从卡片上取，时长从 tracks 按顺序取（分轨、音效不补）。"""
+    if item.get("music") or trace.get("action", "generate") != "generate" or not clip_from_url(str(item.get("url") or "")):
+        return item
+    tracks = trace.get("tracks") or []
+    duration = tracks[index].get("duration") if index < len(tracks) and isinstance(tracks[index], dict) else None
+    meta = {"title": trace.get("title") or "", "style": trace.get("style") or "", "instrumental": bool(trace.get("instrumental"))}
+    if duration:
+        meta["duration"] = duration
+    return {**item, "music": meta}

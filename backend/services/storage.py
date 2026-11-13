@@ -70,12 +70,15 @@ class StorageService:
     def available(self) -> bool:
         return self._client is not None and self.bucket is not None
 
-    def upload_image(self, image_data: bytes, user_id: str = None, session_id: str = None, content_type: str = "image/png") -> Optional[dict]:
-        """上传图片到 S3，返回 URL 和 key"""
+    def upload_image(
+        self, image_data: bytes, user_id: str = None, session_id: str = None, content_type: str = "image/png",
+        image_id: str | None = None,
+    ) -> Optional[dict]:
+        """上传图片到 S3，返回 URL 和 key。image_id 不给就新生成一个（同时是文件名）"""
         if not self.available:
             return None
 
-        image_id = uuid.uuid4().hex
+        image_id = image_id or uuid.uuid4().hex
 
         # 根据 content_type 确定文件扩展名
         ext_map = {

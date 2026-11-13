@@ -78,6 +78,12 @@ function FileThumb({ file }: { file: FileArtifact }) {
       </span>
     );
   }
+  if (file.music?.cover && !failed) {
+    return (
+      // eslint-disable-next-line @next/next/no-img-element
+      <img src={file.music.cover} alt="" onError={() => setFailed(true)} className="h-10 w-10 shrink-0 rounded-lg border border-line object-cover" />
+    );
+  }
   // TIFF / HEIC 浏览器画不出来（面板里另外解码），卡片上直接用图标，不闪一个空白框
   if (fileKind(file) === 'image' && file.url && !failed && !/^(tiff?|heic|heif)$/.test(fileExt(file.name))) {
     return (

@@ -25,6 +25,7 @@ PUBLIC_DIR = FRONTEND_DIR / "public"
 # 后端需要打包的顶层文件
 BACKEND_FILES = [
     "app.py",
+    "desktop_routes.py",
     "asgi.py",
     "wsgi.py",
     "database.py",

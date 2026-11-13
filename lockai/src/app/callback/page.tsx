@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import dynamic from 'next/dynamic';
-import { handleSSOCallback } from '@/lib/auth';
+import { consumeReturnPath, handleSSOCallback } from '@/lib/auth';
 import { LockMark } from '@/components/brand/LockMark';
 
 function Status({ state, message }: { state: 'loading' | 'success' | 'error'; message: string }) {
@@ -29,7 +29,8 @@ function CallbackContent() {
     const result = handleSSOCallback(searchParams);
     if (result) {
       setState('success');
-      const timer = window.setTimeout(() => router.replace('/chat'), 500);
+      const next = consumeReturnPath() ?? '/chat';
+      const timer = window.setTimeout(() => router.replace(next), 500);
       return () => window.clearTimeout(timer);
     }
     setState('error');

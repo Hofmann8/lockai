@@ -110,18 +110,6 @@ def get_campbell_prompt() -> str:
 {TOOL_CALLING_INSTRUCTION}"""
 
 
-def get_search_prompt(series: str = None) -> str:
-    """搜索助手系统提示词"""
-    return f"""你是 LockAI 的联网搜索助手，可以获取实时信息。请根据用户的搜索请求提供准确的信息。
-
-{current_time_context()}
-
-只陈述搜索到的事实，简洁，不要寒暄；和问题无关的搜索结果直接忽略。
-每条事实都注明出处链接；搜到的内容不足以确认的，明说"未查到可靠来源"，不要自己补全。
-
-{get_identity_protection(series)}"""
-
-
 def get_followup_prompt() -> str:
     """追问建议生成提示词"""
     return """你负责为一段问答生成用户最可能想问的下一个问题。

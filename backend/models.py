@@ -168,6 +168,9 @@ class ChatMessage(db.Model):
             result['files'] = files_list
         if trace:
             result['tool_trace'] = trace
+        elif self.role == 'assistant' and not (normalized_content or '').strip():
+            # 存下来的空回答只有一种：模型选择不回复（出错、停下的都带说明或不存）
+            result['silent'] = True
         # 思考文字只存不发：界面只显示用时和 token 数
         if self.reasoning_seconds is not None:
             result['reasoning_seconds'] = self.reasoning_seconds
@@ -234,6 +237,21 @@ class CallingOutUsage(db.Model):
         }
 
 
+class CampbellQuota(db.Model):
+    """每个用户的 Campbell 额度档位和当前周期。
+
+    周期从上一个周期结束后第一次扣费开始，持续 7 天；周期内的用量直接累加在这里，
+    不从按天汇总的 campbell_usages 里推算（周期可能从一天的中间开始）。
+    """
+    __tablename__ = 'campbell_quotas'
+
+    user_id = db.Column(db.String(36), primary_key=True)
+    tier = db.Column(db.Integer, nullable=False, default=1)
+    window_started_at = db.Column(db.DateTime, nullable=True)  # UTC
+    window_units = db.Column(db.Float, nullable=False, default=0.0)
+    updated_at = db.Column(db.DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
 class CampbellUsage(db.Model):
     """Campbell 配额日度用量（按北京时间日聚合）
 
@@ -282,3 +300,64 @@ class CampbellUsage(db.Model):
             'billed_units': self.billed_units,
             'estimated': bool(self.estimated),
         }
+
+
+class DesktopAuthRequest(db.Model):
+    """LockAI Desktop 的一次浏览器授权（PKCE）。
+
+    桌面端发起 → 用户在网页上允许 → 浏览器带一次性授权码跳回本机 → 桌面端用 code_verifier 换设备令牌。
+    授权码只存哈希，换过一次就作废。
+    """
+    __tablename__ = 'desktop_auth_requests'
+
+    id = db.Column(db.String(32), primary_key=True)
+    code_challenge = db.Column(db.String(128), nullable=False)
+    state = db.Column(db.String(256), nullable=False)
+    redirect_uri = db.Column(db.String(300), nullable=False)
+    login_source = db.Column(db.String(16), nullable=False, default='desktop')
+    # pending → approved → exchanged；或 cancelled
+    status = db.Column(db.String(16), nullable=False, default='pending')
+    user_id = db.Column(db.String(36), nullable=True)
+    user_name = db.Column(db.String(100), nullable=True)
+    user_email = db.Column(db.String(200), nullable=True)
+    # LockAuth 头像地址（公共桶，不过期），核验登录时拿到
+    user_avatar = db.Column(db.Text, nullable=True)
+    code_hash = db.Column(db.String(64), nullable=True, index=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    expires_at = db.Column(db.DateTime, nullable=False)
+
+
+class DesktopDevice(db.Model):
+    """一台已授权的 LockAI Desktop，对应一个设备令牌。令牌只存哈希，可随时吊销。"""
+    __tablename__ = 'desktop_devices'
+
+    id = db.Column(db.String(36), primary_key=True)
+    user_id = db.Column(db.String(36), nullable=False, index=True)
+    user_name = db.Column(db.String(100), nullable=True)
+    user_email = db.Column(db.String(200), nullable=True)
+    user_avatar = db.Column(db.Text, nullable=True)
+    token_hash = db.Column(db.String(64), nullable=False, unique=True)
+    token_prefix = db.Column(db.String(16), nullable=False)
+    device_id = db.Column(db.String(64), nullable=True)
+    device_model = db.Column(db.String(100), nullable=True)
+    os_version = db.Column(db.String(200), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow)
+    last_used_at = db.Column(db.DateTime, default=datetime.utcnow)
+    expires_at = db.Column(db.DateTime, nullable=False)
+    revoked_at = db.Column(db.DateTime, nullable=True)
+
+
+class WatermarkChoice(db.Model):
+    """用户开关图片水印的记录，只增不删。
+
+    《人工智能生成合成内容标识办法》：用户要不带显式标识的生成内容时，服务提供者在用户协议里讲明标识义务和
+    责任后可以提供，并依法留存提供对象信息等日志不少于六个月。用户在设置里确认关闭时记一条，重新打开也记一条。
+    """
+    __tablename__ = 'watermark_choices'
+
+    id = db.Column(db.Integer, primary_key=True, autoincrement=True)
+    user_id = db.Column(db.String(36), nullable=False, index=True)
+    enabled = db.Column(db.Boolean, nullable=False)
+    ip = db.Column(db.String(64), nullable=True)
+    user_agent = db.Column(db.String(300), nullable=True)
+    created_at = db.Column(db.DateTime, default=datetime.utcnow, nullable=False)  # UTC

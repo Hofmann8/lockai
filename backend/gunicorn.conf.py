@@ -20,7 +20,7 @@ worker_class = "uvicorn_worker.UvicornWorker"
 # 超时配置
 # uvicorn worker 的心跳由事件循环维持，长请求本身不会触发 timeout；
 # 这里保留一个宽松值，只用于回收真正卡死的 worker。
-# HD 出图的上限见 services/image.py 的 IMAGE_GEN_HD_TIMEOUT（900s）。
+# 出图的上限见 services/image.py 的 IMAGE_RENDER_TIMEOUT（900s）。
 timeout = 1200
 graceful_timeout = 30
 keepalive = 5

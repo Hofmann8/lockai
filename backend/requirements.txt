@@ -19,6 +19,9 @@ tiktoken>=0.7.0
 # S3 Storage
 boto3>=1.35.0
 
+# 生成的音频出库前改标签（去掉 Suno 的注释、写入 AIGC 标识）；纯 Python，没有依赖
+mutagen>=1.47.0
+
 # 云沙箱（阿里云函数计算，E2B 协议兼容）
 # e2b 2.51 起建沙箱改走 POST /v2/sandboxes，阿里云还不支持（405），先锁 2.50
 e2b==2.50.0

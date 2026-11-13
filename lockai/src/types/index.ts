@@ -87,6 +87,22 @@ export interface FileArtifact {
   /** Word / PPT 交付时额外转出来的 PDF，网页预览用 */
   preview?: string;
   error?: string;
+  /** 作曲生成的歌：有这个就用音乐播放器打开 */
+  music?: MusicMeta;
+}
+
+export interface MusicMeta {
+  title: string;
+  style?: string;
+  instrumental?: boolean;
+  /** 带 [Verse] / [Chorus] 这类段落标记 */
+  lyrics?: string;
+  cover?: string;
+  duration?: number;
+  /** Suno 里的编号：之后续写、分轨要用 */
+  clipId?: string;
+  /** 同一次作曲的第几个版本 */
+  version?: number;
 }
 
 export interface ShellToolTrace {
@@ -133,7 +149,46 @@ export interface TaskToolTrace {
   startedAtMs?: number;
 }
 
-export type ToolTrace = SearchToolTrace | ImageGenToolTrace | ShellToolTrace | TaskToolTrace;
+/** 作曲的一个版本：一次提交出两个 */
+export interface MusicTrackProgress {
+  /** 0~100 */
+  progress: number;
+  done: boolean;
+  /** 秒，完成后才有 */
+  duration?: number;
+}
+
+/** 作曲、编辑（续写、局部重写…）、分轨、音效 */
+export type MusicAction =
+  | 'generate' | 'extend' | 'replace_section' | 'remaster' | 'add_vocals' | 'add_backing'
+  | 'hum_to_song' | 'mashup' | 'same_voice' | 'stems' | 'stems_all' | 'sound';
+
+export interface MusicToolTrace {
+  kind: 'music';
+  id: string;
+  /** 没有时是作曲（早期的记录） */
+  action?: MusicAction;
+  /** 编辑、分轨的源文件（沙箱里的路径） */
+  source?: string;
+  /** 正式生成前后的准备步骤：读取音频、拼成完整一首… */
+  phase?: string;
+  title: string;
+  /** 风格标签 */
+  style?: string;
+  instrumental?: boolean;
+  preamble?: string;
+  status: 'running' | 'done';
+  success?: boolean;
+  tracks?: MusicTrackProgress[];
+  /** 转存好的音频，和沙箱交付的文件一起放在交付区 */
+  files?: FileArtifact[];
+  error?: string;
+  modelLabel?: string;
+  startedAtMs?: number;
+  durationSeconds?: number;
+}
+
+export type ToolTrace = SearchToolTrace | ImageGenToolTrace | ShellToolTrace | TaskToolTrace | MusicToolTrace;
 
 export interface ChatMessage {
   id: string;
@@ -148,6 +203,8 @@ export interface ChatMessage {
   reasoning?: string;
   reasoning_seconds?: number;
   reasoning_tokens?: number;
+  /** 模型自己选择不回复：正文为空，界面只留操作按钮 */
+  silent?: boolean;
   timestamp: Date;
 }
 
@@ -189,7 +246,6 @@ export interface ChatRequest {
   thinking?: boolean;
   reasoning_effort?: 'high' | 'max';
   current_message_id?: string;
-  image_quality?: 'standard' | 'hd';
   files?: FileArtifact[];
   /** 文档 / 幻灯片的交付偏好 */
   delivery?: 'quality' | 'editable';
@@ -305,6 +361,37 @@ export interface StreamTaskEndEvent {
   seconds?: number;
 }
 
+export interface StreamMusicStartEvent {
+  type: 'music_start';
+  message_id?: string;
+  id: string;
+  action?: MusicAction;
+  source?: string;
+  title: string;
+  style?: string;
+  instrumental?: boolean;
+  modelLabel?: string;
+  preamble?: string;
+}
+
+export interface StreamMusicProgressEvent {
+  type: 'music_progress';
+  message_id?: string;
+  id: string;
+  tracks: MusicTrackProgress[];
+  phase?: string;
+}
+
+export interface StreamMusicEndEvent {
+  type: 'music_end';
+  message_id?: string;
+  id: string;
+  success: boolean;
+  tracks?: MusicTrackProgress[];
+  files?: FileArtifact[];
+  error?: string;
+}
+
 export interface StreamShellStartEvent {
   type: 'shell_start';
   message_id?: string;
@@ -347,6 +434,8 @@ export interface StreamMessageEndEvent {
   message_id: string;
   /** 中途停下的原因：user 用户停止 / evicted 被新回答挤掉 / timeout 超时 / discard / deleted */
   stopped?: string;
+  /** 模型自己选择不回复 */
+  silent?: boolean;
 }
 
 /** 回到正在后台回答的会话：先重放已有事件（resume … replay_done），再接实时的 */
@@ -394,6 +483,9 @@ export type StreamEvent =
   | StreamShellEndEvent
   | StreamTaskStartEvent
   | StreamTaskEndEvent
+  | StreamMusicStartEvent
+  | StreamMusicProgressEvent
+  | StreamMusicEndEvent
   | StreamMessageEndEvent
   | StreamTitleUpdateEvent
   | StreamResumeEvent

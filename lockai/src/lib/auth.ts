@@ -142,10 +142,24 @@ export function isAuthenticated(): boolean {
   return getAuthState().isAuthenticated && !!getToken();
 }
 
+const RETURN_TO_KEY = 'lockai_return_to';
+
+/**
+ * 登录回来后要回到的站内页面；只接受桌面端授权页这类站内路径
+ */
+export function consumeReturnPath(): string | null {
+  if (typeof window === 'undefined') return null;
+  const path = sessionStorage.getItem(RETURN_TO_KEY);
+  sessionStorage.removeItem(RETURN_TO_KEY);
+  return path && path.startsWith('/desktop/') ? path : null;
+}
+
 /**
  * 跳转到 SSO 登录页
+ * @param returnTo 登录成功后回到的站内路径，不给就进对话页
  */
-export function redirectToSSO(): void {
+export function redirectToSSO(returnTo?: string): void {
+  if (returnTo?.startsWith('/desktop/')) sessionStorage.setItem(RETURN_TO_KEY, returnTo);
   const callbackUrl = getCallbackUrl();
   const loginUrl = `${SSO_LOGIN_URL}?redirect_uri=${encodeURIComponent(callbackUrl)}`;
   window.location.href = loginUrl;

@@ -24,13 +24,15 @@ from sqlalchemy import inspect, text
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from database import db
-from models import ChatMessage, ChatSession, GeneratedImage
+from desktop_routes import create_desktop_router
+from models import ChatMessage, ChatSession, GeneratedImage, WatermarkChoice
 from schemas import (
     AddMessageBody,
     ChatBody,
     CreateSessionBody,
     GenerateTitleBody,
     StopRunBody,
+    WatermarkBody,
     TruncateBody,
     UpdateSessionBody,
     SuggestionsBody,
@@ -46,8 +48,8 @@ from services.runs import HEARTBEAT as RUNS_HEARTBEAT, MAX_PER_USER as RUNS_PER_
 load_dotenv()
 
 CORS_ORIGINS = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3001",
     "http://localhost:3003",
     "http://127.0.0.1:3003",
     "https://ai.funk-and.love",
@@ -105,6 +107,12 @@ def init_database() -> None:
                 db.session.execute(text(ddl))
                 db.session.commit()
                 print(f"[DB] 已添加 campbell_usages.{column} 列")
+
+        for table in ('desktop_auth_requests', 'desktop_devices'):
+            if 'user_avatar' not in [c['name'] for c in inspector.get_columns(table)]:
+                db.session.execute(text(f'ALTER TABLE {table} ADD COLUMN user_avatar TEXT'))
+                db.session.commit()
+                print(f"[DB] 已添加 {table}.user_avatar 列")
 
         migrated = db.session.execute(text("UPDATE chat_sessions SET model_id = 'campbell' WHERE model_id = 'xiaosuolaoshi'"))
         db.session.commit()
@@ -177,6 +185,10 @@ async def _on_unhandled_error(request: Request, exc: Exception):
     return JSONResponse({"error": "服务器内部错误"}, status_code=500)
 
 
+# LockAI Desktop：浏览器授权登录、OpenAI 兼容网关、联网搜索、强制更新策略
+app.include_router(create_desktop_router(ai_service))
+
+
 def _empty(body) -> bool:
     return body is None or body.is_empty()
 
@@ -195,6 +207,21 @@ def get_usage(user_id: str | None = None):
     if not user_id:
         return error("缺少 user_id", 400)
     return ai_service.usage.get_summary(user_id)
+
+
+@app.post("/api/settings/watermark")
+def record_watermark_choice(request: Request, body: WatermarkBody):
+    """记下用户开关图片水印（关闭前前端已经弹窗讲明标识义务，用户确认后才调这里）。记成功了前端才改设置"""
+    if not body.user_id or body.enabled is None:
+        return error("缺少 user_id 或 enabled", 400)
+    forwarded = request.headers.get("x-forwarded-for", "")
+    ip = (forwarded.split(",")[0].strip() or (request.client.host if request.client else "")) or None
+    db.session.add(WatermarkChoice(
+        user_id=body.user_id, enabled=body.enabled, ip=ip,
+        user_agent=(request.headers.get("user-agent") or "")[:300] or None,
+    ))
+    db.session.commit()
+    return {"enabled": body.enabled}
 
 
 # ============ Session APIs ============
@@ -709,7 +736,6 @@ def _chat_kwargs(body: ChatBody) -> dict:
         "thinking": body.thinking,
         "reasoning_effort": body.reasoning_effort,
         "current_message_id": body.current_message_id,
-        "image_quality": body.image_quality,
         "files": _clean_attachments(body.files),
         "delivery": body.delivery,
     }

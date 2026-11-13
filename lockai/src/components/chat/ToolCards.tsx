@@ -4,9 +4,10 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties }
 import { createPortal } from 'react-dom';
 import gsap from 'gsap';
 import { useGSAP } from '@gsap/react';
-import { ChevronDown, Download, Globe, ImageIcon, Loader2, Maximize2, X } from 'lucide-react';
-import type { ImageGenToolTrace, SearchSource, SearchToolTrace } from '@/types';
+import { ChevronDown, Download, Globe, ImageIcon, Loader2, Maximize2, Music, X } from 'lucide-react';
+import type { ImageGenToolTrace, MusicAction, MusicToolTrace, SearchSource, SearchToolTrace } from '@/types';
 import { cn } from '@/lib/cn';
+import { generatedImageUrl, useWatermark } from '@/lib/watermark';
 import { Collapse } from '@/components/ui/Collapse';
 import { useHoldAnchor } from '@/lib/hooks/useScrollAnchor';
 
@@ -322,7 +323,7 @@ export function Lightbox({ url, alt, onClose }: { url: string; alt: string; onCl
     <div className="fixed inset-0 z-[260] flex flex-col bg-scrim backdrop-blur-md animate-fade" onClick={onClose}>
       <div className="flex items-center justify-between gap-3 px-5 py-4" onClick={(e) => e.stopPropagation()}>
         <p className="min-w-0 truncate text-sm text-fg-soft">{alt}</p>
-        <div className="flex items-center gap-1">
+        <div className="flex shrink-0 items-center gap-1">
           <button
             type="button"
             disabled={busy}
@@ -331,7 +332,7 @@ export function Lightbox({ url, alt, onClose }: { url: string; alt: string; onCl
               await downloadImage(url);
               setBusy(false);
             }}
-            className="flex h-9 items-center gap-2 rounded-xl bg-surface px-3 text-[13px] text-fg shadow-soft transition-colors hover:bg-surface-2"
+            className="flex h-9 items-center gap-2 whitespace-nowrap rounded-xl bg-surface px-3 text-[13px] text-fg shadow-soft transition-colors hover:bg-surface-2"
           >
             {busy ? <Loader2 className="h-4 w-4 animate-spin" /> : <Download className="h-4 w-4" />}
             下载
@@ -375,7 +376,9 @@ function ImagePreview({
   ratioStyle?: CSSProperties;
   placeholder: string;
 }) {
-  const src = blur && blurredUrl ? blurredUrl : url;
+  const watermark = useWatermark();
+  const shown = blur && blurredUrl ? blurredUrl : url;
+  const src = shown ? generatedImageUrl(shown, watermark) : shown;
   const [loaded, setLoaded] = useState(false);
   const [measured, setMeasured] = useState<CSSProperties | undefined>(ratioStyle);
   const [lightbox, setLightbox] = useState(false);
@@ -590,6 +593,112 @@ export function ImageCard({ trace, settlingLabel }: { trace: ImageGenToolTrace; 
             ratioStyle={ratioStyle}
             placeholder={running ? (isEdit ? '正在渲染修改' : '正在显影') : settlingLabel || '加载中'}
           />
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* 作曲 */
+/* ------------------------------------------------------------------ */
+
+/** 2:12 */
+function formatLength(seconds: number): string {
+  const s = Math.max(0, Math.round(seconds));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+/** 各动作的状态文案：[进行中, 完成, 失败] */
+const MUSIC_STATUS: Record<MusicAction, [string, string, string]> = {
+  generate: ['正在作曲', '作好了', '作曲没有成功'],
+  extend: ['正在续写', '续写好了', '续写没有成功'],
+  replace_section: ['正在重写这一段', '重写好了', '重写没有成功'],
+  remaster: ['正在重制', '重制好了', '重制没有成功'],
+  add_vocals: ['正在加人声', '人声加好了', '加人声没有成功'],
+  add_backing: ['正在加伴奏', '伴奏加好了', '加伴奏没有成功'],
+  hum_to_song: ['正在把哼唱做成歌', '做好了', '没有做成'],
+  mashup: ['正在混搭', '混搭好了', '混搭没有成功'],
+  same_voice: ['正在用同一个歌手演唱', '唱好了', '没有唱成'],
+  stems: ['正在分离人声和伴奏', '分好了', '分轨没有成功'],
+  stems_all: ['正在拆分全部分轨', '分好了', '分轨没有成功'],
+  sound: ['正在做音效', '音效做好了', '音效没有做成'],
+};
+
+/** 分轨、音效交付的是一组文件，不是「几个版本」 */
+const MUSIC_FILE_SETS = new Set<MusicAction>(['stems', 'stems_all', 'sound']);
+
+function trackLabel(action: MusicAction, index: number): string {
+  if (action === 'stems') return index === 0 ? '人声' : '伴奏';
+  if (action === 'stems_all') return '分轨';
+  return `版本 ${index + 1}`;
+}
+
+/** 生成中显示各版本的进度；做好的音频在下方交付区，点开就能听 */
+export function MusicCard({ trace, settlingLabel }: { trace: MusicToolTrace; settlingLabel?: string }) {
+  const running = trace.status === 'running';
+  const elapsed = useElapsed(trace.startedAtMs, running);
+  const action = trace.action ?? 'generate';
+  const [runningText, doneText, failedText] = MUSIC_STATUS[action] ?? MUSIC_STATUS.generate;
+  const tracks = trace.tracks ?? [];
+  const lengths = tracks.map((t) => (t.duration ? formatLength(t.duration) : '')).filter(Boolean);
+  const delivered = (trace.files ?? []).filter((f) => f.url && !f.error).length;
+  const status = settlingLabel
+    || (running ? (trace.phase || runningText) : trace.success ? doneText : failedText);
+  const sourceName = trace.source?.split('/').pop() ?? '';
+  const chips = [
+    sourceName ? `来自 ${sourceName}` : '',
+    action === 'sound' || MUSIC_FILE_SETS.has(action) || !trace.instrumental ? '' : '纯音乐',
+    MUSIC_FILE_SETS.has(action) && action !== 'sound' ? '' : trace.style?.trim() ?? '',
+  ].filter(Boolean);
+  const placeholders = action === 'stems_all' ? 1 : 2;
+  const summary = MUSIC_FILE_SETS.has(action)
+    ? (delivered > 0 ? `${delivered} 个文件` : '')
+    : (lengths.length > 0 ? `${lengths.length} 个版本 · ${lengths.join(' / ')}` : '');
+
+  return (
+    <div className="my-3">
+      {trace.preamble && <ToolPreamble text={trace.preamble} live={running} />}
+      <div className="animate-rise">
+        <div className="flex min-h-7 flex-wrap items-center gap-x-2 gap-y-1 text-[13.5px]">
+          {running ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin text-accent" />
+          ) : (
+            <Music className={cn('h-3.5 w-3.5', trace.success === false ? 'text-danger' : 'text-fg-faint')} />
+          )}
+          <span className={cn(running || settlingLabel ? 'shimmer-text' : 'text-fg-soft')}>{status}</span>
+          <Seconds value={running ? elapsed : trace.durationSeconds ?? 0} />
+          {trace.modelLabel && (
+            <span className="rounded-md border border-line px-1.5 py-px text-[10.5px] text-fg-faint">{trace.modelLabel}</span>
+          )}
+        </div>
+        <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[13px]">
+          <span className="line-clamp-1 text-fg">{trace.title}</span>
+          {chips.map((chip) => (
+            <span key={chip} className="max-w-[22rem] truncate rounded-full bg-surface-2 px-2 py-px text-[11.5px] text-fg-soft">{chip}</span>
+          ))}
+          {!running && trace.success && summary && (
+            <span className="text-[12px] tabular-nums text-fg-faint">{summary}</span>
+          )}
+        </div>
+        {running && (
+          <div className="mt-2.5 grid max-w-[26rem] gap-2">
+            {(tracks.length > 0 ? tracks : Array.from({ length: placeholders }, () => ({ progress: 0, done: false }))).map((t, i) => (
+              <div key={i} className="flex items-center gap-2.5 text-[12px] text-fg-faint">
+                <span className="w-9 shrink-0">{trackLabel(action, i)}</span>
+                <div className="h-1 flex-1 overflow-hidden rounded-full bg-surface-2">
+                  <div
+                    className={cn('h-full rounded-full transition-[width] duration-700 ease-out', t.done ? 'bg-fg-faint' : 'bg-accent')}
+                    style={{ width: `${Math.max(2, Math.min(100, t.progress))}%` }}
+                  />
+                </div>
+                <span className="w-9 shrink-0 text-right tabular-nums">{t.done ? '好了' : `${t.progress}%`}</span>
+              </div>
+            ))}
+          </div>
+        )}
+        {!running && trace.success === false && trace.error && (
+          <p className="mt-1.5 text-[12.5px] text-danger">{trace.error}</p>
         )}
       </div>
     </div>

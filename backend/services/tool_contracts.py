@@ -246,6 +246,149 @@ def _build_shell_tool() -> dict[str, Any]:
     }
 
 
+MUSIC_SOURCE_HINT = (
+    "沙箱里的路径：生成的音乐在 /home/user/inputs/music/，用户上传的在 /home/user/inputs/，"
+    "shell 做出来的在 /home/user/outputs/。用户上传的音频第一次处理时要先读取约半分钟"
+)
+
+
+def _build_generate_music_tool() -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": "generate_music",
+            "description": (
+                "作曲：生成一首歌或一段纯音乐，一次出两个版本（每首约两分钟，生成约一两分钟）。"
+                "也可以给一张图片或一段视频（reference），按画面的氛围作曲。"
+                "成品以音频文件交给用户，同时放进沙箱的 /home/user/inputs/music/，之后可以用 edit_music 续写、改段落、加人声伴奏，"
+                "或用 shell 里的 ffmpeg 剪辑、调速、淡入淡出、和视频合成。"
+                "消耗额度较多：只在用户明确要音乐时调用；不要为了挑版本反复生成，先让用户听这两版。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "歌名，用用户的语言"},
+                    "style": {
+                        "type": "string",
+                        "description": (
+                            "风格标签，英文、逗号分隔：曲风、主要乐器、情绪、人声（male / female vocals）、速度（如 100 bpm）。"
+                            "例：funk, hip hop, groovy bassline, punchy drums, energetic, 100 bpm"
+                        ),
+                    },
+                    "lyrics": {
+                        "type": "string",
+                        "description": (
+                            "完整歌词，用 [Verse] [Pre-Chorus] [Chorus] [Bridge] [Outro] 等段落标记分段，用用户要的语言写。"
+                            "用户只给了主题时由你来写；纯音乐不填"
+                        ),
+                    },
+                    "instrumental": {"type": "boolean", "description": "纯音乐（没有人声）。用户要伴奏、BGM、舞蹈配乐时用 true"},
+                    "reference": {
+                        "type": "string",
+                        "description": "可选：按这张图片或这段视频的氛围作曲，填会话里的文件路径（如 /home/user/inputs/images/a.png）",
+                    },
+                },
+                "required": ["title", "style"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _build_edit_music_tool() -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": "edit_music",
+            "description": (
+                "在一段已有的音频上再创作，一次出两个版本，耗时一两分钟，额度和作曲一样。源可以是生成的歌，也可以是用户上传的音频。action：\n"
+                "- extend 续写：从 start 秒（默认结尾）接着往下写，交付拼好的完整一首；lyrics 是接下来的词\n"
+                "- replace_section 局部重写：只重做 start~end 这一段，lyrics 是这段的新词\n"
+                "- remaster 重制：同一首歌做一版有变化的新录音\n"
+                "- add_vocals 加人声：给纯音乐、伴奏配上人声，lyrics 是要唱的词\n"
+                "- add_backing 加伴奏：给清唱、哼唱、人声配上伴奏，style 描述伴奏\n"
+                "- hum_to_song 哼唱成曲：把一段哼唱或简单旋律扩成完整的歌\n"
+                "- mashup 混搭：把 source 和 second_source 两首融合成一首\n"
+                "- same_voice 沿用歌手：用 source 里 start~end 那段的歌声唱一首新歌（lyrics、style 是新歌的）\n"
+                "用户上传的音频不知道时长：extend 不给 start、add_vocals / add_backing 不给 end 时，先用 shell 跑 ffprobe 量出时长。"
+                "只是剪切、拼接、调速、变调、淡入淡出、调音量这类不需要重新生成的处理，用 shell 里的 ffmpeg，不要用这个工具。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["extend", "replace_section", "remaster", "add_vocals",
+                                                          "add_backing", "hum_to_song", "mashup", "same_voice"]},
+                    "source": {"type": "string", "description": "要处理的音频。" + MUSIC_SOURCE_HINT},
+                    "second_source": {"type": "string", "description": "mashup 的第二首"},
+                    "title": {"type": "string", "description": "新歌名，不填就用原名加上操作名"},
+                    "style": {"type": "string", "description": "风格标签，英文、逗号分隔；不填沿用原曲"},
+                    "lyrics": {"type": "string", "description": "要唱的词，用 [Verse] [Chorus] 等标记分段"},
+                    "instrumental": {"type": "boolean", "description": "结果是纯音乐；不填沿用原曲"},
+                    "start": {"type": "number", "description": "起点（秒）"},
+                    "end": {"type": "number", "description": "终点（秒）"},
+                },
+                "required": ["action", "source"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _build_separate_music_tool() -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": "separate_music",
+            "description": (
+                "分轨：把一首歌拆开。默认只分人声和伴奏（两三分钟，额度和作曲一样）；"
+                "full=true 时拆成人声、和声、鼓、贝斯、吉他、键盘、弦乐、合成器等十几轨，外加一份合并的 MIDI"
+                "（五六分钟，额度是作曲的 5 倍，只在用户明确要全部分轨或 MIDI 时用）。"
+                "成品放进 /home/user/inputs/music/。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "source": {"type": "string", "description": "要分轨的音频。" + MUSIC_SOURCE_HINT},
+                    "full": {"type": "boolean", "description": "拆成全部乐器分轨并导出 MIDI"},
+                },
+                "required": ["source"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+def _build_generate_sound_tool() -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": "generate_sound",
+            "description": (
+                "生成音效：掌声、欢呼、环境声、转场音、鼓点 loop 之类的短音频（几秒到十几秒），一次出两个版本，"
+                "约一两分钟，额度是作曲的五分之一。成品放进 /home/user/inputs/music/。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "description": {"type": "string", "description": "音效描述，英文效果更好，例：crowd cheering at a street dance battle"},
+                    "title": {"type": "string", "description": "文件名用的短名字，用用户的语言"},
+                    "loop": {"type": "boolean", "description": "做成可以无缝循环的片段"},
+                },
+                "required": ["description"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+MUSIC_TOOLS = [
+    _build_generate_music_tool(),
+    _build_edit_music_tool(),
+    _build_separate_music_tool(),
+    _build_generate_sound_tool(),
+]
+
+
 def build_chat_tools(include_shell: bool = False) -> list[dict[str, Any]]:
     tools = [
         _build_web_search_tool(),
@@ -370,6 +513,8 @@ def build_tool_calling_instruction() -> str:
 - 用户用中文提问时，搜索关键词也用中文；只有查询对象本身是英文资料时才用英文
 - 思考阶段只做规划（结构、要点、要查证什么），不要在思考里把正文写一遍，正文留到回答里写
 - 写论文、报告、综述、调研这类要拿去交或发表的文章时，先用 `web_search` 核实文中要用的事实、数据、政策原文、人物观点和参考文献；参考文献只列查到的真实文献（作者、题名、出处、年份对得上），查不到就不列，绝不编造
+
+动手之前，掂量一下按你的理解直接去做、万一理解偏了，用户要付出多少。代价不大时就先做出来，把你替用户做的选择顺带说清，方便他接着调；只有缺的信息你推断不出来、又决定成败，或者这件事做一次很重时，才先简短问一句。
 
 `web_search` 使用原则：
 1. 如果预计需要多个搜索，请在同一轮一次性发出多个 `web_search` 调用

@@ -33,6 +33,7 @@ type Viewer = ComponentType<{ file: FileArtifact }>;
 const ModelView = lazy(() => import('./preview/ModelView'));
 const ImageView = lazy(() => import('./preview/ImageView'));
 const AudioView = lazy(() => import('./preview/AudioView'));
+const MusicView = lazy(() => import('./preview/MusicView'));
 const NotebookView = lazy(() => import('./preview/NotebookView'));
 const ArchiveView = lazy(() => import('./preview/ArchiveView'));
 const FontView = lazy(() => import('./preview/FontView'));
@@ -307,7 +308,8 @@ export function PreviewBody({ file, onInfo }: { file: FileArtifact; onInfo?: (in
   if (error) return <PreviewFallback file={file} note="文件没能加载出来，可以直接下载" />;
   if (fetchAs && text === undefined) return <Opening />;
 
-  const Lazy = LAZY[kind];
+  // 作曲生成的歌用音乐播放器，其他音频用普通播放器
+  const Lazy = kind === 'audio' && file.music ? MusicView : LAZY[kind];
   if (Lazy) {
     return (
       <Suspense fallback={<Opening />}>

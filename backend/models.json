@@ -4,8 +4,13 @@
     "name": "Campbell 3.0",
     "description": "深度推理与复杂任务处理",
     "model": "gpt-6-astra",
-    "api_base": "${API_BASE_URL}",
-    "api_key": "${RELAY_API_KEY}",
+    "api_base": "${CAMPBELL_API_BASE_URL}",
+    "api_key": "${CAMPBELL_API_KEY}",
+    "fallback": {
+      "model": "gpt-6-astra",
+      "api_base": "${API_BASE_URL}",
+      "api_key": "${RELAY_API_KEY}"
+    },
     "provider": "openai-compatible",
     "transport": "openai-compatible",
     "thinking_mode": "optional",
@@ -25,7 +30,8 @@
       "联网",
       "绘图",
       "修图",
-      "识图"
+      "识图",
+      "作曲"
     ],
     "billing": {
       "input": 1,
@@ -55,23 +61,10 @@
       "联网",
       "绘图",
       "修图",
-      "识图"
+      "识图",
+      "作曲"
     ],
     "vision": true
-  },
-  {
-    "id": "search_builtin",
-    "name": "联网搜索",
-    "description": "内部搜索执行模型（中转站 Responses API + web_search 工具）",
-    "model": "gpt-4.1-mini",
-    "api_base": "${API_BASE_URL}",
-    "api_key": "${RELAY_API_KEY}",
-    "provider": "openai-responses",
-    "transport": "openai-responses",
-    "available": true,
-    "visible": false,
-    "temperature": 0.2,
-    "max_tokens": 1200
   },
   {
     "id": "image_describer",
@@ -103,36 +96,44 @@
   },
   {
     "id": "image_generator",
-    "name": "Campbell 2.5 Image",
-    "description": "实时绘图（gpt-image-2.5-flare）",
-    "model": "gpt-image-2.5-flare",
-    "edit_model": "gpt-image-2.5-flare",
-    "api_base": "${API_BASE_URL}",
+    "name": "Campbell 3.0 Image",
+    "description": "绘图与修图（gpt-image-2.5-sunburst）",
+    "model": "gpt-image-2.5-sunburst",
+    "edit_model": "gpt-image-2.5-sunburst",
+    "api_base": "${IMAGE_API_BASE_URL}",
+    "image_api_key_env": "IMAGE_API_KEY",
+    "fallback": {
+      "api_base": "${API_BASE_URL}",
+      "image_api_key_env": "RELAY_API_KEY"
+    },
     "provider": "openai-image",
     "transport": "openai-image",
     "available": true,
     "visible": false,
-    "image_api_key_env": "RELAY_API_KEY",
     "billing": {
       "input": 0.5,
       "output": 3
     }
   },
   {
-    "id": "image_generator_hd",
-    "name": "Campbell 3.0 Image",
-    "description": "高清绘图（gpt-image-2.5-sunburst，较慢）",
-    "model": "gpt-image-2.5-sunburst",
-    "edit_model": "gpt-image-2.5-sunburst",
+    "id": "music_generator",
+    "name": "Campbell Music",
+    "description": "作曲、编辑、分轨、音效（Suno，一次出两个版本）",
+    "model": "chirp-v6",
+    "task_models": {
+      "sound": "chirp-v5"
+    },
     "api_base": "${API_BASE_URL}",
-    "provider": "openai-image",
-    "transport": "openai-image",
+    "api_key": "${RELAY_API_KEY}",
+    "provider": "suno",
+    "transport": "suno",
     "available": true,
     "visible": false,
-    "image_api_key_env": "RELAY_API_KEY",
     "billing": {
-      "input": 0.5,
-      "output": 3
+      "per_call": 200000,
+      "sound": 40000,
+      "stems": 200000,
+      "stems_all": 1000000
     }
   }
 ]

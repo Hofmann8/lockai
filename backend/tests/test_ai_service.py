@@ -41,8 +41,8 @@ class _DummyLLM:
 
 class _DummyImageService:
     @staticmethod
-    def model_label(hd):
-        return "Campbell 3.0 Image" if hd else "Campbell 2.5 Image"
+    def model_label():
+        return "Campbell 3.0 Image"
 
     def _normalize_image_request(self, arguments):
         return {"subject": arguments.get("subject", "")}

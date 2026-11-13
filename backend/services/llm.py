@@ -33,6 +33,15 @@ RETIRED_CHAT_MODEL_ALIASES = {
 
 DEEPSEEK_OUTPUT_CEILING = 131072
 
+# 换成 fallback 时这几项整组换成回退里的，不和主供应商的混用
+ENDPOINT_FIELDS = ("api_base", "api_key", "api_keys", "api_key_pool_prefix", "image_api_key", "image_api_key_env")
+
+
+def should_fall_back(status: int | None) -> bool:
+    """主供应商这样失败时换回退：连不上 / 超时（None）、鉴权、找不到模型、限流、上游 5xx。
+    400 / 413 / 422 是请求本身的问题，换一家也一样，直接报给用户。"""
+    return status is None or status in (401, 403, 404, 408, 429) or status >= 500
+
 
 class LLMService:
     """LLM API 调用服务。"""
@@ -47,7 +56,7 @@ class LLMService:
         self._key_index_by_model: dict[str, int] = {}
 
         # 兼容旧代码的默认配置
-        self.legacy_api_base = os.environ.get("API_BASE_URL", "https://api.relayrouter.ai")
+        self.legacy_api_base = os.environ.get("API_BASE_URL", "https://api.relayrouter.app")
         self.qwen_base_url = os.environ.get("QWEN_API_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
         self.qwen_api_key = os.environ.get("QWEN_API_KEY", "")
         self.provider_runtime = ProviderRuntime(self)
@@ -104,10 +113,25 @@ class LLMService:
         if not keys:
             return None
 
-        model_id = str(cfg.get("id") or cfg.get("model") or "default")
-        idx = self._key_index_by_model.get(model_id, 0)
+        # 主供应商和回退的 key 各轮各的
+        model_id = f"{cfg.get('id') or cfg.get('model') or 'default'}@{cfg.get('api_base') or ''}"
+        idx = self._key_index_by_model.get(model_id, 0) % len(keys)
         self._key_index_by_model[model_id] = (idx + 1) % len(keys)
         return keys[idx]
+
+    def fallback_config(self, cfg: dict[str, Any]) -> dict[str, Any] | None:
+        """models.json 里配了 fallback 的模型：主配置 + fallback 覆盖（地址和 key 整组替换）。"""
+        fallback = cfg.get("fallback")
+        if not isinstance(fallback, dict) or not fallback:
+            return None
+        merged = {k: v for k, v in cfg.items() if k != "fallback" and k not in ENDPOINT_FIELDS}
+        merged.update(fallback)
+        merged["is_fallback"] = True
+        return merged
+
+    def chat_candidates(self, cfg: dict[str, Any]) -> list[dict[str, Any]]:
+        """依次要试的配置：主供应商、回退。没配 key 的跳过（新 key 还没配时直接走回退）。"""
+        return [c for c in (cfg, self.fallback_config(cfg)) if c and self._collect_api_keys(c)]
 
     def _get_api_key(self, model: str | dict[str, Any] | None = None) -> Optional[str]:
         return self.get_api_key(model or self.get_default_chat_model_id())
@@ -136,12 +160,56 @@ class LLMService:
         reasoning_effort: str | None = None,
         extra_payload: dict[str, Any] | None = None,
     ) -> Generator[dict[str, Any], None, None]:
+        """流式对话。配了 fallback 的模型：主供应商在吐出任何内容之前就失败（should_fall_back），
+        同一个请求换回退重发一次；已经开始输出后再断就不换了，免得用户看到前半段重复。"""
         cfg = self.get_model_config(model)
-        api_key = self.get_api_key(cfg)
-        if not api_key:
+        candidates = self.chat_candidates(cfg)
+        if not candidates:
             yield {"type": "error", "content": "API 密钥未配置"}
             return
 
+        for index, attempt in enumerate(candidates):
+            last = index == len(candidates) - 1
+            started = False
+            events = self._stream_once(
+                attempt,
+                messages,
+                tools=tools,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                enable_thinking=enable_thinking,
+                reasoning_effort=reasoning_effort,
+                extra_payload=extra_payload,
+            )
+            try:
+                for event in events:
+                    status = event.pop("status", None) if event.get("type") == "error" else None
+                    if event.get("type") == "error" and not started and not last and should_fall_back(status):
+                        nxt = candidates[index + 1]
+                        print(f"[LLM] {attempt.get('model')} 失败（{event.get('content')}），改用回退 {nxt.get('model')} @ {nxt.get('api_base')}")
+                        break
+                    started = True
+                    yield event
+                else:
+                    return
+            finally:
+                events.close()
+
+    def _stream_once(
+        self,
+        cfg: dict[str, Any],
+        messages: list,
+        *,
+        tools: list[dict[str, Any]] | None,
+        temperature: float | None,
+        max_tokens: int | None,
+        enable_thinking: bool | None,
+        reasoning_effort: str | None,
+        extra_payload: dict[str, Any] | None,
+    ) -> Generator[dict[str, Any], None, None]:
+        """向一个供应商发一次流式请求。出错时的 error 事件带 status（连不上 / 超时为 None），
+        由 stream_chat_completion 决定要不要换回退，转发前去掉。"""
+        api_key = self.get_api_key(cfg)
         payload = self._build_payload(
             cfg,
             messages,
@@ -154,7 +222,7 @@ class LLMService:
             extra_payload=extra_payload,
         )
 
-        print(f"\n[LLM] 流式调用: {cfg.get('model')} via {cfg.get('id')}")
+        print(f"\n[LLM] 流式调用: {cfg.get('model')} via {cfg.get('id')}{'（回退）' if cfg.get('is_fallback') else ''}")
 
         try:
             with build_http_client(httpx.Timeout(connect=30.0, read=600.0, write=30.0, pool=30.0)) as client:
@@ -167,7 +235,7 @@ class LLMService:
                     if response.status_code != 200:
                         error_text = response.read().decode("utf-8", errors="replace")
                         print(f"[LLM] 错误: {response.status_code} - {error_text[:500]}")
-                        yield {"type": "error", "content": f"API 请求失败: {response.status_code}"}
+                        yield {"type": "error", "content": f"API 请求失败: {response.status_code}", "status": response.status_code}
                         return
 
                     for line in response.iter_lines():
@@ -473,8 +541,6 @@ class LLMService:
         default_cfg = self.get_model_config(self.get_default_chat_model_id())
         self.model_primary = str(default_cfg.get("model") or default_cfg.get("id") or "campbell")
         self.base_url = str(default_cfg.get("api_base") or self.legacy_api_base)
-        self.model_search = "search_builtin"
-        self.model_keyword = "search_builtin"
         self.model_image = "image_generator"
 
     def _default_models(self) -> list[dict[str, Any]]:
@@ -518,20 +584,6 @@ class LLMService:
                 "prompt_id": "scooby",
             },
             {
-                "id": "search_builtin",
-                "name": "联网搜索",
-                "description": "内部搜索执行模型（中转站 Responses API + web_search 工具）",
-                "model": "gpt-4.1-mini",
-                "api_base": self.legacy_api_base,
-                "api_key": os.environ.get("RELAY_API_KEY", ""),
-                "provider": "openai-responses",
-                "transport": "openai-responses",
-                "available": True,
-                "visible": False,
-                "temperature": 0.2,
-                "max_tokens": 1200,
-            },
-            {
                 "id": "image_describer",
                 "name": "图片识别",
                 "description": "内部视觉模型，把图片转成文字描述喂给不支持视觉的主模型",
@@ -561,21 +613,8 @@ class LLMService:
             },
             {
                 "id": "image_generator",
-                "name": "Campbell 2.5 Image",
-                "description": "实时绘图（gpt-image-2.5-flare）",
-                "model": "gpt-image-2.5-flare",
-                "edit_model": "gpt-image-2.5-flare",
-                "api_base": self.legacy_api_base,
-                "image_api_key_env": "RELAY_API_KEY",
-                "provider": "openai-image",
-                "transport": "openai-image",
-                "available": True,
-                "visible": False,
-            },
-            {
-                "id": "image_generator_hd",
                 "name": "Campbell 3.0 Image",
-                "description": "高清绘图（gpt-image-2.5-sunburst，较慢）",
+                "description": "绘图与修图（gpt-image-2.5-sunburst）",
                 "model": "gpt-image-2.5-sunburst",
                 "edit_model": "gpt-image-2.5-sunburst",
                 "api_base": self.legacy_api_base,

@@ -19,7 +19,7 @@ export function conversationToMarkdown(title: string, messages: ChatMessage[]): 
       if (trace.kind === 'image_gen' && trace.url) {
         lines.push(`![${trace.prompt.replace(/[\[\]]/g, '')}](${generatedImageUrl(trace.url)})`, '');
       }
-      if (trace.kind === 'music') {
+      if (trace.kind === 'music' || trace.kind === 'video') {
         for (const file of trace.files ?? []) if (file.url) lines.push(`[${file.name}](${file.url})`, '');
       }
       if (trace.kind === 'search' && trace.sources?.length) {

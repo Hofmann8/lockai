@@ -135,5 +135,25 @@
       "stems": 200000,
       "stems_all": 1000000
     }
+  },
+  {
+    "id": "video_generator",
+    "name": "Campbell Video",
+    "description": "视频生成（Grok Imagine，文生视频、图生视频）",
+    "model": "grok-imagine-video-1.5-lite",
+    "api_base": "${API_BASE_URL}",
+    "api_key": "${RELAY_API_KEY}",
+    "provider": "xai",
+    "transport": "video",
+    "available": true,
+    "visible": false,
+    "billing": {
+      "per_image": 10000,
+      "per_second": {
+        "480p": 20000,
+        "720p": 29932,
+        "1080p": 140136
+      }
+    }
   }
 ]

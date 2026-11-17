@@ -144,10 +144,34 @@ def label_jpeg(data: bytes, content_id: str, title: str = "") -> bytes:
     raise ValueError("JPEG 没有图像数据")
 
 
+def _blank_top_level_uuid(data: bytes) -> bytes:
+    """
+    顶层的 uuid 盒（C2PA 凭证就放在这里，2026-11 实测 Grok 的视频带）原地改成同样长的空 free 盒。
+    不直接删：删了后面音视频数据的位置会变，得跟着改 moov 里的偏移
+    """
+    out = bytearray(data)
+    pos = 0
+    while pos + 8 <= len(out):
+        size, kind = struct.unpack(">I4s", out[pos:pos + 8])
+        header = 8
+        if size == 1:
+            size = struct.unpack(">Q", out[pos + 8:pos + 16])[0]
+            header = 16
+        elif size == 0:
+            size = len(out) - pos
+        if size < header or pos + size > len(out):
+            break
+        if kind == b"uuid":
+            out[pos + 4:pos + 8] = b"free"
+            out[pos + header:pos + size] = bytes(size - header)
+        pos += size
+    return bytes(out)
+
+
 def label_mp4(data: bytes, content_id: str, title: str = "") -> bytes:
     from mutagen.mp4 import MP4, MP4FreeForm
 
-    buf = io.BytesIO(data)
+    buf = io.BytesIO(_blank_top_level_uuid(data))
     audio = MP4(buf)
     if audio.tags is None:
         audio.add_tags()

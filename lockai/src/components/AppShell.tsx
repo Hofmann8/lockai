@@ -2,7 +2,7 @@
 
 import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { usePathname } from 'next/navigation';
-import type { ChatSession } from '@/types';
+import type { ChatSession, RunPhase } from '@/types';
 import { Sidebar } from '@/components/shell/Sidebar';
 import { CommandPalette } from '@/components/shell/CommandPalette';
 import { SettingsDialog } from '@/components/shell/SettingsDialog';
@@ -14,6 +14,18 @@ export interface ChatActivity {
   busy: boolean;
   snapKey: number;
 }
+
+interface LocalRun {
+  phase: Exclude<RunPhase, 'end'>;
+  since: number;
+  /** 服务端列表里见过它在跑 */
+  seen: boolean;
+  /** 哪条连接标的：旧连接迟到的收尾不会把新一轮收掉 */
+  owner?: object;
+}
+
+/** 回答刚起步时服务端可能还没登记：这段时间里列表说没在跑，先信本端 */
+const RUN_GRACE_MS = 20_000;
 
 interface AppShellContextType {
   sessions: ChatSession[];
@@ -27,6 +39,8 @@ interface AppShellContextType {
   removeSession: (id: string) => void;
   openSidebar: () => void;
   setChatActivity: (activity: ChatActivity) => void;
+  /** 一轮回答的头尾：发出 / 接上时 live，离开对话时 detached，收尾时 end。owner 是标记它的那条连接，不传表示以服务端为准直接改 */
+  trackRun: (sessionId: string, phase: RunPhase, owner?: object) => void;
   sidebarCollapsed: boolean;
   setSidebarCollapsed: (collapsed: boolean) => void;
 }
@@ -58,6 +72,13 @@ export function AppShell({ children }: { children: ReactNode }) {
   const pendingDeletes = useRef<Set<string>>(new Set());
   const currentRef = useRef<string | null>(null);
   const runningRef = useRef<Set<string> | null>(null);
+  // 本端知道的进行中回答。服务端列表有滞后（刚发出时还没登记），侧栏的"在回答"取两边的并集
+  const runsRef = useRef<ReadonlyMap<string, LocalRun>>(new Map());
+  const [runs, setRuns] = useState<ReadonlyMap<string, LocalRun>>(runsRef.current);
+  const commitRuns = useCallback((next: ReadonlyMap<string, LocalRun>) => {
+    runsRef.current = next;
+    setRuns(next);
+  }, []);
   const selectRef = useRef<(id: string) => void>(() => {});
 
   useEffect(() => { currentRef.current = currentSessionId; }, [currentSessionId]);
@@ -73,10 +94,27 @@ export function AppShell({ children }: { children: ReactNode }) {
 
   const loadSessions = useCallback(async () => {
     const data = await getSessions();
+    // 对账：离开了的回答，服务端说做完了（或者起步宽限过了还没见过它）就收掉
+    const now = Date.now();
+    const byId = new Map(data.map((s) => [s.id, s]));
+    const next = new Map(runsRef.current);
+    let changed = false;
+    for (const [id, run] of next) {
+      const listed = byId.get(id);
+      if (listed?.running) {
+        if (run.seen) continue;
+        next.set(id, { ...run, seen: true });
+        changed = true;
+      } else if (run.phase === 'detached' && (!listed || run.seen || now - run.since > RUN_GRACE_MS)) {
+        next.delete(id);
+        changed = true;
+      }
+    }
+    if (changed) commitRuns(next);
     setSessions(data);
     setSessionsLoaded(true);
     // 在后台做完的对话（不是正看着的这段）：提示一下，点一下就过去
-    const running = new Set(data.filter((s) => s.running).map((s) => s.id));
+    const running = new Set([...data.filter((s) => s.running).map((s) => s.id), ...next.keys()]);
     const before = runningRef.current;
     runningRef.current = running;
     for (const id of before ?? []) {
@@ -89,14 +127,31 @@ export function AppShell({ children }: { children: ReactNode }) {
       });
     }
     return data;
-  }, []);
+  }, [commitRuns]);
+
+  const trackRun = useCallback((sessionId: string, phase: RunPhase, owner?: object) => {
+    const current = runsRef.current;
+    const prev = current.get(sessionId);
+    if (phase !== 'live' && (!prev || (owner && prev.owner && prev.owner !== owner))) return;
+    if (prev && prev.phase === phase && prev.owner === (owner ?? prev.owner)) return;
+    const next = new Map(current);
+    if (phase === 'end') next.delete(sessionId);
+    else next.set(sessionId, { phase, since: prev?.since ?? Date.now(), seen: prev?.seen ?? false, owner: owner ?? prev?.owner });
+    commitRuns(next);
+  }, [commitRuns]);
 
   useEffect(() => {
     void loadSessions();
   }, [loadSessions]);
 
-  const visibleSessions = useMemo(() => sessions.filter((s) => !hidden.has(s.id)), [hidden, sessions]);
-  const anyRunning = sessions.some((s) => s.running);
+  const visibleSessions = useMemo(
+    () => sessions
+      .filter((s) => !hidden.has(s.id))
+      .map((s) => (!s.running && runs.has(s.id) ? { ...s, running: true } : s)),
+    [hidden, runs, sessions],
+  );
+  // 本端还连着的回答自己会收尾，不用轮询；离开了的要靠列表看它做完没有
+  const anyRunning = sessions.some((s) => s.running) || [...runs.values()].some((r) => r.phase === 'detached');
 
   // 有对话在后台回答：定时刷新列表，页面切回来时也刷新一次
   useEffect(() => {
@@ -222,6 +277,7 @@ export function AppShell({ children }: { children: ReactNode }) {
     removeSession,
     openSidebar: () => setMobileOpen(true),
     setChatActivity: setActivity,
+    trackRun,
     sidebarCollapsed,
     setSidebarCollapsed,
   };

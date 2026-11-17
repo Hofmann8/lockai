@@ -188,7 +188,30 @@ export interface MusicToolTrace {
   durationSeconds?: number;
 }
 
-export type ToolTrace = SearchToolTrace | ImageGenToolTrace | ShellToolTrace | TaskToolTrace | MusicToolTrace;
+export interface VideoToolTrace {
+  kind: 'video';
+  id: string;
+  title: string;
+  prompt?: string;
+  resolution?: string;
+  aspectRatio?: string;
+  /** 视频时长（秒） */
+  duration?: number;
+  /** 图生视频用的图（assetId 或沙箱路径） */
+  image?: string;
+  /** 0~100 */
+  progress?: number;
+  preamble?: string;
+  status: 'running' | 'done';
+  success?: boolean;
+  files?: FileArtifact[];
+  error?: string;
+  modelLabel?: string;
+  startedAtMs?: number;
+  durationSeconds?: number;
+}
+
+export type ToolTrace = SearchToolTrace | ImageGenToolTrace | ShellToolTrace | TaskToolTrace | MusicToolTrace | VideoToolTrace;
 
 export interface ChatMessage {
   id: string;
@@ -361,6 +384,36 @@ export interface StreamTaskEndEvent {
   seconds?: number;
 }
 
+export interface StreamVideoStartEvent {
+  type: 'video_start';
+  message_id?: string;
+  id: string;
+  title: string;
+  prompt?: string;
+  resolution?: string;
+  aspectRatio?: string;
+  duration?: number;
+  modelLabel?: string;
+  preamble?: string;
+}
+
+export interface StreamVideoProgressEvent {
+  type: 'video_progress';
+  message_id?: string;
+  id: string;
+  progress: number;
+}
+
+export interface StreamVideoEndEvent {
+  type: 'video_end';
+  message_id?: string;
+  id: string;
+  success: boolean;
+  progress?: number;
+  files?: FileArtifact[];
+  error?: string;
+}
+
 export interface StreamMusicStartEvent {
   type: 'music_start';
   message_id?: string;
@@ -486,6 +539,9 @@ export type StreamEvent =
   | StreamMusicStartEvent
   | StreamMusicProgressEvent
   | StreamMusicEndEvent
+  | StreamVideoStartEvent
+  | StreamVideoProgressEvent
+  | StreamVideoEndEvent
   | StreamMessageEndEvent
   | StreamTitleUpdateEvent
   | StreamResumeEvent
@@ -520,3 +576,9 @@ export interface ErrorResponse {
   code: string;
   details?: string;
 }
+
+/**
+ * 一轮回答在本端的阶段：发出去 / 接上时 live，离开这段对话时 detached（后台照样做完），收尾时 end。
+ * 侧栏的"在回答"取它和服务端列表的并集。
+ */
+export type RunPhase = 'live' | 'detached' | 'end';

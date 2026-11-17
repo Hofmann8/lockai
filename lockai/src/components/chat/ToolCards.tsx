@@ -4,8 +4,8 @@ import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties }
 import { createPortal } from 'react-dom';
 import gsap from 'gsap';
 import { useGSAP } from '@gsap/react';
-import { ChevronDown, Download, Globe, ImageIcon, Loader2, Maximize2, Music, X } from 'lucide-react';
-import type { ImageGenToolTrace, MusicAction, MusicToolTrace, SearchSource, SearchToolTrace } from '@/types';
+import { ChevronDown, Clapperboard, Download, Globe, ImageIcon, Loader2, Maximize2, Music, X } from 'lucide-react';
+import type { ImageGenToolTrace, MusicAction, MusicToolTrace, SearchSource, SearchToolTrace, VideoToolTrace } from '@/types';
 import { cn } from '@/lib/cn';
 import { generatedImageUrl, useWatermark } from '@/lib/watermark';
 import { Collapse } from '@/components/ui/Collapse';
@@ -695,6 +695,64 @@ export function MusicCard({ trace, settlingLabel }: { trace: MusicToolTrace; set
                 <span className="w-9 shrink-0 text-right tabular-nums">{t.done ? '好了' : `${t.progress}%`}</span>
               </div>
             ))}
+          </div>
+        )}
+        {!running && trace.success === false && trace.error && (
+          <p className="mt-1.5 text-[12.5px] text-danger">{trace.error}</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* 视频 */
+/* ------------------------------------------------------------------ */
+
+/** 生成中显示进度；做好的视频在下方交付区，点开就能看 */
+export function VideoCard({ trace, settlingLabel }: { trace: VideoToolTrace; settlingLabel?: string }) {
+  const running = trace.status === 'running';
+  const elapsed = useElapsed(trace.startedAtMs, running);
+  const progress = trace.progress ?? 0;
+  const status = settlingLabel || (running ? '正在生成视频' : trace.success ? '视频做好了' : '视频没有做成');
+  const chips = [
+    trace.image ? '图生视频' : '',
+    trace.resolution ?? '',
+    trace.duration ? `${trace.duration} 秒` : '',
+    trace.aspectRatio ?? '',
+  ].filter(Boolean);
+
+  return (
+    <div className="my-3">
+      {trace.preamble && <ToolPreamble text={trace.preamble} live={running} />}
+      <div className="animate-rise">
+        <div className="flex min-h-7 flex-wrap items-center gap-x-2 gap-y-1 text-[13.5px]">
+          {running ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin text-accent" />
+          ) : (
+            <Clapperboard className={cn('h-3.5 w-3.5', trace.success === false ? 'text-danger' : 'text-fg-faint')} />
+          )}
+          <span className={cn(running || settlingLabel ? 'shimmer-text' : 'text-fg-soft')}>{status}</span>
+          <Seconds value={running ? elapsed : trace.durationSeconds ?? 0} />
+          {trace.modelLabel && (
+            <span className="rounded-md border border-line px-1.5 py-px text-[10.5px] text-fg-faint">{trace.modelLabel}</span>
+          )}
+        </div>
+        <div className="mt-1.5 flex flex-wrap items-center gap-x-2 gap-y-1 text-[13px]">
+          <span className="line-clamp-1 text-fg">{trace.title}</span>
+          {chips.map((chip) => (
+            <span key={chip} className="rounded-full bg-surface-2 px-2 py-px text-[11.5px] tabular-nums text-fg-soft">{chip}</span>
+          ))}
+        </div>
+        {running && (
+          <div className="mt-2.5 flex max-w-[26rem] items-center gap-2.5 text-[12px] text-fg-faint">
+            <div className="h-1 flex-1 overflow-hidden rounded-full bg-surface-2">
+              <div
+                className="h-full rounded-full bg-accent transition-[width] duration-700 ease-out"
+                style={{ width: `${Math.max(2, Math.min(100, progress))}%` }}
+              />
+            </div>
+            <span className="w-9 shrink-0 text-right tabular-nums">{progress}%</span>
           </div>
         )}
         {!running && trace.success === false && trace.error && (

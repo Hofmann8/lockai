@@ -46,10 +46,13 @@ interface PanelState {
   format: string;
 }
 
+
+/** 新问题置顶时离视口上沿的距离，和对话内容的上边距（pt-8）一致 */
+const TOP_GAP = 32;
 export function ChatView() {
   const shell = useAppShell();
-  const { currentSessionId, setCurrentSessionId, loadSessions, sessions } = shell;
-  const chat = useChatController({ currentSessionId, setCurrentSessionId, loadSessions, sessions });
+  const { currentSessionId, setCurrentSessionId, loadSessions, trackRun, sessions } = shell;
+  const chat = useChatController({ currentSessionId, setCurrentSessionId, loadSessions, trackRun, sessions });
   const {
     messages, isLoading, hydrating, error, models, selectedModelId, streamingMessageId, streamBuffer,
     liveThinking, suggestions, queue, sentTick, snapKey,
@@ -145,7 +148,7 @@ export function ChatView() {
 
   // 停在底部时跟着回答往下走；翻上去看时眼前的内容钉住不动；点开 / 收起卡片时被点的标题不动
   const onDistance = useCallback((distance: number) => setShowJump(distance > 240), []);
-  const { hold, onScroll, scrollToBottom, release } = useScrollAnchor({
+  const { hold, onScroll, scrollToBottom, pin } = useScrollAnchor({
     scrollRef, contentRef, onDistance, enabled: !empty,
   });
 
@@ -161,7 +164,8 @@ export function ChatView() {
     wasHydrating.current = hydrating;
   }, [hydrating, scrollToBottom]);
 
-  // 刚发出去：新问题顶到视口上沿，回答在下面长出来
+  // 刚发出去：新问题顶到视口上沿，回答在下面长出来。
+  // 留的空要比视口顶部的渐隐（20px）大，不然问题会落在渐隐里，看着像被切掉一截
   useLayoutEffect(() => {
     if (sentTick === 0) return;
     setPinned(true);
@@ -170,9 +174,7 @@ export function ChatView() {
     window.requestAnimationFrame(() => {
       const users = el.querySelectorAll<HTMLElement>('[data-role="user"]');
       const last = users[users.length - 1];
-      if (!last) return;
-      release();
-      el.scrollTo({ top: Math.max(0, last.offsetTop - 20), behavior: 'smooth' });
+      if (last) pin(last, TOP_GAP);
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sentTick]);
@@ -409,7 +411,7 @@ export function ChatView() {
         <div
           ref={contentRef}
           className={cn(
-            'mx-auto w-full max-w-[46rem] px-4 pb-10 pt-4 transition-opacity duration-300 sm:px-6',
+            'mx-auto w-full max-w-[46rem] px-4 pb-10 pt-8 transition-opacity duration-300 sm:px-6',
             hydrating && 'opacity-40',
           )}
         >

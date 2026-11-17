@@ -292,7 +292,7 @@ export function SettingsDialog({ open, onClose }: { open: boolean; onClose: () =
         </section>
 
         <section className="mt-5 flex items-center justify-between text-[11.5px] text-fg-faint">
-          <span>LockAI 1.0 · Funk&amp;Love</span>
+          <span>LockAI 1.1 · Funk&amp;Love</span>
           <a href="mailto:link-ai@zju.edu.cn" className="transition-colors hover:text-fg">link-ai@zju.edu.cn</a>
         </section>
       </div>

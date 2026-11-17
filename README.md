@@ -1,6 +1,6 @@
 # LockAI
 
-Funk&Love 舞队 AI 平台。多角色对话、联网搜索、AI 绘图 / 修图 / 识图、作曲和音乐编辑、语音输入，以及在云沙箱里动手干活（做 PPT / 文档 / 表格 / 图表、处理音视频和图片、写网页并预览）。
+Funk&Love 舞队 AI 平台。多角色对话、联网搜索、AI 绘图 / 修图 / 识图、视频生成、作曲和音乐编辑、语音输入，以及在云沙箱里动手干活（做 PPT / 文档 / 表格 / 图表、处理音视频和图片、写网页并预览）。
 
 当前版本：**1.0.0**
 
@@ -8,7 +8,7 @@ Funk&Love 舞队 AI 平台。多角色对话、联网搜索、AI 绘图 / 修图
 
 - **Frontend**：Next.js 16 + React 19 + Tailwind CSS 4，React Compiler 启用；动画用 GSAP（`@gsap/react`），登录页 / 空状态的 3D 锁是一个手写 WebGL 着色器（无 three.js）
 - **Backend**：FastAPI + SQLAlchemy 2 + SQLite，生产用 gunicorn + uvicorn worker
-- **AI Providers**：bb-api（Campbell / gpt-6-astra，绘图 / 修图），RelayRouter 作为这两项的回退，另负责音乐（Suno：作曲、编辑、分轨、音效）；DeepSeek（Scooby / deepseek-flash，标题 / 追问建议 / 识图转述）、阿里云 CleverSee（联网搜索）、DashScope（仅语音识别）
+- **AI Providers**：bb-api（Campbell / gpt-6-astra，绘图 / 修图），RelayRouter 作为这两项的回退，另负责音乐（Suno：作曲、编辑、分轨、音效）和视频（Grok Imagine）；DeepSeek（Scooby / deepseek-flash，标题 / 追问建议 / 识图转述）、阿里云 CleverSee（联网搜索）、DashScope（仅语音识别）
 - **Sandbox**：阿里云函数计算云沙箱（E2B 协议兼容，杭州，和模板镜像所在的 ACR 同地域），每个会话一台；模板镜像和发布流程见 [sandbox/README.md](sandbox/README.md)
 - **Storage**：阿里云 OSS 北京 `lock-ai` 桶（S3 兼容接口）。水印是桶里的 `public/watermark.png`，由 OSS 的 `x-oss-process` 实时叠加，原图不动；桶策略只公开 `users/` 和 `public/`。
 
@@ -136,13 +136,23 @@ CleverSee 出错或没配 Key 时直接告诉模型这次没搜到，由模型�
 - 换风格翻唱（`task=cover`）2026-11 按文档的写法 v5、v6 都失败（卡在 30% 后超时或报参数问题），暂不提供
 - 失败、中途停止不扣；一次回答最多两个音乐任务
 
+### 视频
+
+`generate_video` 工具，Campbell 和 Scooby 都能用，走 RelayRouter 的 Grok Imagine（`POST /v1/videos/generations` 提交、`GET /v1/videos/{request_id}` 查，`API_BASE_URL` + `RELAY_API_KEY`），模型见 `models.json` 的 `video_generator`（grok-imagine-video-1.5-lite）。
+
+- 文生视频；给一张图（会话资源清单的 assetId，或沙箱里的图片路径）就是图生视频。成品带声音，24 帧 H.264
+- 参数：时长 1~15 秒（默认 6）、分辨率 480p / 720p / 1080p（默认 720p，模型只在用户明确要求时用 1080p）、画幅 16:9 / 9:16 / 1:1。2026-11 实测 1080p 也能用（文档只写了前两种），1 秒的视频约 45 秒出来
+- 计费按 `billing.per_second` 的分辨率单价乘时长，图生视频再加一次 `per_image`：480p 约 4 credits/秒、720p 约 6、1080p 约 28，图另加 2。和上游实际扣费的比例一致
+- 提交前先按参数估算，额度不够就不提交，把需要多少、还剩多少、放得下的分辨率和时长返回给模型，由模型如实转告用户，不让它自己降参数重试
+- 成品在第三方临时地址（7 天），完成后转存 OSS `users/<用户>/sessions/<会话>/videos/<内容编号>/`，在交付区显示成视频卡片，并放进会话沙箱的 `inputs/videos/`；失败、中途停止不扣；一次回答最多两个视频
+
 ### 生成内容的文件标识
 
-生图、修图和音乐的所有文件（歌曲、封面、分轨、音效、MIDI）转存 OSS 之前都经过 [backend/services/media_label.py](backend/services/media_label.py) 的 `label_media`：去掉上游写进文件的信息，换成 LockAI 的标识，换供应商时用户拿到的文件不变。
+生图、修图、视频和音乐的所有文件（歌曲、封面、分轨、音效、MIDI）转存 OSS 之前都经过 [backend/services/media_label.py](backend/services/media_label.py) 的 `label_media`：去掉上游写进文件的信息，换成 LockAI 的标识，换供应商时用户拿到的文件不变。
 
-- 上游留下的（2026-11 实测）：生图的 PNG 带 OpenAI 签发的 C2PA 凭证（`caBX` 块，写着 OpenAI Media Service API、gpt-image）；Suno 的 m4a 注释是 `made with suno; created=…; id=<clipId>`，编码器是 `Lavf…`
+- 上游留下的（2026-11 实测）：生图的 PNG 带 OpenAI 签发的 C2PA 凭证（`caBX` 块，写着 OpenAI Media Service API、gpt-image）；Grok 的 mp4 在顶层 `uuid` 盒里放 C2PA（写着 xAI、Grok），`ilst` 里还有封面图；Suno 的 m4a 注释是 `made with suno; created=…; id=<clipId>`，编码器是 `Lavf…`
 - 写入的是《人工智能生成合成内容标识办法》要求的隐式标识，格式按 GB 45438-2025 附录 E：`AIGC` 字段，值是 JSON（`Label` 为 `"1"` 表示 AI 生成，`ContentProducer` / `ContentPropagator` 为 `LockAI`，`ProduceID` / `PropagateID` 为内容编号）。「这是 AI 生成的」照实保留，只换掉生成方
-- 位置：PNG 写在 iTXt 块的 XMP、JPEG 写在 APP1 段的 XMP（命名空间 `http://www.tc260.org.cn/ns/AIGC/1.0/` 的 `AIGC`，另带 `xmp:CreatorTool=LockAI` 和 IPTC 的 `trainedAlgorithmicMedia`）；m4a 写在 `ilst` 的 `AIGC` 自由格式标签，同时把标题设成歌名、工具设成 LockAI；MIDI 写在第一轨开头的文字事件
+- 位置：PNG 写在 iTXt 块的 XMP、JPEG 写在 APP1 段的 XMP（命名空间 `http://www.tc260.org.cn/ns/AIGC/1.0/` 的 `AIGC`，另带 `xmp:CreatorTool=LockAI` 和 IPTC 的 `trainedAlgorithmicMedia`）；m4a / mp4 写在 `ilst` 的 `AIGC` 自由格式标签，同时把标题设成歌名或视频名、工具设成 LockAI，顶层的 `uuid` 盒原地清成同长的空 `free` 盒（直接删会让后面音视频数据的位置变掉）；MIDI 写在第一轨开头的文字事件
 - 内容编号：图片用图片编号（也是文件名），音乐文件各自新生成一个，记在文件卡片的 `contentId`
 - PNG 只保留显示需要的块，JPEG 保留 JFIF、ICC 色彩和 Adobe 色彩变换段，画面逐像素不变；m4a 只改标签区，音频数据不变。认不出的格式或处理出错时原样保存，不会因此丢掉成品
 - 像素和音频里嵌的不可见水印不在元数据里，不处理

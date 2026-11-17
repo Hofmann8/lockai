@@ -1,4 +1,4 @@
-import type { ChatMessage, ImageGenToolTrace, MusicToolTrace, SearchSource, ShellToolTrace, TaskToolTrace, ToolTrace } from '@/types';
+import type { ChatMessage, ImageGenToolTrace, MusicToolTrace, SearchSource, ShellToolTrace, TaskToolTrace, ToolTrace, VideoToolTrace } from '@/types';
 
 export const TOOL_MARKER_RE = /<!--tool:(\d+)-->/g;
 
@@ -206,6 +206,29 @@ export function patchMusicTrace(
   const next = [...trace];
   const music = next[idx] as MusicToolTrace;
   next[idx] = { ...music, ...patch(music) };
+  return next;
+}
+
+export function startVideoTrace(
+  trace: ToolTrace[] | undefined,
+  video: Omit<VideoToolTrace, 'kind' | 'status'>,
+): ToolTrace[] {
+  const next = Array.isArray(trace) ? [...trace] : [];
+  next.push({ kind: 'video', ...video, status: 'running' });
+  return next;
+}
+
+export function patchVideoTrace(
+  trace: ToolTrace[] | undefined,
+  id: string,
+  patch: (video: VideoToolTrace) => Partial<VideoToolTrace>,
+): ToolTrace[] | undefined {
+  if (!Array.isArray(trace)) return trace;
+  const idx = trace.findIndex((t) => t.kind === 'video' && t.id === id);
+  if (idx < 0) return trace;
+  const next = [...trace];
+  const video = next[idx] as VideoToolTrace;
+  next[idx] = { ...video, ...patch(video) };
   return next;
 }
 

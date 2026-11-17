@@ -94,7 +94,7 @@ export function canPreview(file: FileArtifact): boolean {
 export function messageFiles(message: ChatMessage): FileArtifact[] {
   const byPath = new Map<string, FileArtifact>();
   for (const trace of message.tool_trace ?? []) {
-    if (trace.kind !== 'shell' && trace.kind !== 'music') continue;
+    if (trace.kind !== 'shell' && trace.kind !== 'music' && trace.kind !== 'video') continue;
     for (const f of trace.files ?? []) {
       // 早期作曲的文件没带歌曲信息：用这一步记下的歌名和风格补上（分轨、音效本来就不带，用普通播放器）
       const legacy = trace.kind === 'music' && !trace.action && !f.music && !f.error

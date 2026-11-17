@@ -34,6 +34,7 @@ const ModelView = lazy(() => import('./preview/ModelView'));
 const ImageView = lazy(() => import('./preview/ImageView'));
 const AudioView = lazy(() => import('./preview/AudioView'));
 const MusicView = lazy(() => import('./preview/MusicView'));
+const VideoView = lazy(() => import('./preview/VideoView'));
 const NotebookView = lazy(() => import('./preview/NotebookView'));
 const ArchiveView = lazy(() => import('./preview/ArchiveView'));
 const FontView = lazy(() => import('./preview/FontView'));
@@ -271,16 +272,6 @@ function MarkdownPreview({ file, text, truncated }: { file: FileArtifact; text: 
   );
 }
 
-function VideoPreview({ file }: { file: FileArtifact }) {
-  const [failed, setFailed] = useState(false);
-  if (failed) return <PreviewFallback file={file} note={`浏览器放不了这种视频（${fileExt(file.name).toUpperCase()}），下载后用播放器打开；也可以让我转成 MP4`} />;
-  return (
-    <div className="flex h-full items-center justify-center bg-black">
-      <video src={file.url} controls autoPlay playsInline onError={() => setFailed(true)} className="max-h-full max-w-full" />
-    </div>
-  );
-}
-
 /* ------------------------------------------------------------------ */
 /* 入口 */
 /* ------------------------------------------------------------------ */
@@ -288,6 +279,7 @@ function VideoPreview({ file }: { file: FileArtifact }) {
 const LAZY: Partial<Record<ReturnType<typeof fileKind>, Viewer>> = {
   image: ImageView,
   audio: AudioView,
+  video: VideoView,
   model: ModelView,
   notebook: NotebookView,
   archive: ArchiveView,
@@ -321,8 +313,6 @@ export function PreviewBody({ file, onInfo }: { file: FileArtifact; onInfo?: (in
   switch (kind) {
     case 'pdf':
       return <PdfViewer url={file.url!} onInfo={onInfo} />;
-    case 'video':
-      return <VideoPreview file={file} />;
     case 'html':
       return <HtmlPreview file={file} text={text ?? ''} truncated={truncated} />;
     case 'markdown':

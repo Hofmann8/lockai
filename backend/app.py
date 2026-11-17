@@ -151,7 +151,7 @@ class DatabaseScopeMiddleware:
             await self.app(scope, receive, send)
 
 
-app = FastAPI(title="LockAI API", version="1.0.0")
+app = FastAPI(title="LockAI API", version="1.1.0")
 app.add_middleware(DatabaseScopeMiddleware)
 app.add_middleware(
     CORSMiddleware,

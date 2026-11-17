@@ -18,7 +18,7 @@ import { decomposeMessage } from '@/lib/chat/compose';
 import { splitAssistantParts, type AssistantPart } from '@/lib/chat/traces';
 import { messageFiles } from '@/lib/chat/artifacts';
 import { Markdown } from './Markdown';
-import { ImageCard, Lightbox, MusicCard, SearchCard, SearchGroup, Seconds, useElapsed } from './ToolCards';
+import { ImageCard, Lightbox, MusicCard, SearchCard, SearchGroup, Seconds, useElapsed, VideoCard } from './ToolCards';
 import { Deliverables, ShellGroup, TaskCard } from './WorkCards';
 import { UploadList } from './UploadTree';
 import { ThinkingChip } from './Thinking';
@@ -362,7 +362,7 @@ function settlingLabel(trace: ToolTrace): string {
   if (trace.kind === 'task') return trace.success === false ? '这块工作没做完，正在想办法' : '正在看执行报告，想下一步';
   if (trace.kind === 'search') return trace.success === false ? '搜索没成功，先按已知的回答' : '正在读搜索结果';
   if (trace.kind === 'shell') return trace.success === false ? '这一步出错了，正在排查' : '正在看结果，想下一步';
-  if (trace.kind === 'music') return trace.success === false ? '没做成，正在整理说明' : '做好了，正在整理';
+  if (trace.kind === 'music' || trace.kind === 'video') return trace.success === false ? '没做成，正在整理说明' : '做好了，正在整理';
   if (trace.success === false) return '这张没画成，正在整理说明';
   return '主体已经出来了，正在补细节';
 }
@@ -520,6 +520,8 @@ function AssistantMessageImpl({
           <SearchCard trace={item} />
         ) : item.kind === 'music' ? (
           <MusicCard trace={item} />
+        ) : item.kind === 'video' ? (
+          <VideoCard trace={item} />
         ) : (
           // 画图有自己的收尾状态（先出主体再补细节），不走底部那行
           <ImageCard trace={item} settlingLabel={imageSettling && block === lastBlock ? settlingLabel(item) : undefined} />

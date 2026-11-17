@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { ChatMessage, ChatModel, ChatSession, FileArtifact, MusicToolTrace, ShellToolTrace, ThinkingLevel, TimedStreamEvent, ToolTrace } from '@/types';
+import type { ChatMessage, ChatModel, ChatSession, FileArtifact, MusicToolTrace, RunPhase, ShellToolTrace, ThinkingLevel, TimedStreamEvent, ToolTrace, VideoToolTrace } from '@/types';
 import {
   fetchSuggestions, getModels, getRunningChats, resumeChatStream, sendChatMessageStream, stopChatRun, uploadImage,
   type RunningChat,
@@ -19,9 +19,11 @@ import {
   finalizeSearchTrace,
   patchLatestImageTrace,
   patchMusicTrace,
+  patchVideoTrace,
   patchShellTrace,
   patchTaskTrace,
   startMusicTrace,
+  startVideoTrace,
   startShellTrace,
   startTaskTrace,
   stripToolMarkers,
@@ -98,10 +100,18 @@ interface MusicLive {
   end?: (music: MusicToolTrace) => Partial<MusicToolTrace>;
 }
 
+interface VideoLive {
+  started: boolean;
+  patch?: Partial<VideoToolTrace>;
+  end?: (video: VideoToolTrace) => Partial<VideoToolTrace>;
+}
+
 interface ControllerDeps {
   currentSessionId: string | null;
   setCurrentSessionId: (id: string | null) => void;
   loadSessions: () => Promise<unknown>;
+  /** 一轮回答的头尾，侧栏据此标"在回答" */
+  trackRun: (sessionId: string, phase: RunPhase, owner?: object) => void;
   /** 侧栏的会话列表：看有没有别的对话在后台回答，决定发送前要不要先问一下停哪条 */
   sessions?: ChatSession[];
 }
@@ -112,7 +122,20 @@ export interface CapacityPrompt {
   runs: RunningChat[];
 }
 
-export function useChatController({ currentSessionId, setCurrentSessionId, loadSessions, sessions }: ControllerDeps) {
+/** 离开一段对话时断开连接用的原因：回答在后台照样做完，和"停止""丢弃"区分开 */
+const LEAVE_REASON = 'leave-session';
+
+function leave(controller: AbortController | null) {
+  controller?.abort(new DOMException(LEAVE_REASON, 'AbortError'));
+}
+
+/** 这条连接断开后，这轮回答处在什么阶段：离开了就是后台继续，否则就是收尾了 */
+function runPhaseAfter(controller: AbortController): RunPhase {
+  const reason: unknown = controller.signal.reason;
+  return controller.signal.aborted && reason instanceof DOMException && reason.message === LEAVE_REASON ? 'detached' : 'end';
+}
+
+export function useChatController({ currentSessionId, setCurrentSessionId, loadSessions, trackRun, sessions }: ControllerDeps) {
   const initialSettings = useMemo(() => getSettings(), []);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [isLoading, setIsLoading] = useState(false);
@@ -150,6 +173,7 @@ export function useChatController({ currentSessionId, setCurrentSessionId, loadS
   const dispatchingQueueRef = useRef(false);
   const shellLiveRef = useRef(new Map<string, ShellLive>());
   const musicLiveRef = useRef(new Map<string, MusicLive>());
+  const videoLiveRef = useRef(new Map<string, VideoLive>());
   /** 正在重放后台回答已有的部分：一次性铺出来，不走逐字和工具卡片的最短停留 */
   const replayingRef = useRef(false);
   /** 接上后台回答时，本机时钟减服务端时钟；事件时间戳加上它就是本机时间 */
@@ -713,6 +737,65 @@ export function useChatController({ currentSessionId, setCurrentSessionId, loadS
         queueToolFinalization((trace) => patchMusicTrace(trace, event.id, finish));
         break;
       }
+      case 'video_start': {
+        pauseReasoning(at);
+        const live: VideoLive = { started: false };
+        videoLiveRef.current.set(event.id, live);
+        scheduleToolAction(() => {
+          live.started = true;
+          const { content: base, preamble } = takePreamble(commitBufferedAssistantContent(), event.preamble);
+          updateStreamTargetMessage((msg) => {
+            let nextTrace: ToolTrace[] | undefined = startVideoTrace(msg.tool_trace, {
+              id: event.id,
+              title: event.title,
+              prompt: event.prompt,
+              resolution: event.resolution,
+              aspectRatio: event.aspectRatio,
+              duration: event.duration,
+              modelLabel: event.modelLabel,
+              progress: 0,
+              preamble,
+              startedAtMs: at,
+            });
+            const markerIndex = nextTrace.length - 1;
+            if (live.patch) nextTrace = patchVideoTrace(nextTrace, event.id, () => live.patch ?? {});
+            if (live.end) nextTrace = patchVideoTrace(nextTrace, event.id, live.end);
+            const nextContent = appendToolMarker(base, markerIndex);
+            streamCommittedContentRef.current = nextContent;
+            return { ...msg, content: nextContent, tool_trace: nextTrace };
+          });
+        });
+        break;
+      }
+      case 'video_progress': {
+        const live = videoLiveRef.current.get(event.id);
+        const progress = { progress: event.progress };
+        if (live && !live.started) {
+          live.patch = progress;
+          break;
+        }
+        updateStreamTargetMessage((msg) => ({
+          ...msg, tool_trace: patchVideoTrace(msg.tool_trace, event.id, () => progress),
+        }));
+        break;
+      }
+      case 'video_end': {
+        const finish = (video: VideoToolTrace): Partial<VideoToolTrace> => ({
+          status: 'done',
+          success: event.success,
+          progress: event.progress ?? video.progress,
+          files: event.files,
+          error: event.error,
+          durationSeconds: Math.max(1, Math.round((at - (video.startedAtMs ?? at)) / 1000)),
+        });
+        const live = videoLiveRef.current.get(event.id);
+        if (live && !live.started) {
+          live.end = finish;
+          break;
+        }
+        queueToolFinalization((trace) => patchVideoTrace(trace, event.id, finish));
+        break;
+      }
       case 'task_start':
         // 派给执行助手的一块工作：卡片先出来，它的每一步随后带着 taskId 进来
         pauseReasoning(at);
@@ -761,6 +844,7 @@ export function useChatController({ currentSessionId, setCurrentSessionId, loadS
     resetReasoning(thinking);
     shellLiveRef.current.clear();
     musicLiveRef.current.clear();
+    videoLiveRef.current.clear();
     serverMessageIdRef.current = null;
     replayingRef.current = false;
     clockOffsetRef.current = null;
@@ -880,10 +964,12 @@ export function useChatController({ currentSessionId, setCurrentSessionId, loadS
       setCurrentSessionId(fallback.id);
       await addMessage(sessionId, userMessage);
     }
-    // 回答在后台跑：列表马上标出"在回答"，离开这段对话也看得到
+    // 回答从这里开始：侧栏马上标出"在回答"，离开这段对话也看得到；连接断开时收尾或转后台
+    const runId = sessionId;
+    const controller = new AbortController();
+    trackRun(runId, 'live', controller);
     void loadSessions();
 
-    const controller = new AbortController();
     abortRef.current = controller;
     streamEndedRef.current = false;
 
@@ -911,6 +997,7 @@ export function useChatController({ currentSessionId, setCurrentSessionId, loadS
         failStream((err as Error).message || '网络中断，回答没有完整返回');
       }
     } finally {
+      trackRun(runId, runPhaseAfter(controller), controller);
       if (abortRef.current === controller) abortRef.current = null;
       if (!streamEndedRef.current && loadingRef.current && streamTargetMessageIdRef.current === placeholderId) {
         // 流结束但既没有 message_end 也没报错（比如连接被代理切断）
@@ -919,7 +1006,7 @@ export function useChatController({ currentSessionId, setCurrentSessionId, loadS
     }
   }, [
     beginStreamTarget, confirmCapacity, failStream, handleStreamEvent, loadSessions, models, resolveThinking,
-    selectedModel, selectedModelId, setCurrentSessionId, setLoadingNow, setMessagesNow, setModel,
+    selectedModel, selectedModelId, setCurrentSessionId, setLoadingNow, setMessagesNow, setModel, trackRun,
   ]);
 
   /** 回到一段正在后台回答的对话：先把已经做了的一次性铺出来，再接着实时看 */
@@ -942,6 +1029,7 @@ export function useChatController({ currentSessionId, setCurrentSessionId, loadS
     const controller = new AbortController();
     abortRef.current = controller;
     streamEndedRef.current = false;
+    trackRun(sessionId, 'live', controller);
     try {
       const found = await resumeChatStream(sessionId, handleStreamEvent, controller.signal);
       if (!found && !controller.signal.aborted) {
@@ -958,12 +1046,13 @@ export function useChatController({ currentSessionId, setCurrentSessionId, loadS
         failStream((err as Error).message || '网络中断，没能接上正在进行的回答');
       }
     } finally {
+      trackRun(sessionId, runPhaseAfter(controller), controller);
       if (abortRef.current === controller) abortRef.current = null;
       if (!streamEndedRef.current && loadingRef.current && streamTargetMessageIdRef.current === placeholderId) {
         if (!controller.signal.aborted) failStream('连接提前结束了，刷新一下看看最新进度');
       }
     }
-  }, [beginStreamTarget, bindStreamTarget, failStream, handleStreamEvent, resetReasoning, setLoadingNow, setMessagesNow]);
+  }, [beginStreamTarget, bindStreamTarget, failStream, handleStreamEvent, resetReasoning, setLoadingNow, setMessagesNow, trackRun]);
 
   /* ---------------- 会话切换 ---------------- */
 
@@ -972,7 +1061,7 @@ export function useChatController({ currentSessionId, setCurrentSessionId, loadS
     setSuggestions(null);
     // 离开一段对话只是不看了：断开连接，回答在后台照样做完
     if (!currentSessionId) {
-      abortRef.current?.abort();
+      leave(abortRef.current);
       abortRef.current = null;
       streamEndedRef.current = false;
       bindStreamTarget(null);
@@ -987,7 +1076,7 @@ export function useChatController({ currentSessionId, setCurrentSessionId, loadS
       skipHydrateSessionRef.current = null;
       return;
     }
-    abortRef.current?.abort();
+    leave(abortRef.current);
     abortRef.current = null;
     bindStreamTarget(null);
     resetReasoning();
@@ -1014,6 +1103,7 @@ export function useChatController({ currentSessionId, setCurrentSessionId, loadS
         }
       }
       if (session.running) void resume(currentSessionId, resolveThinking(model).effective);
+      else trackRun(currentSessionId, 'end');
     });
     return () => { cancelled = true; };
     // models 变化时不重新拉取会话

@@ -55,6 +55,13 @@ from .sandbox import INPUTS_DIR, SandboxService, input_relpath, safe_filename
 from .search import SearchService, engine_label, normalize_search_args
 from .storage import StorageService, strip_image_processing
 from .context import compact_turn
+from .video import (
+    POLL_SECONDS as VIDEO_POLL_SECONDS,
+    TIMEOUT_SECONDS as VIDEO_TIMEOUT_SECONDS,
+    VideoError,
+    VideoService,
+    normalize_video_args,
+)
 from .tokens import count_prompt, count_text, reasoning_tokens_of, strip_injected
 from .tool_contracts import (
     CHAT_TOOLS,
@@ -62,6 +69,7 @@ from .tool_contracts import (
     DELEGATE_INSTRUCTION,
     DELEGATE_TOOL,
     MUSIC_TOOLS,
+    VIDEO_TOOL,
     SANDBOX_INSTRUCTION,
     WORKER_INSTRUCTION,
     WORKER_TOOLS,
@@ -135,6 +143,7 @@ class AIService:
     tools = CHAT_TOOLS
     sandbox: SandboxService | None = None
     music: MusicService | None = None
+    video: VideoService | None = None
 
     def __init__(self):
         self.llm = LLMService()
@@ -147,6 +156,9 @@ class AIService:
         self.music = MusicService(self.llm, self.storage)
         if self.music.available:
             self.tools = self.tools + MUSIC_TOOLS
+        self.video = VideoService(self.llm, self.storage)
+        if self.video.available:
+            self.tools = self.tools + [VIDEO_TOOL]
         from .usage import UsageService
         self.usage = UsageService()
         # 沙箱任务一步一个命令，做个 PPT 要十几轮，一次要一整套物料的能到八九十轮。
@@ -1063,6 +1075,18 @@ class AIService:
                 turn=turn,
             ))
 
+        if name == "generate_video":
+            return (yield from self._run_video(
+                arguments,
+                tool_trace=tool_trace,
+                assistant_message_id=assistant_message_id,
+                user_id=user_id,
+                session_id=session_id,
+                turn=turn if turn is not None else {},
+                current_user_images=current_user_images,
+                current_user_message_id=current_user_message_id,
+            ))
+
         if name in MUSIC_TOOL_NAMES:
             return (yield from self._run_music(
                 arguments,
@@ -1776,6 +1800,189 @@ class AIService:
                           if isinstance(f, dict) and f.get("url") and f.get("path")]
         return found
 
+    # ------------------------------------------------------------------
+    # 视频（Grok Imagine）
+    # ------------------------------------------------------------------
+
+    def _video_image(
+        self, ref: str, session_id: str | None, turn: dict[str, Any], tool_trace: list[dict[str, Any]],
+        current_user_images: list[str], current_user_message_id: str | None,
+    ) -> tuple[str, str]:
+        """图生视频的那张图 → (地址, 错误)。认会话资源清单的 assetId，也认沙箱里的图片路径"""
+        try:
+            assets = self.image._collect_edit_source_candidates(
+                session_id, current_user_images or [], current_user_message_id=current_user_message_id,
+            )
+        except Exception as exc:
+            print(f"[Video] 读资源清单失败: {type(exc).__name__}: {exc}")
+            assets = []
+        for asset in assets:
+            if asset.get("assetId") == ref and asset.get("url"):
+                return strip_image_processing(str(asset["url"])), ""
+        item = _match_session_file(self._music_candidates(session_id, turn, tool_trace), ref)
+        if item is None:
+            return "", f"找不到图片 {ref}"
+        if media_kind(item) != "image":
+            return "", f"{item.get('name')} 不是图片"
+        return strip_image_processing(str(item.get("url") or "")), ""
+
+    def _run_video(
+        self,
+        arguments: dict[str, Any],
+        *,
+        tool_trace: list[dict[str, Any]],
+        assistant_message_id: str,
+        user_id: str | None,
+        session_id: str | None,
+        turn: dict[str, Any],
+        current_user_images: list[str],
+        current_user_message_id: str | None,
+    ):
+        """
+        提交前按分辨率、时长估算额度，不够就不提交，把差多少和更省的做法告诉模型；
+        提交后轮询进度推给前端，完成后转存 OSS、放进沙箱 inputs/videos/，按估算扣费。失败、停止不扣。
+        """
+        request = normalize_video_args(arguments)
+        step_id = uuid.uuid4().hex[:8]
+        label = self.video.model_label() if self.video else "Campbell Video"
+        trace: dict[str, Any] = {
+            "kind": "video", "id": step_id, "title": request["title"], "prompt": request["prompt"],
+            "resolution": request["resolution"], "aspectRatio": request["aspect_ratio"], "duration": request["duration"],
+            "status": "running", "progress": 0, "modelLabel": label,
+        }
+        tool_trace.append(trace)
+        yield {"_append_marker": True, "type": "video_start", "message_id": assistant_message_id, "id": step_id,
+               "title": request["title"], "prompt": request["prompt"], "resolution": request["resolution"],
+               "aspectRatio": request["aspect_ratio"], "duration": request["duration"], "modelLabel": label}
+
+        def finish(success: bool, error: str = "", files: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+            trace.update({"status": "done", "success": success})
+            if error:
+                trace["error"] = error
+            if files:
+                trace["files"] = files
+            return {"type": "video_end", "message_id": assistant_message_id, "id": step_id, "success": success,
+                    "progress": trace["progress"], **({"error": error} if error else {}), **({"files": files} if files else {})}
+
+        if self.video is None or not self.video.available:
+            yield finish(False, "视频生成暂不可用")
+            return "视频生成暂不可用，请告诉用户稍后再试，不要再调用 generate_video。"
+        if sum(1 for item in tool_trace if item.get("kind") == "video") > MAX_VIDEOS_PER_ANSWER:
+            yield finish(False, "这次回答的视频已到上限")
+            return f"这次回答已经生成了 {MAX_VIDEOS_PER_ANSWER} 个视频，不要再调用 generate_video；请让用户先看已有的结果。"
+        if not request["prompt"]:
+            yield finish(False, "缺少画面描述")
+            return "generate_video 需要 prompt（画面描述），请补全后重试。"
+
+        image_url = ""
+        if request["image"]:
+            image_url, problem = self._video_image(request["image"], session_id, turn, tool_trace,
+                                                   current_user_images, current_user_message_id)
+            if problem:
+                yield finish(False, problem)
+                return f"generate_video 没有执行：{problem}。请换成会话资源清单里的 assetId 或沙箱里的图片路径。"
+            trace["image"] = request["image"]
+
+        # 先估算：额度不够就不提交
+        units = self.video.units_for(request, bool(image_url))
+        cost = self.usage.credits_of(units)
+        trace["credits"] = cost
+        if user_id and units > 0:
+            ok, _scope, quota_msg = self.usage.check(user_id, cost)
+            if not ok:
+                remaining = self._weekly_remaining(user_id)
+                options = []
+                for resolution in ("720p", "480p"):
+                    for seconds in (request["duration"], 6, 3):
+                        alt = {**request, "resolution": resolution, "duration": min(seconds, request["duration"])}
+                        alt_cost = self.usage.credits_of(self.video.units_for(alt, bool(image_url)))
+                        text = f"{resolution} {alt['duration']} 秒约 {alt_cost:g} credits"
+                        if alt_cost <= remaining and alt_cost < cost and text not in options:
+                            options.append(text)
+                hint = f"放得下的做法：{'；'.join(options[:3])}。" if options else "本周剩余额度连最短的视频都不够。"
+                error = f"额度不够：这个视频约需 {cost:g} credits，本周还剩 {remaining:g}"
+                yield finish(False, error)
+                return (
+                    f"generate_video 没有提交：按 {request['resolution']}、{request['duration']} 秒"
+                    f"{'、图生视频' if image_url else ''}估算约需 {cost:g} credits，本周 Campbell 额度只剩 {remaining:g}"
+                    f"（{quota_msg}）。{hint}请把这些如实告诉用户，由用户决定，不要自己换参数重试。"
+                )
+
+        try:
+            task_id = self.video.submit(request, image_url)
+        except VideoError as exc:
+            yield finish(False, str(exc))
+            return f"视频提交失败：{exc}。请如实告诉用户。"
+
+        deadline = time.monotonic() + VIDEO_TIMEOUT_SECONDS
+        state: dict[str, Any] = {"state": "running", "progress": 0, "url": "", "error": ""}
+        failures = 0
+        while True:
+            try:
+                state = self.video.fetch(task_id)
+                failures = 0
+            except VideoError as exc:
+                failures += 1
+                print(f"[Video] 查询失败（第 {failures} 次）: {exc}")
+                if failures >= 5:
+                    state = {"state": "failed", "progress": trace["progress"], "url": "", "error": str(exc)}
+            if state["progress"] != trace["progress"]:
+                trace["progress"] = state["progress"]
+                yield {"type": "video_progress", "message_id": assistant_message_id, "id": step_id, "progress": state["progress"]}
+            if state["state"] != "running":
+                break
+            if time.monotonic() > deadline:
+                state = {"state": "failed", "progress": trace["progress"], "url": "", "error": "等待超时"}
+                break
+            wake = time.monotonic() + VIDEO_POLL_SECONDS
+            while time.monotonic() < wake:
+                if self._stopped(turn):
+                    yield finish(False, "已停止")
+                    return "视频生成被中止（回答已停止）。"
+                time.sleep(0.5)
+
+        if state["state"] != "success":
+            error = state.get("error") or "生成失败"
+            yield finish(False, error)
+            return f"视频生成失败：{error}。请如实告诉用户，可以建议调整画面描述再试。"
+
+        taken = {rel for rel, _ in self._music_candidates(session_id, turn, tool_trace)}
+        try:
+            saved = self.video.save(state["url"], request, user_id, session_id, taken=taken)
+        except Exception as exc:
+            print(f"[Video] 转存失败: {type(exc).__name__}: {exc}")
+            yield finish(False, "保存失败")
+            return "视频生成好了但保存失败，请告诉用户稍后再试。"
+
+        if user_id and units > 0:
+            try:
+                spent = self.usage.record_fixed_call(user_id, units)
+                print(f"[Usage] video 扣 {spent:g} credits")
+            except Exception as exc:
+                print(f"[Usage] record video failed: {type(exc).__name__}: {exc}")
+
+        inputs = [{key: saved[key] for key in ("name", "path", "url", "size", "mime") if key in saved}]
+        turn.setdefault("generated_inputs", []).extend(inputs)
+        sandbox = turn.get("sandbox")
+        if sandbox is not None and self.sandbox is not None:
+            try:
+                self.sandbox.sync_inputs(sandbox, inputs)
+            except Exception as exc:
+                print(f"[Video] 放进沙箱失败: {type(exc).__name__}: {exc}")
+
+        yield finish(True, files=[saved])
+        return (
+            f"视频已生成（{request['resolution']}、{request['duration']} 秒、{request['aspect_ratio']}，有声音），"
+            f"以视频卡片展示给用户，沙箱路径 {INPUTS_DIR}/{saved['path']}。用一两句话介绍，不要贴链接；"
+            "用户要剪辑、拼接、加字幕、配乐时用 shell 里的 ffmpeg 处理这个文件。"
+        )
+
+    def _weekly_remaining(self, user_id: str) -> float:
+        try:
+            return float(self.usage.get_summary(user_id)["remaining"]["weekly"])
+        except Exception:
+            return 0.0
+
     def _run_shell(
         self,
         arguments: dict[str, Any],
@@ -1983,11 +2190,13 @@ class AIService:
         music_messages = (
             ChatMessage.query
             .filter(ChatMessage.session_id == session_id, ChatMessage.role == "assistant")
-            .filter(ChatMessage.tool_trace.like('%"music"%'))
+            .filter(ChatMessage.tool_trace.like('%"music"%') | ChatMessage.tool_trace.like('%"video"%'))
             .all()
         )
         for m in music_messages:
             for trace in m.to_dict().get("tool_trace") or []:
+                if isinstance(trace, dict) and trace.get("kind") == "video":
+                    candidates += [f for f in trace.get("files") or [] if isinstance(f, dict) and f.get("url")]
                 if isinstance(trace, dict) and trace.get("kind") == "music":
                     candidates += [_with_legacy_music(f, trace, i) for i, f in enumerate(trace.get("files") or [])
                                    if isinstance(f, dict) and f.get("url")]
@@ -2251,6 +2460,13 @@ class AIService:
                 lines.append(f"- shell: {command} → {result}{suffix}")
                 continue
 
+            if kind == "video":
+                files = [f.get("path") or f.get("name") for f in item.get("files") or [] if f.get("url")]
+                where = f"；沙箱 {INPUTS_DIR}/ 下的 {', '.join(files)}" if files else ""
+                lines.append(f"- generate_video(prompt={json.dumps(item.get('prompt') or '', ensure_ascii=False)[:160]}, "
+                             f"resolution={item.get('resolution')}, duration={item.get('duration')}): {status}{where}")
+                continue
+
             if kind == "music":
                 files = [f.get("path") or f.get("name") for f in item.get("files") or [] if f.get("url")]
                 where = f"；沙箱 {INPUTS_DIR}/ 下的 {', '.join(files)}" if files else ""
@@ -2485,6 +2701,8 @@ MUSIC_TOOL_NAMES = ("generate_music", "edit_music", "separate_music", "generate_
 MUSIC_TOOL_LABELS = {"generate_music": "作曲", "edit_music": "编辑音乐", "separate_music": "分轨", "generate_sound": "生成音效"}
 # 一次回答里最多几个音乐任务（作曲、编辑、分轨、音效都算）：都要几分钟、都花额度
 MAX_MUSIC_JOBS_PER_ANSWER = 2
+# 一次回答最多生成几个视频
+MAX_VIDEOS_PER_ANSWER = 2
 MEASURE_HINT = "先用 shell 跑 ffprobe 量出这段音频的时长（秒），再把它填进 {field}"
 
 

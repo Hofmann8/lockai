@@ -89,3 +89,16 @@ def test_unknown_or_broken_files_are_kept_as_is():
     broken = b"\x89PNG\r\n\x1a\n" + b"\x00\x00\xff\xffIHDR"  # 块长度越界
     assert label_media(broken, "x") == broken
     assert sniff(b"\xff\xd8\xff\xe0") == "jpeg" and sniff(b"....ftypisom") == "mp4"
+
+
+def test_mp4_c2pa_uuid_box_is_blanked_in_place():
+    """Grok 的视频在顶层 uuid 盒里放 C2PA：原地清空成同长的 free 盒，后面的数据位置不变"""
+    raw = (FIXTURES / "tiny_suno.m4a").read_bytes()
+    ftyp_len = struct.unpack(">I", raw[:4])[0]
+    c2pa = b"\xd8\xfe\xc3\xd6\x1b\x0eH<\x92\x97X(\x87~\xc4\x81" + b"jumb c2pa xAI Grok"
+    box = struct.pack(">I", 8 + len(c2pa)) + b"uuid" + c2pa
+    with_c2pa = raw[:ftyp_len] + box + raw[ftyp_len:]
+    from services.media_label import _blank_top_level_uuid
+    blanked = _blank_top_level_uuid(with_c2pa)
+    assert len(blanked) == len(with_c2pa) and b"Grok" not in blanked and b"c2pa" not in blanked
+    assert blanked[ftyp_len + 4:ftyp_len + 8] == b"free"

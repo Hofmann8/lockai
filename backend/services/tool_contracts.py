@@ -381,6 +381,45 @@ def _build_generate_sound_tool() -> dict[str, Any]:
     }
 
 
+def _build_generate_video_tool() -> dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": "generate_video",
+            "description": (
+                "生成一段视频（带声音），文生视频；给一张图（image）就是让这张图动起来。耗时约一分钟。"
+                "按分辨率和时长计费：480p 约 4 credits/秒，720p 约 6 credits/秒，1080p 约 28 credits/秒，图生视频另加 2 credits。"
+                "默认用 720p（要省就用 480p），只有用户明确要 1080p 时才用 1080p。"
+                "成品交给用户，同时放进沙箱的 /home/user/inputs/videos/，之后可以用 shell 里的 ffmpeg 剪辑、拼接、加字幕、配乐。"
+                "提交前会按参数估算额度，不够时不会生成，返回结果里会说明差多少。"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "画面描述，英文效果更好：主体、动作、镜头运动、场景、光线、风格；要声音（音乐、环境声、台词）也写进来",
+                    },
+                    "title": {"type": "string", "description": "文件名用的短名字，用用户的语言"},
+                    "duration": {"type": "integer", "minimum": 1, "maximum": 15, "description": "时长（秒），默认 6"},
+                    "resolution": {"type": "string", "enum": ["480p", "720p", "1080p"], "description": "默认 720p"},
+                    "aspect_ratio": {"type": "string", "enum": ["16:9", "9:16", "1:1"],
+                                     "description": "画幅，默认 16:9；手机竖屏、短视频用 9:16"},
+                    "image": {
+                        "type": "string",
+                        "description": "可选：让这张图动起来。填会话资源清单里的 assetId，或沙箱里的图片路径（如 /home/user/inputs/images/a.png）",
+                    },
+                },
+                "required": ["prompt"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+
+VIDEO_TOOL = _build_generate_video_tool()
+
+
 MUSIC_TOOLS = [
     _build_generate_music_tool(),
     _build_edit_music_tool(),
